@@ -280,6 +280,7 @@ void sessionResetForUi() {
     g_modsLine.clear();
     g_modsWarn = false;
     g_peerModsCfg.clear();
+    g_repl.setLedgerRecording(false);
     if (g_lastGw) g_repl.clearPeerReplicationState(g_lastGw);
     else          g_repl.resetSession();
     g_inbound.flushWorldState();
@@ -288,19 +289,33 @@ void sessionResetForUi() {
 
 // ---- Squad-tab owners kept with the save (core/TabLedger.h) -----------------
 
-// A save edge's second write, a few seconds later (autosaves are not watched).
-std::string g_ledgerRewriteName;
-DWORD       g_ledgerRewriteTick = 0;
+// An autosave's later writes. Kenshi saves an autosave by copying the current
+// save folder - its TokelaCoop_squads.txt included - over our edge write, within
+// a fraction of a second, and autosaves are not watched for quiescence: so the
+// owners go in again at +1.5 s, +4 s and +8 s (an unchanged file is not touched).
+std::string  g_ledgerRewriteName;
+DWORD        g_ledgerRewriteTick = 0;
+unsigned int g_ledgerRewriteStep = 0;
+
+void writeTabLedgerToSave(const std::string& name, const char* when);
+
+// A late write still pending goes in NOW, with this world's owners: before a
+// world load replaces them (written afterwards it would put the next world's
+// owners into this world's autosave), and when Kenshi closes.
+void flushPendingLedgerWrite(const char* why) {
+    if (g_ledgerRewriteTick == 0) return;
+    g_ledgerRewriteTick = 0;
+    g_ledgerRewriteStep = 0;
+    writeTabLedgerToSave(g_ledgerRewriteName, why);
+}
 
 // The loaded world's owners, read from <save>\TokelaCoop_squads.txt. Replaces
 // whatever the previous world left: called on every world load (gameplay start,
 // and the reload edge below) before the new session seeds its tabs. A save
 // without the file (made before v0.54, or a test fixture) keeps the rank rule.
 void loadTabLedgerFromSave(const char* when) {
+    flushPendingLedgerWrite("before-load");
     g_repl.clearTabLedger();
-    // A pending late write belongs to the world that just went away: it would put
-    // this world's owners into that world's autosave.
-    g_ledgerRewriteTick = 0;
     if (!g_cfg.tabLedger) return;
     char cur[128]; cur[0] = '\0';
     coop::engine::saveInfo(cur, sizeof(cur), 0, 0);
@@ -550,6 +565,10 @@ void processNetEvents(GameWorld* gw) {
         b[sizeof(b) - 1] = '\0';
         coopLog(b);
         g_peerId = it->id;
+        // Both games seed the squad-tab owners afresh for this session (see
+        // reseedTabsForPeer), and from now on those decisions are kept.
+        g_repl.reseedTabsForPeer();
+        g_repl.setLedgerRecording(true);
         // Connect-edge resync (protocol 30): re-announce placed buildings and
         // force an immediate resend pass across all change-gated channels, so
         // a late joiner / reconnector converges now instead of waiting out
@@ -585,6 +604,7 @@ void processNetEvents(GameWorld* gw) {
         g_modsLine.clear();
         g_modsWarn = false;
         g_peerModsCfg.clear();
+        g_repl.setLedgerRecording(false);
         // Coordinated save: disconnected = solo again; local saves must work.
         if (!g_cfg.isHost && g_cfg.saveSync) {
             coop::engine::setSaveSuppress(false);
@@ -660,10 +680,18 @@ void pumpSaveReceive() {
 // drives a coordinated save). Received BEGIN/FILE/DONE stage + verify +
 // commit the host's folder; the ACK reports the outcome.
 void driveSaveSync() {
-    // An autosave's second squad-owner write, once the save has surely finished.
+    // An autosave's later squad-owner writes (see g_ledgerRewriteTick).
     if (g_ledgerRewriteTick != 0 && (long)(GetTickCount() - g_ledgerRewriteTick) >= 0) {
-        g_ledgerRewriteTick = 0;
+        static const DWORD kNextMs[] = { 2500, 4000 };   // +1.5 s -> +4 s -> +8 s
         writeTabLedgerToSave(g_ledgerRewriteName, "late");
+        if (g_ledgerRewriteStep < 2) {
+            g_ledgerRewriteTick = GetTickCount() + kNextMs[g_ledgerRewriteStep];
+            if (g_ledgerRewriteTick == 0) g_ledgerRewriteTick = 1;
+            ++g_ledgerRewriteStep;
+        } else {
+            g_ledgerRewriteTick = 0;
+            g_ledgerRewriteStep = 0;
+        }
     }
     // Local save edges from the detour (max 8 queued per tick).
     coop::engine::SaveEdge edges[8];
@@ -676,8 +704,11 @@ void driveSaveSync() {
             // fingerprinted or sent; an autosave gets a late second write.
             writeTabLedgerToSave(name, "save");
             if (edges[i].autosave) {
+                if (name != g_ledgerRewriteName) flushPendingLedgerWrite("late");
                 g_ledgerRewriteName = name;
-                g_ledgerRewriteTick = GetTickCount() + 8000;
+                g_ledgerRewriteTick = GetTickCount() + 1500;
+                if (g_ledgerRewriteTick == 0) g_ledgerRewriteTick = 1;
+                g_ledgerRewriteStep = 0;
             }
         }
         if (g_cfg.isHost) {
@@ -2939,6 +2970,8 @@ int detachReKenshiFocusListenersSeh() {
 }
 
 void __cdecl crtExit_hook(int code) {
+    // An autosave made just before quitting still gets its squad owners.
+    flushPendingLedgerWrite("exit");
     coop::engine::coopUiShutdown();
     int n = detachReKenshiFocusListenersSeh();
     if (n != 0) {

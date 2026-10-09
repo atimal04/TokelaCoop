@@ -211,6 +211,7 @@ powershell -ExecutionPolicy Bypass -File scripts\regress.ps1 -Tier full -SkipBui
   - `PROTOCOL_VERSION` se comprueba en el handshake: súbelo al cambiar cualquier paquete.
   - Rechazos: el host desconecta con un código en el u32 de DISCONNECT de ENet (`refuseEncode`: VERSION, FULL con reintento).
     Regla: el host **nunca** desconecta con 0. Así rechazan las versiones hasta la v0.53, y un cliente tiene que poder distinguirlas.
+  - Protocolo 57 desde la v0.54 (la v0.53 era 56): los dos se rechazan con aviso en vez de jugar con reglas distintas.
   - Sesión de 2: el host rechaza como FULL a un segundo peer mientras hay uno admitido, y el cliente se despide al parar
     (también al cerrar Kenshi) para liberar la plaza al momento.
   - `src/prototest` fija el tamaño y el round-trip de cada struct.
@@ -227,6 +228,11 @@ powershell -ExecutionPolicy Bypass -File scripts\regress.ps1 -Tier full -SkipBui
   - un movimiento de escuadra viaja como `EVT_SQUAD_MOVE`. Si el amigo crea una escuadra que aquí no existe, se crea
     otra y se emparejan (`peerTabLocal_`, línea `[squad] PEER-TAB` del log): cada juego numera distinto las
     escuadras creadas en partida, y tras guardar y cargar las dos usan los números del host;
+  - al conectarse el amigo, los dos juegos olvidan los dueños de la sesión y vuelven a repartir igual
+    (`reseedTabsForPeer`, línea `[squad] RESEED`), y solo se apuntan dueños mientras hay amigo conectado;
+  - un personaje del amigo que aquí tiene otra mano local (lo movió a una escuadra nueva) se resuelve con
+    `resolvePeerChar` / `localHandForPeerChar` (vía `proxyByKey_`) en stats, médico, carga, muebles e inventario;
+    si no, sus datos se perdían y el host guardaba una copia vieja;
   - el host guarda de quién es cada pestaña en `<save>\TokelaCoop_squads.txt` (`core/TabLedger.h`) al guardar, y los
     dos lo leen al cargar (`via=ledger` en `TABOWN`): así una escuadra nueva del join no pasa al host al recargar
     (`TOKELACOOP_TAB_LEDGER=0` lo apaga). Solo decide si nombra como del join alguna pestaña que exista; si no, manda

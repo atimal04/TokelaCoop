@@ -2121,6 +2121,7 @@
         # off and must see the host get the squad (the negative control).
         squad_persist = @{
             Save = 'sync'; Setup = ''; Tolerance = 6.0
+            Seconds = 200; KillGraceSec = 170   # the scenario's 130 s fallback starts at peer-ready (~30 s in)
             PrimaryGate = 'squad_persist'
             Gating   = @('squad_persist', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth', 'march')
@@ -2129,6 +2130,7 @@
         squad_persist_off = @{
             DiagEnv = @{ TOKELACOOP_TAB_LEDGER = '0' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
+            Seconds = 200; KillGraceSec = 170
             PrimaryGate = 'squad_persist_off'
             Gating   = @('squad_persist_off')
             Advisory = @()

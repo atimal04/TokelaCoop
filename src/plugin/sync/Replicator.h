@@ -103,6 +103,17 @@ public:
     void setTabLedger(const TabLedger& l) { tabLedger_ = l; }
     const TabLedger& tabLedger() const { return tabLedger_; }
     void clearTabLedger() { tabLedger_.clear(); }
+    // Decisions are recorded only while the friend is connected: alone, every
+    // tab is ours whatever the rank says, and a guess made then must not decide
+    // the next co-op session. Plugin.cpp sets it on the presence edges.
+    void setLedgerRecording(bool on) { ledgerRecord_ = on; }
+    // The friend has just connected: forget this session's tab owners and our
+    // own move pins, so both games seed every tab the same way (the save's
+    // ledger, else the rank rule). Alone, the host decided its new squads as its
+    // own, while the join seeds the pushed save from scratch - without this both
+    // could own the squad the host split off for the friend before connecting.
+    // No world changes, so the roster baseline and the drive maps stay.
+    void reseedTabsForPeer();
     // Who owns a squad tab: 1 ours, 2 the friend's, 0 not decided yet (a tab
     // this tick created, or squad sync off).
     int tabOwnerClass(u32 container, u32 containerSerial) const {
@@ -2214,10 +2225,22 @@ private:
     // our hand for one fixture and the peer's for another cannot bite.
     void handForContainerKey(const Key& k, unsigned int out[5]) const {
         if (ownedContainers_.count(k) == 0 && ownHands_.count(k) == 0 &&
-            localHandForFixtureKey(k, out))
+            (localHandForFixtureKey(k, out) || localHandForPeerChar(k, out)))
             return;
         out[0] = k.t; out[1] = k.c; out[2] = k.cs; out[3] = k.i; out[4] = k.s;
     }
+    // A peer's character by the hand the peer streams it under. Our copy of a
+    // body the peer moved into another squad (or recruited into a squad this game
+    // does not have) sits in a squad WE numbered, so its local hand differs and
+    // the plain hand lookup misses it; rekeyPeerBody bound it in proxyByKey_,
+    // which the drive already uses. Without this, stats, medical, limb, carry,
+    // furniture and inventory updates for that character were dropped here, and
+    // the host's next save kept its stale copy (loot lost or duplicated after a
+    // reload). Minted NPC proxies are left out: those channels never served them.
+    Character* resolvePeerChar(const Key& k) const;
+    // The local hand of that body (object order), for engine calls that take a
+    // hand. False when the key is not such a body.
+    bool localHandForPeerChar(const Key& k, unsigned int out[5]) const;
     // Protocol 23 recruitment sync state.
     bool recruitSync_;
     // Ownership PINS (protocols 23 + 35): per-hand overrides layered on the
@@ -2282,6 +2305,7 @@ private:
     // resetSession - only by a world load (see clearTabLedger).
     TabLedger tabLedger_;
     bool      tabLedgerOn_;
+    bool      ledgerRecord_;
     // A squad the peer created mid-session has a runtime container number of
     // its own in each game. When its first member arrives here we make a new
     // squad for it (insertPeerMember) and pair the two numbers, so its later

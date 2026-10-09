@@ -870,10 +870,15 @@ function Test-SquadPersist {
     }
     $cont = "$($pt.Matches[0].Groups[3].Value),$($pt.Matches[0].Groups[4].Value)"
 
-    # TABOWN for that squad logged AFTER each side's reload marker.
+    # TABOWN for that squad logged AFTER each side's reload: the scenario's marker
+    # or the plugin's own session reset, whichever comes first after the scenario
+    # started (a synchronous swap resets the session before the marker is logged).
     $afterReload = {
         param($f)
-        $mark = Select-String -Path $f -Pattern "SCENARIO SQP reloaded" | Select-Object -First 1
+        $start = Select-String -Path $f -Pattern "SCENARIO SQP start" | Select-Object -First 1
+        if (-not $start) { return $null }
+        $mark = Select-String -Path $f -Pattern "SCENARIO SQP reloaded|\[load\] inbound world-state queues flushed" |
+                Where-Object { $_.LineNumber -gt $start.LineNumber } | Select-Object -First 1
         if (-not $mark) { return $null }
         $rx = "\[squad\] TABOWN cont=" + [regex]::Escape($cont) + " rank=(\d+) own=(\d) via=([\w-]+)"
         return (Select-String -Path $f -Pattern $rx | Where-Object { $_.LineNumber -gt $mark.LineNumber } |
