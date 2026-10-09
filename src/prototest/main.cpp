@@ -317,8 +317,8 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v56: active-mod list check)",
-             (int)PROTOCOL_VERSION, 56);
+    CHECK_EQ("PROTOCOL_VERSION (v57: v0.54 own characters + squad owners; refuses v0.53)",
+             (int)PROTOCOL_VERSION, 57);
     CHECK_EQ("PKT_MODLIST id", (int)PKT_MODLIST, 49);
 
     // Protocol 52: the shared money pool. The two players spend from ONE wallet,

@@ -765,7 +765,7 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 if (ownHands_.find(k) != ownHands_.end()) break;
                 int limb = (int)ev.arg;
                 if (limb < 0 || limb > 3) break;
-                Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+                Character* c = resolvePeerChar(k);
                 if (!c) break; // not loaded here; the medical stream self-heals later
                 unsigned char states[4] = { LIMB_STATE_UNKNOWN, LIMB_STATE_UNKNOWN,
                                             LIMB_STATE_UNKNOWN, LIMB_STATE_UNKNOWN };
@@ -789,10 +789,12 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 // Works for own-tab, cross-tab, and either direction: each
                 // machine mirrors the relationship between its own instances.
                 if (!carrySync_) break;
-                Character* carrier = engine::resolveCharByHand(
-                    ev.aIndex, ev.aSerial, ev.aType, ev.aContainer, ev.aContainerSerial);
+                Key ak; ak.t = ev.aType; ak.c = ev.aContainer; ak.cs = ev.aContainerSerial;
+                ak.i = ev.aIndex; ak.s = ev.aSerial;
+                Character* carrier = resolvePeerChar(ak);
                 unsigned int ch[5] = { ev.sType, ev.sContainer, ev.sContainerSerial,
                                        ev.sIndex, ev.sSerial };
+                localHandForPeerChar(k, ch);   // a friend's body we hold under our own hand
                 bool ok = carrier && engine::applyPickup(0, carrier, ch);
                 char cb[160]; _snprintf(cb, sizeof(cb) - 1,
                     "[carry] RECV PICKUP id=%u carrier=%u,%u carried=%u,%u ok=%d",
@@ -806,8 +808,9 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 // ragdoll flag). Idempotent - a carrier that never picked up
                 // locally (lost/late pickup) is a no-op success.
                 if (!carrySync_) break;
-                Character* carrier = engine::resolveCharByHand(
-                    ev.aIndex, ev.aSerial, ev.aType, ev.aContainer, ev.aContainerSerial);
+                Key ak; ak.t = ev.aType; ak.c = ev.aContainer; ak.cs = ev.aContainerSerial;
+                ak.i = ev.aIndex; ak.s = ev.aSerial;
+                Character* carrier = resolvePeerChar(ak);
                 bool ok = carrier && engine::applyDrop(carrier, ev.arg != 0.0f);
                 char cb[160]; _snprintf(cb, sizeof(cb) - 1,
                     "[carry] RECV DROP id=%u carrier=%u,%u carried=%u,%u ok=%d",
@@ -850,7 +853,7 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                         break;
                     }
                 }
-                Character* occ = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+                Character* occ = resolvePeerChar(k);
                 unsigned int fh[5] = { ev.aType, ev.aContainer, ev.aContainerSerial,
                                        ev.aIndex, ev.aSerial };
                 int kind = (int)ev.arg;
@@ -867,7 +870,7 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 // that never entered locally (lost/late enter) is a no-op success.
                 if (!furnSync_) break;
                 if (ownHands_.find(k) != ownHands_.end()) break;
-                Character* occ = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+                Character* occ = resolvePeerChar(k);
                 unsigned int fh[5] = { ev.aType, ev.aContainer, ev.aContainerSerial,
                                        ev.aIndex, ev.aSerial };
                 int kind = (int)ev.arg;
@@ -1194,6 +1197,22 @@ void Replicator::insertPeerMember(GameWorld* gw, Character* c, const Key& newK,
     bool tabHere = false;
     for (std::set<Key>::const_iterator s = allSquad_.begin(); s != allSquad_.end() && !tabHere; ++s)
         tabHere = (s->c == newK.c && s->cs == newK.cs);
+    // Never park the friend's character in a squad of OURS. That happens when the
+    // friend drops it into a squad that is empty on their screen but holds our
+    // people here (empty squads keep the same number in both games): the owner
+    // is saved per squad, so the next load would hand the character to us, with
+    // no way back under the own-characters guard. Treat that squad as one we do
+    // not have: a squad move gets a squad of its own, paired like any other; a
+    // recruit joins one of the friend's members.
+    bool oursNotTheirs = false;
+    if (!ownIt && tabHere) {
+        std::map<std::pair<u32, u32>, bool>::const_iterator to = tabOwned_.find(peerTab);
+        if (to != tabOwned_.end() && to->second) {
+            tabHere = false;
+            oursNotTheirs = true;
+            nh[1] = 0; nh[2] = 0;   // so the join below cannot pick that squad
+        }
+    }
     if (!tabHere) {
         // Checked live, not against allSquad_: a second member moved in the same
         // event drain must find the squad the first one just made (the roster
@@ -1203,6 +1222,12 @@ void Replicator::insertPeerMember(GameWorld* gw, Character* c, const Key& newK,
             engine::playerTabHasMember(gw, pt->second.first, pt->second.second)) {
             nh[1] = pt->second.first; nh[2] = pt->second.second; tabHere = true;
         }
+    }
+    if (oursNotTheirs) {
+        char ob[176]; _snprintf(ob, sizeof(ob) - 1,
+            "[squad] NOT-OURS peer squad %u,%u is ours here: friend's body kept out of it (paired=%d)",
+            newK.c, newK.cs, tabHere ? 1 : 0);
+        ob[sizeof(ob) - 1] = '\0'; coop::logLine(ob);
     }
     // The body's hand before we move it: making a new squad renumbers the
     // character serial, and the roster edge of our own move is keyed by the

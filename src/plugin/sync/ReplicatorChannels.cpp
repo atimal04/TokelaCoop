@@ -235,8 +235,7 @@ void Replicator::applyMedical(GameWorld* gw, Inbound& in, NetLink& net, u32 owne
         Key k; k.t = p.sType; k.c = p.sContainer; k.cs = p.sContainerSerial;
         k.i = p.sIndex; k.s = p.sSerial;
         if (ownHands_.find(k) != ownHands_.end()) continue; // never write our own truth
-        unsigned int hand[5] = { k.t, k.c, k.cs, k.i, k.s };
-        Character* c = engine::resolveCharByHand(hand[3], hand[4], hand[0], hand[1], hand[2]);
+        Character* c = resolvePeerChar(k);
         if (!c) continue;
         engine::MedicalRead w;
         memset(&w, 0, sizeof(w));
@@ -316,9 +315,11 @@ void Replicator::applyMedical(GameWorld* gw, Inbound& in, NetLink& net, u32 owne
         MedRecv&   r = it->second;
         if (!r.have || (now - r.lastFwdMs) < FWD_THROTTLE_MS) continue;
         if (ownHands_.find(k) != ownHands_.end()) continue;
-        unsigned int hand[5] = { k.t, k.c, k.cs, k.i, k.s };
+        // The same body step 1 wrote (a friend's character we hold under our own
+        // hand included), or our bandage would be undone and never forwarded.
+        Character* tc = resolvePeerChar(k);
         engine::MedicalRead mr;
-        if (!engine::readMedicalByHand(hand, &mr) || !mr.valid) continue;
+        if (!tc || !engine::readMedical(tc, &mr) || !mr.valid) continue;
         TreatmentPacket tp;
         memset(&tp, 0, sizeof(tp));
         bool rise = false;
@@ -501,7 +502,7 @@ void Replicator::applyStats(GameWorld* gw, Inbound& in) {
         Key k; k.t = p.sType; k.c = p.sContainer; k.cs = p.sContainerSerial;
         k.i = p.sIndex; k.s = p.sSerial;
         if (ownHands_.find(k) != ownHands_.end()) continue; // never write our own truth
-        Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+        Character* c = resolvePeerChar(k);
         if (!c) continue;
         engine::StatsRead w;
         memset(&w, 0, sizeof(w));
@@ -2164,7 +2165,7 @@ void Replicator::publishStealth(GameWorld* gw, NetLink& net, u32 ownerId) {
     for (std::map<Key, Driven>::iterator it = targets_.begin(); it != targets_.end(); ++it) {
         const Key& k = it->first;
         if (ownHands_.find(k) != ownHands_.end()) continue;
-        Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+        Character* c = resolvePeerChar(k);
         if (!c) continue;
         engine::StealthRead sr;
         if (!engine::readStealth(c, &sr) || !sr.valid) continue;

@@ -78,7 +78,7 @@ Replicator::Replicator()
       poolSeen_(-1), poolSent_(-1), poolSentMs_(0), poolTotal_(-1),
       poolSeq_(0), poolAcked_(0),
       moneySync_(true), recruitSync_(true),
-      squadSync_(true), tabsSeeded_(0), tabLedgerOn_(true), ownGuardActive_(false),
+      squadSync_(true), tabsSeeded_(0), tabLedgerOn_(true), ledgerRecord_(false), ownGuardActive_(false),
       cellAuth_(false), cellCollapse_(false), collapsed_(false),
       claimSendMs_(0), claimAssertMs_(0), claimMapMs_(0),
       facSeqOut_(1), facSampleMs_(0), factionSync_(true),
@@ -562,7 +562,7 @@ void Replicator::decideTabs(const EntityState* raw, unsigned int nSquad,
         }
         tabOwned_[ctnrs[i]] = owned;
         // Remember the verdict for the next reconnect and for the save file.
-        if (tabLedgerOn_)
+        if (tabLedgerOn_ && ledgerRecord_)
             tabLedger_[ctnrs[i]] = owned ? myRole : (unsigned char)(1 - myRole);
         if (!seeding || rank >= 2u || why[0] == 'l') { // seeded rank 0/1 stay silent
             char b[128];
@@ -584,6 +584,44 @@ bool Replicator::ownsTab(const std::pair<u32, u32>& key, unsigned int rank) cons
     // Not yet decided (squadSync_ off, or the first tick of a fresh container):
     // the historical rule, so this is never MORE permissive than before.
     return ownRanks_.empty() ? (rank == 0u) : (ownRanks_.count(rank) != 0);
+}
+
+void Replicator::reseedTabsForPeer() {
+    pinOwned_.clear();
+    pinPeer_.clear();
+    moveEcho_.clear();
+    exitedOwn_.clear();
+    tabRank_.clear();
+    tabOwned_.clear();
+    tabSeenMs_.clear();
+    peerTabLocal_.clear();
+    pendingPeerTab_.clear();
+    tabsSeeded_ = 0;
+    engine::clearSquadScreenPlatoons();   // re-learned from the new owners
+    coop::logLine("[squad] RESEED tabs for the friend's session");
+}
+
+Character* Replicator::resolvePeerChar(const Key& k) const {
+    Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+    if (c) return c;
+    std::map<Key, Character*>::const_iterator p = proxyByKey_.find(k);
+    if (p == proxyByKey_.end() || !p->second) return 0;
+    if (mintedBodies_.count(p->second)) return 0;
+    // The engine can reap a bound body between ticks: prove it is live first
+    // (the same SEH-guarded read the drive does).
+    unsigned int lh[5];
+    if (!engine::readHand(p->second, lh)) return 0;
+    return p->second;
+}
+
+bool Replicator::localHandForPeerChar(const Key& k, unsigned int out[5]) const {
+    std::map<Key, Character*>::const_iterator p = proxyByKey_.find(k);
+    if (p == proxyByKey_.end() || !p->second || mintedBodies_.count(p->second)) return false;
+    unsigned int lh[5];
+    if (!engine::readObjectHand(reinterpret_cast<RootObject*>(p->second), lh)) return false;
+    if ((lh[0] | lh[1] | lh[2] | lh[3] | lh[4]) == 0) return false;
+    for (int i = 0; i < 5; ++i) out[i] = lh[i];
+    return true;
 }
 
 unsigned int Replicator::tabRankFor(const std::pair<u32, u32>& key,

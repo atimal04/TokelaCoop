@@ -929,7 +929,7 @@ public:
         : TimedScenario(name, 0), recruited_(false), recruitOk_(false), split_(false),
           splitOk_(false), saveIssued_(false), saveOk_(false), ackSeen_(false), ackOk_(false),
           loadIssued_(false), loadOk_(false), sigWas2_(false), swapDone_(false),
-          reportedAtMs_(0), dropStartMs_(0), sigClearedMs_(0), lastStatusMs_(0) {
+          reportedAtMs_(0), dropStartMs_(0), sigClearedMs_(0), lastStatusMs_(0), ackBase_(0) {
         memset(recruit_, 0, sizeof(recruit_));
     }
 
@@ -973,10 +973,14 @@ public:
         if (ctx.isHost) {
             if (!saveIssued_ && live && ctx.elapsedMs >= SAVE_AT_MS) {
                 saveIssued_ = true;
+                // An earlier transfer's ACK (the connect push, when it had to
+                // stream) is not this save's.
+                ackBase_ = savexfer::lastAckXferId();
                 saveOk_ = engine::saveGameAs(SAVE_NAME);
                 logStep("save", saveOk_, ctx.elapsedMs);
             }
-            if (saveIssued_ && !ackSeen_ && savexfer::lastAckXferId() != 0) {
+            if (saveIssued_ && !ackSeen_ && savexfer::lastAckXferId() != 0 &&
+                savexfer::lastAckXferId() != ackBase_) {
                 ackSeen_ = true;
                 ackOk_ = (savexfer::lastAckOk() == 1);
                 logStep("ack", ackOk_, ctx.elapsedMs);
@@ -1054,6 +1058,7 @@ private:
     unsigned int  recruit_[5];
     bool          sigWas2_, swapDone_;
     unsigned long reportedAtMs_, dropStartMs_, sigClearedMs_, lastStatusMs_;
+    unsigned int  ackBase_;
 
     static const char* const SAVE_NAME;
 };
