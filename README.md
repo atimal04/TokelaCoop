@@ -140,8 +140,12 @@ is needed after an edit.
 
 - **You each control your own squad.** With one squad tab per player, the host
   runs squad 1 and the joining player squad 2. Your friend's squad is visible
-  and synced on your screen, but answers only to them. If your save has only
-  one squad, move some units into a second squad tab in-game to give them a crew.
+  and synced on your screen, but answers only to them (you cannot select, order
+  or move each other's characters). If your save has only one squad, move some
+  units into a second squad tab **before your friend connects**: it becomes
+  theirs when they join. A squad you split off while they are already connected
+  stays yours until you save and load again. Squads either of you creates or
+  recruits into later stay with whoever made them, across saves and reloads.
 - **Two-player starts included.** The TokelaCoop mod ships two game starts (New
   Game -> pick one from the list), both the vanilla Wanderer start with two
   wanderers already split into separate squads, so the host gets squad 1 and the
@@ -186,9 +190,10 @@ is needed after an edit.
 - **"your friend has another version" on the F2 panel** - one of you has a build
   with a different network protocol; both players should re-install from the
   same release.
-- **"Mods: DIFFERENT" showing only KenshiCoop.mod against TokelaCoop.mod** - your
-  friend still has the old KenshiCoop (v0.53 or older, same network protocol, so
-  it connects): they should run the new installer, not copy mod lists.
+- **"your friend has an older version of the mod (probably KenshiCoop ...)"** -
+  your friend still has the old KenshiCoop (v0.53 or older). Since v0.54 the two
+  refuse each other instead of playing with different rules: they should run the
+  new installer.
 
 The kit's `README.txt` has the full setup + troubleshooting list.
 

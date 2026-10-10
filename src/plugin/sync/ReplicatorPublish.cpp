@@ -138,9 +138,14 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     // Publish the SUBJECT under the key the peer streams it by (canonicalOf_,
     // stamped every drive tick) or the peer's applyCombat resolves nothing
     // (r=1 forever) and the fight renders on one client only.
+    // The same holds for a CARRIED body: one of the friend's characters that we
+    // hold under our own hand (it was moved into a squad we numbered) would reach
+    // the peer as a hand it does not have, and the pickup/drop events below copy
+    // this subject. (The NPC rows appended below get the same pass.)
+    const unsigned int nOwnRows = n;
     for (unsigned int i = 0; i < n; ++i) {
         EntityState& e = buf[i];
-        if (!coop::taskIsCombat(e.task)) continue;
+        if (!coop::taskIsCombat(e.task) && !coop::taskIsCarry(e.task)) continue;
         Character* tc = engine::resolveCharByHand(e.sIndex, e.sSerial, e.sType,
                                                   e.sContainer, e.sContainerSerial);
         if (!tc) continue;
@@ -449,6 +454,21 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                 ++added;
             }
         }
+    }
+    // The NPC rows get the subject translation too: a host guard hauling, or a
+    // raider fighting, one of the friend's characters that we hold under our own
+    // hand (moved into a squad we numbered) must name it by the friend's key.
+    for (unsigned int i = nOwnRows; i < n; ++i) {
+        EntityState& e = buf[i];
+        if (!coop::taskIsCombat(e.task) && !coop::taskIsCarry(e.task)) continue;
+        Character* tc = engine::resolveCharByHand(e.sIndex, e.sSerial, e.sType,
+                                                  e.sContainer, e.sContainerSerial);
+        if (!tc) continue;
+        std::map<Character*, Key>::const_iterator cit = canonicalOf_.find(tc);
+        if (cit == canonicalOf_.end()) continue;
+        const Key& ck = cit->second;
+        e.sType = ck.t; e.sContainer = ck.c; e.sContainerSerial = ck.cs;
+        e.sIndex = ck.i; e.sSerial = ck.s;
     }
     net.setOwnedEntities(ownerId, buf, n);
 

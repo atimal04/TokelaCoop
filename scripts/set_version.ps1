@@ -10,7 +10,8 @@
                                               - deploy.cmd installs this copy as is,
                                               and Installer.Tests checks it matches
     * tools\MultiplayerStartGen\Program.cs     the same description, for a regenerate
-    * README.md                                "**Current version: vX.YY.**"
+    * README.md                                "**Current version: vX.YY.**" and
+                                              the banner example ("TokelaCoop vX.YY")
   The .mod is rewritten with ModText.psm1, which recomputes record lengths and
   refuses to touch a StringId. Then run the tests, commit, and tag vX.YY (the
   release job refuses a tag that is not "v" + Version.h's value).
@@ -43,6 +44,7 @@ Write-Host "TokelaCoop v${Version}:"
 Set-InFile 'src\netproto\Version.h' '#define TOKELACOOP_VERSION "[0-9]+\.[0-9]+"' "#define TOKELACOOP_VERSION `"$Version`""
 Set-InFile 'tools\MultiplayerStartGen\Program.cs' '"TokelaCoop v[0-9]+\.[0-9]+ \(formerly' "`"TokelaCoop v$Version (formerly"
 Set-InFile 'README.md' '\*\*Current version: v[0-9]+\.[0-9]+\.\*\*' "**Current version: v$Version.**"
+Set-InFile 'README.md' '\("TokelaCoop v[0-9]+\.[0-9]+"\)' "(`"TokelaCoop v$Version`")"
 
 Import-Module (Join-Path $repoRoot 'scripts\ModText.psm1') -Force
 $mod = Join-Path $repoRoot 'dist\mods\TokelaCoop\TokelaCoop.mod'

@@ -75,6 +75,14 @@ PLAY (Steam - recommended)
      player can watch the transfer before the world loads. Toggle Connection to
      OFFLINE to leave.
 
+  SQUADS: each player controls only their own squad(s): you cannot select,
+  order or move your friend's characters (the game tells you "ese personaje es
+  de tu amigo"). The "TokelaCoop (Wanderer x2)" starts already give each player
+  a squad. With a one-squad save, the HOST moves some characters into a second
+  squad BEFORE the friend connects: it becomes the friend's when they join.
+  Squads either of you creates or hires into later stay with whoever made them,
+  also after saving and loading.
+
 PLAY (LAN / direct UDP - advanced)
 ----------------------------------
   Skip the Steam ID swap. Open <Kenshi>\mods\TokelaCoop\coop_config.json in
@@ -103,12 +111,10 @@ TROUBLESHOOTING
     mods, versions or load order. <Kenshi>\TokelaCoop_mods_diff.txt lists every
     difference; "Copy friend's mod list" copies their load order. The check
     only warns, it never blocks the connection (new, not yet tested in-game).
-    If the only difference is KenshiCoop.mod against TokelaCoop.mod, your
-    friend still has the old KenshiCoop (v0.53 or older): they should run this
-    installer, not copy mod lists.
   * "your friend has another version" on the F2 panel: one player has an
     older/newer build with a different network protocol; both should use the
-    same release.
+    same release. If it says "probably KenshiCoop", your friend still has the
+    old KenshiCoop (v0.53 or older): they should run this installer.
   * A warning box at start, or "untick KenshiCoop" on the banner: the old
     KenshiCoop is still installed next to TokelaCoop. Run the installer again,
     or untick KenshiCoop in the launcher's Mods tab.

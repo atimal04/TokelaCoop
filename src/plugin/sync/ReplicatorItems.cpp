@@ -1761,7 +1761,8 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
             // Provenance/quality/grade off the moved stack (it lives in dst now) - a peer
             // may need them if it has to fabricate a missing non-gear copy.
             pkt.level = GRADE_NA;
-            unsigned int dHand[5] = { f.dst.t, f.dst.c, f.dst.cs, f.dst.i, f.dst.s };
+            unsigned int dHand[5];
+            handForContainerKey(f.dst, dHand);
             unsigned int nd = engine::captureContainerContents(gw, dHand, items, 64, 0);
             for (unsigned int j = 0; j < nd; ++j) {
                 if (items[j].itemType != f.key.second) continue;
@@ -1864,6 +1865,17 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
         // that key missed the chest this client actually tracks and reconciles.
         Key lsk; lsk.t = sHand[0]; lsk.c = sHand[1]; lsk.cs = sHand[2]; lsk.i = sHand[3]; lsk.s = sHand[4];
         Key ldk; ldk.t = dHand[0]; ldk.c = dHand[1]; ldk.cs = dHand[2]; ldk.i = dHand[3]; ldk.s = dHand[4];
+        // ...except a friend's character we hold under our own hand (moved into a
+        // squad we numbered): its snapshot, baseline and latch are all kept under
+        // the friend's key, so the bookkeeping stays there; only the engine move
+        // above uses our hand.
+        {
+            unsigned int pc[5];
+            if (ownedContainers_.count(sk) == 0 && ownHands_.count(sk) == 0 &&
+                localHandForPeerChar(sk, pc)) lsk = sk;
+            if (ownedContainers_.count(dk) == 0 && ownHands_.count(dk) == 0 &&
+                localHandForPeerChar(dk, pc)) ldk = dk;
+        }
         XKey key(std::string(p.stringID), p.itemType);
         const bool srcOwn = xferAuthored(lsk);
         const bool dstOwn = xferAuthored(ldk);
