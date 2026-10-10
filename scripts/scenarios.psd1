@@ -95,6 +95,20 @@
 
     Scenarios = @{
         # ---- entity stream / presence -------------------------------------------
+        # stop_probe: diagnostic repro for on-stop overshoot/rubberband in the driven
+        # copy (walk-drive taper + halting-settle fix, concept from CTRL-ALT-E e36b960).
+        # Host walks its squad leader out-and-back on squad1 with a REAL halt at each
+        # end (move issued once per leg), for a long window so a heavy-modlist join
+        # still overlaps many stops. Read the join [drv] trace (TOKELACOOP_DRIVEDBG=1)
+        # at the stops. Not tiered (never runs in regress); smoothness/crosscheck
+        # advisory only.
+        stop_probe = @{
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'crosscheck'
+            Gating   = @('crosscheck')
+            Advisory = @('smoothness', 'anim_truth', 'march', 'clock_sync')
+            Tier = 'none'; WanVariant = $false
+        }
         leader_move = @{
             Save = 'sync'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'crosscheck'
@@ -751,6 +765,22 @@
             PrimaryGate = 'proxy_drift'
             Gating   = @('proxy_drift', 'clock_sync')
             Advisory = @('mint_aggro', 'smoothness', 'anim_truth', 'march', 'combat_snap_rate', 'lifecycle', 'mint_dist')
+            Tier = 'full'; WanVariant = $false
+        }
+        # npc_aggro: mint_aggro's exact script with the OTHER half of issue #54
+        # gated - not where the fight happens, but WHETHER it happens. Same
+        # hostile AI-intact squad closed onto the join's characters, nothing of
+        # ours ordering anything; the gate is the owner's AI emitting the combat
+        # order (fight 0->1 transition in the host log) within 30 s of the
+        # close, observable in the join log within 8 s. No DiagEnv: the defaults
+        # (aiSuspend + censusFreezeAi ON) are exactly the config in the issue's
+        # own log. The raced sampling parity stays mint_aggro's advisory; this
+        # gate reads transitions, not sample agreement.
+        npc_aggro = @{
+            Save = 'sync'; Setup = ''; Tolerance = 18.0
+            PrimaryGate = 'npc_aggro'
+            Gating   = @('npc_aggro', 'clock_sync')
+            Advisory = @('mint_aggro', 'proxy_drift', 'smoothness', 'anim_truth', 'march', 'combat_snap_rate', 'lifecycle', 'mint_dist')
             Tier = 'full'; WanVariant = $false
         }
         # player_ko: players as VICTIMS both directions - scaffold KO + revive on
@@ -1443,6 +1473,37 @@
             Tier = 'none'; WanVariant = $false
         }
 
+        # save_squadmeta_stage1 (issue #74-F1): stage 1 of
+        # scripts/save_squadmeta_test.ps1 (not a tier member - the two-stage
+        # wrapper drives it, like save_stage1). Each client mutates its OWN
+        # squad at 8 s (host: rename platoons[0] + a JOB_MEDIC permajob; join:
+        # rename platoons[1] + faction name + a JOB_MEDIC) - the issue's
+        # "what the host sets persists, what the joiner sets is wiped"
+        # asymmetry, verbatim - then one coordinated saveGameAs('coopresume')
+        # at 25 s bakes whatever the authority holds (save_sync gates the
+        # transfer; save_squadmeta gates the setup legs).
+        save_squadmeta_stage1 = @{
+            Save = 'squad2'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'save_squadmeta'
+            Gating   = @('save_squadmeta', 'save_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'none'; WanVariant = $false
+        }
+
+        # save_squadmeta: stage 2 (not a tier member). Both clients relaunch on
+        # the save the stage-1 transfer delivered (NO harness mirroring - the
+        # join loads what the TRANSFER wrote) and the verdict checks the
+        # mutated squad/faction names and permajob queues against the KNOWN
+        # stage-1 constants, per authored datum. Host legs green + join legs
+        # red is the issue's root; the oracle adds host==join census parity.
+        save_squadmeta = @{
+            Save = 'coopresume'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'save_squadmeta'
+            Gating   = @('save_squadmeta', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'none'; WanVariant = $false
+        }
+
         # load_probe: coordinated-load phase-13a diagnostic (protocol 32 -
         # load detour installed for edge logging, NO load coordination;
         # saveSync stays ON so the join holds an identical copy first). The
@@ -1674,6 +1735,22 @@
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'store_sync'
             Gating   = @('store_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # store_join_add: issue #81(a) direction - the JOIN deposits into the
+        # host's chest (the store_sync script PLUS the join-side add into its
+        # minted chest copy, storeSync ON). Gates the store_sync local legs
+        # PLUS the join add landing locally and CROSSING onto the host's own
+        # chest census before the host reconcile, with the final content
+        # hashes agreeing. Save+reload persistence of the crossed items stays
+        # out: it needs the two-stage resume_test.ps1 mechanics.
+        store_join_add = @{
+            DiagEnv = @{ TOKELACOOP_INV_SYNC = '1' }
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'store_join_add'
+            Gating   = @('store_join_add', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'full'; WanVariant = $false
         }
@@ -1927,6 +2004,24 @@
             Advisory = @('existence_parity', 'anti_zombie', 'lifecycle',
                          'suppress_churn', 'smoothness', 'anim_truth', 'march')
             Tier = 'probe'; WanVariant = $false
+        }
+
+        # existence_gate: existence_parity PROMOTED to a gate, on a BAKED
+        # hostile population (issues #34/#54: NPCs that exist on one client
+        # and not the other). split_far keeps the oracle advisory because that
+        # scenario exists to EXPOSE emergent ghosts; here the 'camp' prison
+        # save bakes a dense Holy Nation garrison + slave population and both
+        # squads watch it co-located, so a sustained ghost is exigible absent,
+        # not exposed. Same passive-soak body as world_parity with a ~60 s
+        # steady window: the join's 5 s [audit] exist series (fresh census
+        # only) must show no persistent ghost population and zero dormPc (a
+        # body beside a player character the gate stopped reconciling).
+        existence_gate = @{
+            Save = 'camp'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'existence_parity'
+            Gating   = @('existence_parity', 'clock_sync')
+            Advisory = @('lifecycle', 'suppress_churn', 'anti_zombie', 'smoothness')
+            Tier = 'full'; WanVariant = $false
         }
 
         # speed_sync: consensus game-speed (pause/1x/2x/3x). Scenario-simulated
@@ -2332,6 +2427,34 @@
             Gating   = @('nested_bag', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'smoke'; WanVariant = $false
+        }
+        # rejoin_bag_stage1 (issue #61): stage 1 of scripts/rejoin_bag_test.ps1 (not a
+        # tier member - the two-stage wrapper drives it, like save_stage1). The
+        # inv_nested_bag script VERBATIM (same NEST lines, so nested_bag gates it
+        # unchanged) PLUS one coordinated save 'coopresume' at 25 s, so the bag and
+        # its contents bake into the shared save (save_sync gates the transfer).
+        rejoin_bag_stage1 = @{
+            DiagEnv = @{ TOKELACOOP_INV_SYNC = '1'; TOKELACOOP_WORLD_SYNC = '1'
+                         TOKELACOOP_INV_DUMP = '1' }
+            Save = 'squad2'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'nested_bag'
+            Gating   = @('nested_bag', 'save_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'none'; WanVariant = $false
+        }
+        # rejoin_bag: stage 2 (not a tier member). Both clients relaunch on the
+        # save the stage-1 transfer delivered (NO harness mirroring - the join
+        # loads what the TRANSFER wrote) and census the same bag for 30 s. The
+        # rejoin_bag oracle gates presence on BOTH sides plus host==join parity
+        # (parity IS the no-loss/no-dupe proof) and the top-level churn check.
+        rejoin_bag = @{
+            DiagEnv = @{ TOKELACOOP_INV_SYNC = '1'; TOKELACOOP_WORLD_SYNC = '1'
+                         TOKELACOOP_INV_DUMP = '1' }
+            Save = 'coopresume'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'rejoin_bag'
+            Gating   = @('rejoin_bag', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'none'; WanVariant = $false
         }
         # The player's actual workflow: dump a character's ENTIRE kit at once and hoover all of it
         # up with a second character. The one-item gates above pass on a trickle and cannot see

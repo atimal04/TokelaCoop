@@ -31,12 +31,17 @@
 param(
     [switch]$SkipBuild,
     # Where to find TokelaCoop.mod / RE_Kenshi.json if they aren't in dist\mods.
-    [string]$HostDir = "C:\Program Files (x86)\Steam\steamapps\common\Kenshi"
+    # Empty -> TOKELACOOP_KENSHI_DIR env override, else the harness default
+    # (CoopHarness.psm1).
+    [string]$HostDir = ""
 )
 
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot  = Split-Path -Parent $scriptDir
+
+Import-Module (Join-Path $scriptDir "CoopHarness.psm1") -Force
+if ($HostDir -eq "") { $HostDir = Get-CoopKenshiDir }
 
 if (-not $SkipBuild) {
     # The PLAYER release ships the Release config: the shipped DLL excludes the

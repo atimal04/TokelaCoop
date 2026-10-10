@@ -145,6 +145,7 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             pkt.found = found ? 1 : 0;
             pkt.dead  = dead ? 1 : 0;
             pkt.age   = age; // animals scale body size by age (protocol 39)
+            if (found) engine::charName(c, pkt.name, sizeof(pkt.name));
             net.queueSpawnInfo(pkt);
             char b[224]; _snprintf(b, sizeof(b) - 1,
                 "[spawn] INFO send hand=%u,%u,%u,%u,%u found=%d dead=%d age=%.2f sid='%s' fac='%s'",
@@ -545,7 +546,8 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             }
         }
         Character* proxy = engine::spawnProxyNpc(gw, p.charSid, p.facSid,
-                                                 p.x, p.y, p.z, p.heading, p.age);
+                                                 p.x, p.y, p.z, p.heading, p.age,
+                                                 p.name);
         if (!proxy) {
             // Local mint failed (template/faction absent here - modded host?).
             // Back off hard; retrying in seconds cannot succeed.
@@ -745,6 +747,204 @@ bool Replicator::pickMintedProxyNear(GameWorld* gw, const unsigned int refHand[5
     return true;
 }
 
+Character* Replicator::characterForFurnitureKey(const Key& occ) const {
+    Character* c = engine::resolveCharByHand(occ.i, occ.s, occ.t, occ.c, occ.cs);
+    if (c) return c;
+    std::map<Key, Character*>::const_iterator pi = proxyByKey_.find(occ);
+    if (pi != proxyByKey_.end()) return pi->second;
+    // A driven save-native body can be re-keyed by the engine after recruitment
+    // or combat. canonicalOf_ is the authoritative wire-key -> local-body bridge.
+    for (std::map<Character*, Key>::const_iterator ci = canonicalOf_.begin();
+         ci != canonicalOf_.end(); ++ci) {
+        if (!(ci->second < occ) && !(occ < ci->second)) return ci->first;
+    }
+    return 0;
+}
+
+void Replicator::queueFurnitureIntent(NetLink& net, u32 ownerId, const Key& occ,
+                                      bool on, int kind,
+                                      const unsigned int furn[5],
+                                      unsigned long now) {
+    if (kind != 1 && kind != 2) return;
+    FurnitureRow& row = furnitureRows_[occ];
+    bool same = row.pendingSeq != 0 && row.pendingOn == on &&
+                row.pendingKind == kind;
+    for (int i = 0; same && i < 5; ++i) same = row.pendingFurn[i] == furn[i];
+    if (!same) {
+        row.pendingSeq = furnitureIntentSeqOut_++;
+        if (row.pendingSeq == 0) row.pendingSeq = furnitureIntentSeqOut_++;
+        row.pendingOn = on;
+        row.pendingKind = kind;
+        for (int i = 0; i < 5; ++i) row.pendingFurn[i] = furn[i];
+    }
+
+    FurniturePacket fp; memset(&fp, 0, sizeof(fp));
+    fp.type = (u8)PKT_FURNITURE; fp.mode = (u8)FURNITURE_INTENT;
+    fp.on = on ? 1 : 0; fp.kind = (u8)kind;
+    fp.ownerId = ownerId; fp.seq = row.pendingSeq;
+    fp.occupant[0] = occ.t; fp.occupant[1] = occ.c; fp.occupant[2] = occ.cs;
+    fp.occupant[3] = occ.i; fp.occupant[4] = occ.s;
+    for (int i = 0; i < 5; ++i) fp.furniture[i] = furn[i];
+    net.queueFurniture(fp);
+    row.pendingSendMs = now;
+    char b[176]; _snprintf(b, sizeof(b) - 1,
+        "[furn58] INTENT seq=%u occ=%u,%u on=%d kind=%d furn=%u,%u",
+        fp.seq, occ.i, occ.s, on ? 1 : 0, kind, furn[3], furn[4]);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+}
+
+void Replicator::queueFurnitureState(NetLink& net, u32 ownerId, const Key& occ,
+                                     bool on, int kind,
+                                     const unsigned int furn[5],
+                                     u32 ackOwnerId, u32 ackSeq) {
+    if (kind != 1 && kind != 2) return;
+    FurnitureRow& row = furnitureRows_[occ];
+    row.seeded = true; row.on = on; row.kind = on ? kind : 0;
+    for (int i = 0; i < 5; ++i) row.furn[i] = on ? furn[i] : 0;
+
+    FurniturePacket fp; memset(&fp, 0, sizeof(fp));
+    fp.type = (u8)PKT_FURNITURE; fp.mode = (u8)FURNITURE_STATE;
+    fp.on = on ? 1 : 0; fp.kind = (u8)kind;
+    fp.ownerId = ownerId; fp.seq = furnitureStateSeqOut_++;
+    if (fp.seq == 0) fp.seq = furnitureStateSeqOut_++;
+    fp.occupant[0] = occ.t; fp.occupant[1] = occ.c; fp.occupant[2] = occ.cs;
+    fp.occupant[3] = occ.i; fp.occupant[4] = occ.s;
+    for (int i = 0; i < 5; ++i) fp.furniture[i] = furn[i];
+    fp.ackOwnerId = ackOwnerId; fp.ackSeq = ackSeq;
+    net.queueFurniture(fp);
+    char b[192]; _snprintf(b, sizeof(b) - 1,
+        "[furn58] STATE seq=%u occ=%u,%u on=%d kind=%d ack=%u:%u",
+        fp.seq, occ.i, occ.s, on ? 1 : 0, kind, ackOwnerId, ackSeq);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+}
+
+void Replicator::applyFurniturePackets(GameWorld* gw, Inbound& in, NetLink& net,
+                                       u32 localId, bool isHost) {
+    hostRole_ = isHost;
+    localId_ = localId;
+    std::deque<InboundFurniture> got;
+    in.drainFurniture(got);
+    // Preserve the existing A/B escape hatch: disabled means discard the
+    // channel, not merely stop publishing while received rows still mutate.
+    if (!furnSync_) return;
+    for (std::deque<InboundFurniture>::iterator it = got.begin(); it != got.end(); ++it) {
+        const FurniturePacket& fp = it->pkt;
+        if (fp.ownerId != it->ownerId || fp.on > 1 ||
+            (fp.kind != 1 && fp.kind != 2) || fp.seq == 0) continue;
+        Key k; k.t = fp.occupant[0]; k.c = fp.occupant[1]; k.cs = fp.occupant[2];
+        k.i = fp.occupant[3]; k.s = fp.occupant[4];
+        FurnitureRow& row = furnitureRows_[k];
+
+        if (isHost) {
+            if (fp.mode != FURNITURE_INTENT || fp.ownerId == localId) continue;
+            // Only a body already being driven from this peer may be commanded
+            // by its intent. This prevents a forged packet from moving a Host-
+            // owned squad member or arbitrary world NPC.
+            if (ownHands_.find(k) != ownHands_.end() ||
+                targets_.find(k) == targets_.end()) continue;
+            u32 seen = row.intentSeen[fp.ownerId];
+            Character* occ = characterForFurnitureKey(k);
+            if (!occ) continue; // unresolved world object: leave unacked; retry is same-seq
+
+            engine::FurnitureRead before;
+            bool haveBefore = engine::readFurniture(occ, &before) && before.valid;
+            int beforeKind = haveBefore && (before.kind == 1 || before.kind == 2)
+                           ? before.kind : 0;
+            bool isNew = hostIntentIsNew(seen, fp.seq);
+            if (isNew) {
+                if (fp.on) {
+                    bool same = beforeKind == (int)fp.kind;
+                    for (int i = 0; same && i < 5; ++i)
+                        same = before.furn[i] == fp.furniture[i];
+                    if (!same && beforeKind == 0)
+                        engine::applyFurniture(gw, occ, fp.furniture, (int)fp.kind, true);
+                } else if (beforeKind == (int)fp.kind) {
+                    engine::applyFurniture(gw, occ, before.furn, beforeKind, false);
+                }
+                row.intentSeen[fp.ownerId] = fp.seq;
+                seen = fp.seq;
+            }
+
+            // Always answer duplicates too: this is the idempotent retry/ack path.
+            engine::FurnitureRead after;
+            bool haveAfter = engine::readFurniture(occ, &after) && after.valid;
+            int actualKind = haveAfter && (after.kind == 1 || after.kind == 2)
+                           ? after.kind : 0;
+            unsigned int stateFurn[5];
+            for (int i = 0; i < 5; ++i)
+                stateFurn[i] = actualKind ? after.furn[i] : fp.furniture[i];
+            int wireKind = actualKind ? actualKind : (int)fp.kind;
+            queueFurnitureState(net, localId, k, actualKind != 0, wireKind,
+                                stateFurn, fp.ownerId, seen);
+        } else {
+            if (fp.mode != FURNITURE_STATE || fp.seq <= row.stateSeqSeen) continue;
+            row.stateSeqSeen = fp.seq;
+            row.seeded = true; row.on = fp.on != 0; row.kind = fp.on ? fp.kind : 0;
+            for (int i = 0; i < 5; ++i) row.furn[i] = fp.on ? fp.furniture[i] : 0;
+            row.applyPending = true; row.applyOn = fp.on != 0;
+            row.applyKind = fp.kind;
+            for (int i = 0; i < 5; ++i) row.applyFurn[i] = fp.furniture[i];
+            if (hostIntentAckCovers(localId, row.pendingSeq,
+                                    fp.ackOwnerId, fp.ackSeq)) {
+                row.pendingSeq = 0; row.pendingSendMs = 0;
+            }
+            // A Host correction is a new baseline, not another local intent.
+            HostBody& hb = hostBody_[k];
+            hb.furnKind = fp.on ? fp.kind : 0;
+            for (int i = 0; i < 5; ++i) hb.furn[i] = fp.on ? fp.furniture[i] : 0;
+        }
+    }
+
+    if (!isHost) {
+        // Retain canonical rows across zone-load gaps. Reliable delivery proves
+        // the decision arrived; application simply waits for the local object.
+        for (std::map<Key, FurnitureRow>::iterator it = furnitureRows_.begin();
+             it != furnitureRows_.end(); ++it) {
+            FurnitureRow& row = it->second;
+            if (!row.applyPending) continue;
+            Character* occ = characterForFurnitureKey(it->first);
+            if (!occ) continue;
+            engine::FurnitureRead cur;
+            bool have = engine::readFurniture(occ, &cur) && cur.valid;
+            int curKind = have && (cur.kind == 1 || cur.kind == 2) ? cur.kind : 0;
+            bool ok = false;
+            if (row.applyOn) {
+                bool same = curKind == row.applyKind;
+                for (int i = 0; same && i < 5; ++i)
+                    same = cur.furn[i] == row.applyFurn[i];
+                if (same) {
+                    ok = true;
+                } else {
+                    // Canonical switches (or a wrong same-kind anchor) are an
+                    // ordered exit+enter locally; applyFurniture intentionally
+                    // refuses an enter while another attachment is active.
+                    bool released = curKind == 0 || engine::applyFurniture(
+                        gw, occ, cur.furn, curKind, false);
+                    ok = released && engine::applyFurniture(
+                        gw, occ, row.applyFurn, row.applyKind, true);
+                }
+            } else {
+                ok = curKind == 0 || engine::applyFurniture(
+                    gw, occ, have ? cur.furn : row.applyFurn,
+                    curKind ? curKind : row.applyKind, false);
+            }
+            if (ok) {
+                engine::endAction(occ);
+                row.applyPending = false;
+                // Spike 58 (kind-conflict anchor): the applied canonical row
+                // is the reliable edge that VOUCHES this body's cage/bed under
+                // protocol 59 (the legacy RECV ENTER events carry only the
+                // chained kind now). Stamp the vouch so a CHAINED-only
+                // continuous bit can't break this cage (chainAnchorStep); a
+                // canonical release withdraws it. Driven bodies only.
+                if (ownHands_.find(it->first) == ownHands_.end())
+                    targets_[it->first].furnEdgeKind =
+                        coop::furnEdgeVouchFromState(row.applyOn, row.applyKind);
+            }
+        }
+    }
+}
+
 void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
     std::deque<InboundEvent> got;
     in.drainEvents(got);
@@ -822,43 +1022,14 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 break;
             }
             case EVT_ENTER_FURNITURE: {
-                // Furniture occupancy (protocol 19): subject = the OCCUPANT,
-                // actor = the FURNITURE's save-stable hand (both clients loaded
-                // the same save, so it resolves locally). Run the engine's own
-                // setBedMode/setPrisonMode between the LOCAL pair - the in-bed/
-                // in-cage pose and transform are engine-native here. On a body
-                // we OWN, only a THIRD-PARTY placement is honoured (protocol
-                // 36): the world authority jailed our KO'd body (a guard
-                // action that runs purely on the host sim - our engine never
-                // executed it). Conscious voluntary use stays owner-authored:
-                // for those our engine did the real placement and this event
-                // is just the echo of our own edge.
+                // Protocol 59 owns beds/cages. Keep the legacy reliable event
+                // solely for protocol 41's chained/pole kind.
                 if (!furnSync_) break;
-                if (ownHands_.find(k) != ownHands_.end()) {
-                    Character* own = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
-                    bool down = own && coop::bodyIsDown(engine::readBodyState(own));
-                    engine::FurnitureRead ofr;
-                    bool already = own && engine::readFurniture(own, &ofr) &&
-                                   ofr.valid && ofr.kind == (int)ev.arg;
-                    // Race guard: the host re-authors PEER-ENTER on a 5 s
-                    // cadence, so one can be in flight when we free our own
-                    // body - a recent owner-side exit vetoes the stale enter.
-                    std::map<Key, unsigned long>::iterator ox = ownFurnExit_.find(k);
-                    bool justExited = ox != ownFurnExit_.end() &&
-                                      (nowMs() - ox->second) < 10000;
-                    if (!down || already || justExited) {
-                        char sb[160]; _snprintf(sb, sizeof(sb) - 1,
-                            "[furn] RECV PEER-ENTER own occ=%u,%u SKIP (down=%d already=%d exited=%d)",
-                            k.i, k.s, down ? 1 : 0, already ? 1 : 0,
-                            justExited ? 1 : 0);
-                        sb[sizeof(sb) - 1] = '\0'; coop::logLine(sb);
-                        break;
-                    }
-                }
-                Character* occ = resolvePeerChar(k);
+                int kind = (int)ev.arg;
+                if (kind != 3 || ownHands_.find(k) != ownHands_.end()) break;
+                Character* occ = resolvePeerChar(k);   // also a friend's body moved to another squad (TokelaCoop)
                 unsigned int fh[5] = { ev.aType, ev.aContainer, ev.aContainerSerial,
                                        ev.aIndex, ev.aSerial };
-                int kind = (int)ev.arg;
                 bool ok = occ && engine::applyFurniture(0, occ, fh, kind, true);
                 char fb[160]; _snprintf(fb, sizeof(fb) - 1,
                     "[furn] RECV ENTER id=%u occ=%u,%u furn=%u,%u kind=%d ok=%d",
@@ -871,6 +1042,7 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 // The inverse: release the local occupant. Idempotent - a copy
                 // that never entered locally (lost/late enter) is a no-op success.
                 if (!furnSync_) break;
+                if ((int)ev.arg != 3) break;
                 if (ownHands_.find(k) != ownHands_.end()) break;
                 Character* occ = resolvePeerChar(k);
                 unsigned int fh[5] = { ev.aType, ev.aContainer, ev.aContainerSerial,
@@ -944,6 +1116,14 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
     // which lands on the SAME new hand (run 120738) - would otherwise
     // silence our own edge's stream.
     if (pinOwned_.count(newK) || ownHands_.count(newK)) return;
+    // Author-release echo (gap 10 cross-tab control-release): a hand we
+    // ALREADY pinned peer is either our own release of a unit we moved into
+    // the peer's tab (publishSquadMoves) or a re-key this side already
+    // processed - classification and membership are settled, and the body
+    // (when local) is driven by direct hand resolution. Re-entering would
+    // fail the oldK resolve (our copy already re-containered away from it)
+    // and enroll a force-REQ whose reply can only dupe-defer forever - skip.
+    if (pinPeer_.count(newK)) return;
     // Phase 1b (control follows the squad transfer): does newK's destination tab
     // resolve to a rank THIS client owns? Uses the SAME predicate publishOwned
     // partitions on (ownRanks_ over the latched tabRank_). When true, the move
@@ -995,12 +1175,20 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
     // EVT_SQUAD_MOVE re-keyed it and un-pinned the body). Snapshot the latches
     // here and re-seed them onto targets_[newK] so the corpse stays down.
     bool carryDeath = false, carryKo = false, carryDown = false;
+    // Carry the furniture-edge vouch too: a caged+shackled prisoner whose
+    // hand re-keys mid-occupancy (recruit / squad move) would otherwise get a
+    // fresh Driven with furnEdgeKind=0, and the very next kind-3 tick reads
+    // CHAIN_ANCHOR_RECHAIN instead of HOLD (chainAnchorStep) - one 75-885 u
+    // re-seat teleport, exactly what the jail-anchor fix suppresses. The
+    // vouch is a reliable-edge fact about the BODY, not the hand.
+    int carryFurnKind = 0;
     {
         std::map<Key, Driven>::iterator oldT = targets_.find(oldK);
         if (oldT != targets_.end()) {
-            carryDeath = oldT->second.deathLatched;
-            carryKo    = oldT->second.koLatched;
-            carryDown  = oldT->second.downApplied;
+            carryDeath    = oldT->second.deathLatched;
+            carryKo       = oldT->second.koLatched;
+            carryDown     = oldT->second.downApplied;
+            carryFurnKind = oldT->second.furnEdgeKind;
         }
     }
     // Drop the old key's stream state too (run 192211: the interp TAIL of a
@@ -1024,6 +1212,17 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
             newK.t, newK.c, newK.cs, newK.i, newK.s,
             carryDeath ? 1 : 0, carryKo ? 1 : 0);
         lb[sizeof(lb) - 1] = '\0'; coop::logLine(lb);
+    }
+    if (carryFurnKind != 0) {
+        Driven& nd = targets_[newK]; // stream fills interp; we seed only the vouch
+        // A canonical STATE row already applied under the NEW hand is fresher
+        // than the migrated vouch - keep it and only fill the empty slot.
+        if (nd.furnEdgeKind == 0) nd.furnEdgeKind = carryFurnKind;
+        char fb[200]; _snprintf(fb, sizeof(fb) - 1,
+            "[event] REKEY-FURN old=%u,%u,%u,%u,%u new=%u,%u,%u,%u,%u kind=%d",
+            oldK.t, oldK.c, oldK.cs, oldK.i, oldK.s,
+            newK.t, newK.c, newK.cs, newK.i, newK.s, nd.furnEdgeKind);
+        fb[sizeof(fb) - 1] = '\0'; coop::logLine(fb);
     }
     Character* c = engine::resolveCharByHand(oldK.i, oldK.s, oldK.t, oldK.c, oldK.cs);
     if (!c) {
@@ -1125,7 +1324,18 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
         // into our squad), insertPeerMember pins the actual local hand OWNED so
         // publishOwned streams it and the local player controls it. Idempotent +
         // tab-aware, so a squad-move re-containers an existing member too.
-        insertPeerMember(gw, c, newK, tag, destOwned);
+        // Don't re-join a dead body to the player squad: joinPlayerSquadAt
+        // triggers the squad-portrait refresh, and a portrait for a dead/re-keyed
+        // hand derefs a null PortraitData (MainBarGUI crash on death). The corpse
+        // stays down via the death latch on targets_[newK]. KO'd members still insert.
+        if (carryDeath) {
+            char sk[176]; _snprintf(sk, sizeof(sk) - 1,
+                "[%s] MEMBER skip new=%u,%u,%u,%u,%u (death-latched corpse)",
+                (tag ? tag : "squad"), newK.t, newK.c, newK.cs, newK.i, newK.s);
+            sk[sizeof(sk) - 1] = '\0'; coop::logLine(sk);
+        } else {
+            insertPeerMember(gw, c, newK, tag, destOwned);
+        }
         if (destOwned) {
             // Control hand-off: drop every residual DRIVE artifact so publishOwned
             // streams the body immediately and applyTargets never fights our own
@@ -1155,6 +1365,15 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
                 (tag ? tag : "squad"), newK.t, newK.c, newK.cs, newK.i, newK.s);
             cf[sizeof(cf) - 1] = '\0'; coop::logLine(cf);
         }
+    } else if (carryDeath) {
+        // Dead body with no local copy: don't force-REQ/mint. Minting spawns a
+        // fresh unnamed corpse (the "Name" portrait that appears after a death,
+        // since proxy names aren't replicated). Suppress any in-flight reply mint.
+        rekeyedOld_[newK] = nowMs();
+        char fb[176]; _snprintf(fb, sizeof(fb) - 1,
+            "[%s] REKEY-DEAD skip-mint new=%u,%u,%u,%u,%u",
+            (tag ? tag : "squad"), newK.t, newK.c, newK.cs, newK.i, newK.s);
+        fb[sizeof(fb) - 1] = '\0'; coop::logLine(fb);
     } else {
         // ok=0: no local body at the OLD hand and no proxy to migrate. The
         // recruit/move fired while this hand was OUTSIDE our interest (the

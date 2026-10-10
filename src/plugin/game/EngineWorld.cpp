@@ -14,6 +14,7 @@
 
 #include "EngineInternal.h"
 #include <kenshi/ModInfo.h>        // ModInfo::file / header.version (protocol 56 mod list)
+#include "ProdTemplateMatch.h" // es_ES/stringID building-template matching (pure)
 
 namespace coop {
 namespace engine {
@@ -532,6 +533,15 @@ bool writeDoorByHand(const unsigned int dHand[5], int wantOpen, int wantLocked,
         DoorStuff* d = static_cast<DoorStuff*>(b);
         DoorState st = d->state;
         int curOpen = (st == DOORSTATE_OPEN || st == DOORSTATE_OPENING) ? 1 : 0;
+        int curLocked = (d->doorLock && g_doorIsLockedFn &&
+                         g_doorIsLockedFn(d)) ? 1 : 0;
+        // Combined unlock+open must unlock first; asking a locked door to open
+        // can make the polite path refuse and unnecessarily hit the force path.
+        if (wantLocked == 0 && curLocked && d->doorLock &&
+            g_doorUnlockFn) {
+            g_doorUnlockFn(d);
+            curLocked = 0;
+        }
         if (wantOpen != curOpen) {
             // Polite path first (animation + navmesh + sound - what a local
             // click does); the blunt UT force paths only when it refuses.
@@ -542,13 +552,18 @@ bool writeDoorByHand(const unsigned int dHand[5], int wantOpen, int wantLocked,
             }
         }
         if (wantLocked >= 0 && d->doorLock && g_doorLockFn && g_doorUnlockFn) {
-            int curLocked = (g_doorIsLockedFn && g_doorIsLockedFn(d)) ? 1 : 0;
+            curLocked = (g_doorIsLockedFn && g_doorIsLockedFn(d)) ? 1 : 0;
             if (wantLocked != curLocked) {
                 if (wantLocked) g_doorLockFn(d); else g_doorUnlockFn(d);
             }
         }
-        if (outAfter) fillDoorRead(d, outAfter);
-        return true;
+        DoorRead after;
+        fillDoorRead(d, &after);
+        if (outAfter) *outAfter = after;
+        bool openOk = wantOpen < 0 || after.open == wantOpen;
+        bool lockOk = wantLocked < 0 ||
+                      (after.hasLock && after.locked == wantLocked);
+        return openOk && lockOk;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         coop::logLine("[door] write SEH-except");
         return false;
@@ -1007,8 +1022,16 @@ int placeBuildingAt(GameWorld* gw, const char* sid, float x, float y, float z,
         // engine NESTS a createBuilding per extra floor inside this call - those
         // nested ones re-enter the capture hook and would echo this mint back.
         ++g_buildCaptureSuppress;
+        // Protocol-27 copies represent a PLAYER placement.  Passing a null
+        // owner created a visually present but orphaned workbench on the peer:
+        // Kenshi then rejected normal use as though nobody owned it.  Give the
+        // factory this client's corresponding player faction, matching the
+        // native build-menu creation path.  applyBuilds verifies the result and
+        // falls back to the deed state writer if this engine path leaves only a
+        // partial ownership state.
+        Faction* playerOwner = playerFactionOf(gw);
         Building* bld = g_createBldgFn(
-            gw->theFactory, tmpl, pos, /*town*/0, /*owner*/0, rot, /*cb*/0,
+            gw->theFactory, tmpl, pos, /*town*/0, playerOwner, rot, /*cb*/0,
             /*furnitureOf*/0, /*isDoorOf*/0, /*saveState*/0, /*isIndoorsOf*/0,
             /*invisible*/false, completed, /*isFoliage*/false,
             /*floor*/0, /*isOutsideFurniture*/false);
@@ -1073,13 +1096,21 @@ static GameData* findBuildTemplate(GameWorld* gw, bool wantDoor) {
     // "Training Dummy MkI" / the walk-in shack the English names pick.
     GameData* fixed = findTemplateBySid(n, wantDoor ? "778-gamedata.base" : "898-gamedata.base");
     if (fixed) return fixed;
-    const char* fixturePrefs[] = { "training dummy", "camp bed", "storage", "well" };
-    const char* doorPrefs[]    = { "small shack", "shack", "storm house", "small house" };
-    const char** prefs = wantDoor ? doorPrefs : fixturePrefs;
-    for (unsigned int k = 0; k < 4; ++k) {
+    // Preference lists + matching live in ProdTemplateMatch.h (pure, unit
+    // tested) - same fix as findProdTemplate: on an es_ES game the display
+    // NAME is translated, so English-only terms never matched and the probe
+    // logged "[build] probe-place no template" (build_sync/latejoin_sync/
+    // save_stage1, runs 20260926_215034..220003). A candidate matches by name
+    // (English OR Spanish terms) OR by the language-independent stringID.
+    unsigned int nPrefs = 0;
+    const char* const* prefs = wantDoor ? prodtmpl::doorPrefs(&nPrefs)
+                                        : prodtmpl::fixturePrefs(&nPrefs);
+    for (unsigned int k = 0; k < nPrefs; ++k) {
         for (unsigned int i = 0; i < n; ++i) {
             GameData* gd = g_dataScratch[i];
-            if (gd && ciContains(gd->name.c_str(), prefs[k])) return gd;
+            if (gd && prodtmpl::matches(gd->name.c_str(),
+                                        gd->stringID.c_str(), prefs[k]))
+                return gd;
         }
     }
     return 0;
@@ -1232,6 +1263,7 @@ static void fillProdRead(Building* b, ProdRead* r) {
             r->outAmount = outBuf->amount;
             r->outCap    = outBuf->maxCapacity;
             if (outBuf->item) {
+                r->outType = (unsigned int)outBuf->item->type;
                 strncpy(r->outSid, outBuf->item->stringID.c_str(),
                         sizeof(r->outSid) - 1);
                 r->outSid[sizeof(r->outSid) - 1] = '\0';
@@ -1246,6 +1278,7 @@ static void fillProdRead(Building* b, ProdRead* r) {
                 ? g_machProdDataCraftFn : g_machProdDataBaseFn;
             GameData* pd = pf ? pf(b) : 0;
             if (pd) {
+                r->outType = (unsigned int)pd->type;
                 strncpy(r->outSid, pd->stringID.c_str(), sizeof(r->outSid) - 1);
                 r->outSid[sizeof(r->outSid) - 1] = '\0';
             }
@@ -1322,6 +1355,47 @@ bool readMachineByHand(const unsigned int mHand[5], ProdRead* out) {
         fillProdRead(b, out);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool writeMachineRecipeByHand(GameWorld* gw, const unsigned int mHand[5],
+                              const char* recipeSid, unsigned int recipeType,
+                              float amount, bool requireEmpty,
+                              ProdRead* outAfter) {
+    if (outAfter) memset(outAfter, 0, sizeof(*outAfter));
+    if (!gw || !mHand || !recipeSid || !recipeSid[0] || !g_machSetProdItemFn)
+        return false;
+    GameData* recipe = findItemTemplateImpl(gw, recipeSid, recipeType);
+    if (!recipe || recipe->stringID != recipeSid ||
+        (unsigned int)recipe->type != recipeType)
+        return false; // exact stable identity only; never fall back by display name
+    RootObject* ro = resolveObjectByHand(mHand);
+    if (!ro) return false;
+    __try {
+        Building* b = static_cast<Building*>(ro);
+        int ct = (int)b->classType;
+        if (!isProductionClassType(ct) || !b->_buildState.isComplete) return false;
+        ProductionBuilding* pb = static_cast<ProductionBuilding*>(b);
+        StorageBuilding::ConsumptionItem* cur = pb->productionItem;
+        bool same = cur && cur->item &&
+                    cur->item->stringID == recipeSid &&
+                    (unsigned int)cur->item->type == recipeType;
+        // Host validation: never replace a different, non-empty canonical
+        // buffer. That would turn a remote UI click into item destruction.
+        if (requireEmpty && !same && cur && cur->amount > 0.005f)
+            return false;
+        float useAmount = amount >= 0.0f ? amount : 0.0f;
+        int stack = (int)useAmount;
+        float progress = useAmount - (float)stack;
+        g_machSetProdItemFn(pb, recipe, stack, progress);
+        ProdRead verify;
+        fillProdRead(b, &verify);
+        if (outAfter) *outAfter = verify;
+        return verify.outType == recipeType &&
+               strcmp(verify.outSid, recipeSid) == 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[prod] recipe-write SEH-except");
+        return false;
+    }
 }
 
 bool writeMachineByHand(const unsigned int mHand[5], int wantPower,
@@ -1432,20 +1506,12 @@ static GameData* findProdTemplate(GameWorld* gw, int kind, int skip) {
     g_dataScratch.clear();
     g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, BUILDING);
     unsigned int n = g_dataScratch.size();
-    const char* genPrefs[]   = { "small wind generator", "wind generator",
-                                 "small generator", "generator" };
-    const char* craftPrefs[] = { "armour crafting bench", "weapon smithing bench",
-                                 "weapon smith", "engineering bench" };
-    const char* storePrefs[] = { "general storage", "storage box", "storage chest",
-                                 "chest", "storage" };
-    const char* resPrefs[]   = { "small research bench", "research bench",
-                                 "research" };
-    const char** prefs;
-    unsigned int nPrefs;
-    if (kind == 0)      { prefs = genPrefs;   nPrefs = 4; }
-    else if (kind == 2) { prefs = storePrefs; nPrefs = 5; }
-    else if (kind == 3) { prefs = resPrefs;   nPrefs = 3; }
-    else                { prefs = craftPrefs; nPrefs = 4; }
+    // Preference lists + matching live in ProdTemplateMatch.h (pure, unit
+    // tested). On an es_ES game the display NAME is translated, so a candidate
+    // matches by name (English OR Spanish terms) OR by stringID - the internal
+    // FCS id, stable and language-independent (fixes "no template" on es_ES).
+    unsigned int nPrefs = 0;
+    const char* const* prefs = prodtmpl::prefsForKind(kind, &nPrefs);
     GameData* seen[16];
     unsigned int nSeen = 0;
     // First candidate by stringID (see findBuildTemplate on localized names): the
@@ -1464,7 +1530,9 @@ static GameData* findProdTemplate(GameWorld* gw, int kind, int skip) {
     for (unsigned int k = 0; k < nPrefs; ++k) {
         for (unsigned int i = 0; i < n; ++i) {
             GameData* gd = g_dataScratch[i];
-            if (!gd || !ciContains(gd->name.c_str(), prefs[k])) continue;
+            if (!gd || !prodtmpl::matches(gd->name.c_str(),
+                                          gd->stringID.c_str(), prefs[k]))
+                continue;
             bool dup = false; // a name can match several prefs
             for (unsigned int s = 0; s < nSeen; ++s)
                 if (seen[s] == gd) { dup = true; break; }

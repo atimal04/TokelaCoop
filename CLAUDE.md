@@ -167,7 +167,7 @@ Compatibilidad comprobada con análisis estático (2026-09-23), no ejecutando el
 - Scripts en PowerShell 5.1, con los `.ps1`/`.psm1` en UTF-8 con BOM (si no, 5.1 rompe las tildes).
 - Tests sin juego, que el CI ejecuta con `powershell` 5.1:
   - `scripts/tests/Installer.Tests.ps1`, con carpetas falsas (incluye la migración y el `.mod` publicado);
-  - `scripts/tests/Contract.Tests.ps1` (manifiesto, oráculos y que no quede ningún `KENSHICOOP_`).
+  - `scripts/tests/Contract.Tests.ps1` (manifiesto, oráculos y que no quede ningún `TOKELACOOP_`).
 - El `.mod` (`dist/mods/TokelaCoop/TokelaCoop.mod`) lo genera `tools/MultiplayerStartGen` (necesita .NET 9 y un
   Kenshi); para cambiar solo textos (nombres, descripciones) basta `scripts/ModText.psm1`, que recalcula la
   longitud de cada registro y se niega a tocar un StringId.

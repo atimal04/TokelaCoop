@@ -12,6 +12,7 @@
 // the API consumed by the PowerShell oracles (see resources/CODE_MAP.md).
 
 #include "EngineInternal.h"
+#include "ProdTemplateMatch.h" // es_ES/stringID building-template matching (pure)
 #include "../core/WorkPose.h" // SEAT_MATCH_DIST / WORK_MATCH_DIST / poseMatchDist
 
 namespace coop {
@@ -187,8 +188,36 @@ Character* adoptCandidateNear(GameWorld* gw, const char* charSid,
     }
 }
 
+// setName takes a std::string (destructor forbids __try in-frame): the POD-only
+// shim wraps the non-POD callee, mirroring charName/charNameCopy.
+void setProxyNameCopy(Character* c, const char* name) {
+    c->setName(std::string(name));
+}
+void setProxyNameGuarded(Character* c, const char* name) {
+    if (!c || !name || !name[0]) return;
+    __try {
+        setProxyNameCopy(c, name);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// Age read/write for the stats-channel animal-scale sync (protocol 63). Age
+// drives CharacterAnimal body scale; humans return a cosmetic age (harmless).
+float charAge(Character* c) {
+    if (!c) return -1.0f;
+    __try {
+        return c->getAge();
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1.0f; }
+}
+void setCharAge(Character* c, float age) {
+    if (!c || !(age > 0.0f && age < 1.0e6f)) return;
+    __try {
+        c->setAge(age);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
-                         float x, float y, float z, float heading, float age) {
+                         float x, float y, float z, float heading, float age,
+                         const char* name) {
     if (!gw || !gw->theFactory || !g_createCharFn || !charSid || !charSid[0]) return 0;
     // Creature-size sync (protocol 39): animals scale body size by age, so the
     // proxy must be CREATED at the host's age or it spawns full-grown (the
@@ -235,6 +264,9 @@ Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
     // authority for a proxy (AI-suspend re-asserts this every driven tick).
     detachFromTownAI(c);
     clearGoals(c);
+    // Name sync (protocol 63): give the proxy the host body's name so runtime
+    // NPCs/recruits don't show Kenshi's default "Name" on the peer.
+    setProxyNameGuarded(c, name);
     return c;
 }
 
@@ -487,21 +519,27 @@ RootObject* findFurnitureNear(GameWorld* gw, int kind) {
         g_npcQuery.clear();
         g_getObjsFn(gw, &g_npcQuery, &center, 60.0f, BUILDING, 256, 0);
         unsigned int total = g_npcQuery.size();
-        const char* bedPrefs[]  = { "camp bed", "bedroll", "bed" };
-        const char* cagePrefs[] = { "prisoner cage", "cage" };
+        // Preference lists in ProdTemplateMatch.h: name (EN or ES) OR stringID,
+        // so an es_ES client relocates the same baked fixture (the English-only
+        // lists matched nothing on a localized game - the "no template" class).
+        unsigned int nBed = 0, nCage = 0, nPole = 0;
+        const char* const* bedPrefs  = prodtmpl::bedPrefs(&nBed);
+        const char* const* cagePrefs = prodtmpl::cagePrefs(&nCage);
         // kind==4: a PRISONER POLE. Same engine containment as a cage (kind=2 /
         // setPrisonMode) but a distinct model - prefer pole/shackle names so a
         // world holding both a cage and a pole picks the pole.
-        const char* polePrefs[] = { "prisoner pole", "cage pole", "shackle", "pole" };
-        const char** prefs = (kind == 4) ? polePrefs
-                                          : ((kind == 2) ? cagePrefs : bedPrefs);
-        const unsigned int nprefs = (kind == 4) ? 4u : ((kind == 2) ? 2u : 3u);
+        const char* const* polePrefs = prodtmpl::polePrefs(&nPole);
+        const char* const* prefs = (kind == 4) ? polePrefs
+                                               : ((kind == 2) ? cagePrefs : bedPrefs);
+        const unsigned int nprefs = (kind == 4) ? nPole : ((kind == 2) ? nCage : nBed);
         for (unsigned int k = 0; k < nprefs; ++k) {
             for (unsigned int i = 0; i < total; ++i) {
                 RootObject* o = g_npcQuery[i];
                 if (!o) continue;
                 GameData* gd = o->getGameData();
-                if (gd && ciContains(gd->name.c_str(), prefs[k])) return o;
+                if (gd && prodtmpl::matches(gd->name.c_str(),
+                                            gd->stringID.c_str(), prefs[k]))
+                    return o;
             }
         }
         // The names above are the English ones: a Kenshi running in another
@@ -1077,11 +1115,12 @@ bool setupCraftScene(GameWorld* gw) {
 
     // Pick the task from the chosen fixture name: a dummy is "used", everything
     // else is "operated". (findMachineTemplate prioritises a training dummy.)
+    // Name (EN or ES) OR stringID, so an es_ES bake picks the same task.
     int task = OPERATE_MACHINERY;
     {
         GameData* tmpl = findMachineTemplate(gw);
-        if (tmpl && (ciContains(tmpl->name.c_str(), "dummy") ||
-                     ciContains(tmpl->name.c_str(), "bag")))
+        if (tmpl && prodtmpl::isTrainingFixture(tmpl->name.c_str(),
+                                                tmpl->stringID.c_str()))
             task = USE_TRAINING_DUMMY;
     }
     // Borrow a live non-player faction from a nearby NPC so the worker is NOT a
@@ -1152,7 +1191,11 @@ bool knockDown(Character* c, bool on) {
             // well past the re-arm interval. Fall back to ragdoll if unresolved.
             if (g_knockoutFn || g_knockoutForceFn) {
                 MedicalSystem* med = &c->medical;
-                if (g_knockoutFn)      g_knockoutFn(med, 1.0f);
+                if (g_knockoutFn) {
+                    g_suppressKnockoutReport = true;
+                    g_knockoutFn(med, 1.0f);
+                    g_suppressKnockoutReport = false;
+                }
                 if (g_knockoutForceFn) g_knockoutForceFn(med, 8.0f);
                 return true;
             }
@@ -1164,6 +1207,22 @@ bool knockDown(Character* c, bool on) {
         if (g_ragdollModeFn)   g_ragdollModeFn(c, false, RagdollPart::WHOLE);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_suppressKnockoutReport = false;
+        return false;
+    }
+}
+
+bool applyKnockout(Character* c, float skill) {
+    if (!c || !g_knockoutFn) return false;
+    __try {
+        if (skill < 0.0f) skill = 0.0f;
+        if (skill > 1.0f) skill = 1.0f;
+        g_suppressKnockoutReport = true;
+        g_knockoutFn(&c->medical, skill);
+        g_suppressKnockoutReport = false;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_suppressKnockoutReport = false;
         return false;
     }
 }

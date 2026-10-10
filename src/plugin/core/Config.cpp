@@ -244,6 +244,12 @@ void loadConfig(Config& c) {
     c.researchSync = envOr("TOKELACOOP_RESEARCH_SYNC", "1") != "0";
     c.deedSync    = envOr("TOKELACOOP_DEED_SYNC", "1") != "0";
     c.fixtureSync = envOr("TOKELACOOP_FIXTURE_SYNC", "1") != "0";
+    c.bountySync = envOr("TOKELACOOP_BOUNTY_SYNC", "1") != "0";
+    // The bounty channel (protocol 62) coexists with the read-only spike-59
+    // probe (TOKELACOOP_BOUNTY_PROBE): the probe only READS, so both can run,
+    // but keep the write channel OFF while probing the unsynced baseline.
+    if (envOr("TOKELACOOP_BOUNTY_PROBE", "0") == "1") c.bountySync = false;
+
     c.storeSync   = envOr("TOKELACOOP_STORE_SYNC", "1") != "0";
     c.squadSync   = envOr("TOKELACOOP_SQUAD_SYNC", "1") != "0";
     c.latejoinSync = envOr("TOKELACOOP_LATEJOIN_SYNC", "1") != "0";

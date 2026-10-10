@@ -28,6 +28,14 @@ const enet_uint8 CH_UNRELIABLE = 1;  // entity batches / stealth / cam (newest s
 const enet_uint8 CH_BULK       = 2;  // coordinated save/load transfer (bulk reliable)
 const int        CH_COUNT      = 3;  // channels negotiated at host-create / connect
 
+// Disconnect reason codes carried in enet_peer_disconnect(peer, data) - ENet
+// delivers 'data' to the peer as event.data on its DISCONNECT event. This is how
+// the HOST tells a REJECTED joiner WHY (the host detects a version mismatch at
+// HELLO, before any WELCOME, so the join otherwise just sees a bare disconnect
+// and no on-screen reason). 0 = normal/graceful (ENet's default); nonzero = a
+// specific reason the peer can map to a user-facing message.
+const enet_uint32 DISCONNECT_VERSION_MISMATCH = 1;
+
 // Net-thread diagnostics. OutputDebugStringA is thread-safe, and CoopLog guards
 // its FILE* with a lock, so both are safe to call off the main thread.
 void netLog(const char* msg) {
@@ -48,6 +56,20 @@ void netErr(const char* msg) {
     buf[sizeof(buf) - 1] = '\0';
     coop::logErrLine(buf);
 }
+
+// Cross-thread UI-error channel backing store (see NetLink.h). The buffer holds
+// the latest player-facing connection-reject reason; the NET thread writes it and
+// the MAIN thread reads it. Wrapped in a global object whose constructor runs at
+// DLL load under the loader lock (single-threaded, before any net thread exists),
+// so the CRITICAL_SECTION is always initialized before first use - no lazy-init
+// race (VC10 has no thread-safe function-local statics).
+struct NetUiErrChannel {
+    CRITICAL_SECTION cs;
+    char             buf[256];
+    NetUiErrChannel() { InitializeCriticalSection(&cs); buf[0] = '\0'; }
+    ~NetUiErrChannel() { DeleteCriticalSection(&cs); }
+};
+NetUiErrChannel g_netUiErr; // constructed at DLL load, destroyed at unload
 
 // Monotonic ms clock for the batch send stamp (v35). QPC, not GetTickCount:
 // the receiver reconstructs snapshot SPACING from consecutive stamps, and
@@ -126,6 +148,31 @@ unsigned admittedPeersExcept(const ENetHost* host, const ENetPeer* except) {
 }
 } // namespace
 
+// Cross-thread UI-error channel (declared in NetLink.h). setNetUiError() is
+// called on the NET thread; netUiError()/clearNetUiError() on the MAIN thread.
+// All three take the same lock, so the buffer is never read mid-write.
+void setNetUiError(const char* msg) {
+    EnterCriticalSection(&g_netUiErr.cs);
+    _snprintf(g_netUiErr.buf, sizeof(g_netUiErr.buf) - 1, "%s", msg ? msg : "");
+    g_netUiErr.buf[sizeof(g_netUiErr.buf) - 1] = '\0';
+    LeaveCriticalSection(&g_netUiErr.cs);
+}
+const char* netUiError() {
+    // The caller (F2 panel) is MAIN-thread only, so copy the shared buffer into a
+    // MAIN-thread-private static under the lock and hand back a stable pointer -
+    // the returned string can't be torn by a concurrent NET-thread write.
+    static char mainCopy[256];
+    EnterCriticalSection(&g_netUiErr.cs);
+    memcpy(mainCopy, g_netUiErr.buf, sizeof(mainCopy));
+    LeaveCriticalSection(&g_netUiErr.cs);
+    return mainCopy;
+}
+void clearNetUiError() {
+    EnterCriticalSection(&g_netUiErr.cs);
+    g_netUiErr.buf[0] = '\0';
+    LeaveCriticalSection(&g_netUiErr.cs);
+}
+
 NetLink::NetLink()
     : isHost_(false), port_(0),
       enetHost_(0), serverPeer_(0), inbound_(0),
@@ -145,12 +192,14 @@ NetLink::~NetLink() {
 }
 
 bool NetLink::startHost(int port, Inbound* inbound) {
+    clearNetUiError(); // wipe any reject reason from a previous attempt
     isHost_ = true; port_ = port; inbound_ = inbound; myId_ = 0;
     refusal_ = 0; noAnswerSince_ = 0; peerRefused_ = 0; peerRefusedTick_ = 0; admitted_ = 0;
     return launchThread();
 }
 
 bool NetLink::startClient(const std::string& ip, int port, Inbound* inbound) {
+    clearNetUiError(); // wipe any reject reason from a previous attempt
     isHost_ = false; ip_ = ip; port_ = port; inbound_ = inbound; myId_ = 0;
     refusal_ = 0; noAnswerSince_ = 0; peerRefused_ = 0; peerRefusedTick_ = 0; admitted_ = 0;
     return launchThread();
@@ -229,6 +278,10 @@ void NetLink::queueInvSnapshot(u32 ownerId, u8 keyKind, const u32 cKey[5],
     pushLocked(outCs_, outInv_, oi);
 }
 
+void NetLink::queueInvSaveFence(const InvSaveFencePacket& pkt) {
+    pushLocked(outCs_, outInvSaveFence_, pkt);
+}
+
 void NetLink::queueWorldItems(u32 ownerId, const WorldItemEntry* items, unsigned int count) {
     OutWorldItems ow;
     ow.ownerId = ownerId;
@@ -284,14 +337,23 @@ void NetLink::queueFaction(const FactionPacket& pkt) { pushLocked(outCs_, outFac
 void NetLink::queueTime(const TimePacket& pkt) { pushLocked(outCs_, outTime_, pkt); }
 
 void NetLink::queueDoor(const DoorPacket& pkt) { pushLocked(outCs_, outDoor_, pkt); }
+void NetLink::queueDoorIntent(const DoorIntentPacket& pkt) {
+    pushLocked(outCs_, outDoorIntent_, pkt);
+}
 
 void NetLink::queueProd(const ProdPacket& pkt) { pushLocked(outCs_, outProd_, pkt); }
+void NetLink::queueProdIntent(const ProdIntentPacket& pkt) {
+    pushLocked(outCs_, outProdIntent_, pkt);
+}
 
 void NetLink::queueResearch(const ResearchPacket& pkt) { pushLocked(outCs_, outResearch_, pkt); }
 
 void NetLink::queueDeed(const DeedPacket& pkt) { pushLocked(outCs_, outDeed_, pkt); }
 
 void NetLink::queueFixture(const FixturePacket& pkt) { pushLocked(outCs_, outFixture_, pkt); }
+
+void NetLink::queueFurniture(const FurniturePacket& pkt) { pushLocked(outCs_, outFurniture_, pkt); }
+void NetLink::queueBounty(const BountyPacket& pkt) { pushLocked(outCs_, outBounty_, pkt); }
 
 void NetLink::queueBuildPlace(const BuildPlacePacket& pkt) { pushLocked(outCs_, outBuildPlace_, pkt); }
 
@@ -300,6 +362,8 @@ void NetLink::queueBuildState(const BuildStatePacket& pkt) { pushLocked(outCs_, 
 void NetLink::queueBuildDoor(const BuildDoorPacket& pkt) { pushLocked(outCs_, outBuildDoor_, pkt); }
 
 void NetLink::queueBuildRemove(const BuildRemovePacket& pkt) { pushLocked(outCs_, outBuildRemove_, pkt); }
+
+void NetLink::queueBuildIntent(const BuildIntentPacket& pkt) { pushLocked(outCs_, outBuildIntent_, pkt); }
 
 void NetLink::queueStealth(const StealthPacket& pkt) { pushLocked(outCs_, outStealth_, pkt); }
 
@@ -312,6 +376,7 @@ void NetLink::queueSpawnReq(const SpawnReqPacket& pkt) { pushLocked(outCs_, outS
 void NetLink::queueSpawnInfo(const SpawnInfoPacket& pkt) { pushLocked(outCs_, outSpawnInfo_, pkt); }
 
 void NetLink::queueWorldPickup(const WorldPickupPacket& pkt) { pushLocked(outCs_, outWorldPickups_, pkt); }
+void NetLink::queueNativeTaken(const WorldNativeTakenPacket& pkt) { pushLocked(outCs_, outNativeTaken_, pkt); }
 
 void NetLink::queueInvXfer(const InvXferPacket& pkt) { pushLocked(outCs_, outInvXfers_, pkt); }
 
@@ -741,6 +806,14 @@ void NetLink::threadLoop() {
                                                   items, hdr.count, hdr.flags);
                             }
                         }
+                    } else if (type == PKT_INV_SAVE_FENCE) {
+                        // Protocol 61 inventory save fence. Direction determines
+                        // whether the marker is a Host request or Join completion.
+                        InvSaveFencePacket sfp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &sfp)
+                            && inbound_) {
+                            inbound_->pushInvSaveFence(sfp.ownerId, sfp);
+                        }
                     } else if (type == PKT_WORLD_ITEM) {
                         // Reliable world-item snapshot (Phase W1). Delivered immediately
                         // (not through the WAN-sim delay buffer), like the inventory
@@ -790,6 +863,17 @@ void NetLink::threadLoop() {
                                 inbound_->pushWorldClaim(hdr.ownerId, hdr.authorId,
                                                          netIds, hdr.count);
                             }
+                        }
+                    } else if (type == PKT_NATIVE_TAKEN) {
+                        // A peer consumed a save-native ground item (protocol
+                        // 56) - never streamed, no netId - so WE destroy our
+                        // own still-on-ground copy, located by template +
+                        // position (the shared save data).
+                        if (ev.packet->dataLength >= sizeof(WorldNativeTakenPacket) && inbound_) {
+                            WorldNativeTakenPacket wnt;
+                            std::memcpy(&wnt, ev.packet->data, sizeof(wnt));
+                            wnt.stringID[sizeof(wnt.stringID) - 1] = '\0';
+                            inbound_->pushNativeTaken(wnt.ownerId, wnt);
                         }
                     } else if (type == PKT_NPC_CENSUS) {
                         // Reliable wide-radius NPC existence census (protocol
@@ -917,12 +1001,20 @@ void NetLink::threadLoop() {
                             inbound_->pushTime(ti.ownerId, ti);
                         }
                     } else if (type == PKT_DOOR) {
-                        // Reliable baked-door state row (protocol 26):
-                        // symmetric change-gated, disambiguated on apply.
+                        // Reliable Host-canonical baked-door state row
+                        // (protocol 26/57).
                         DoorPacket dp;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &dp)
                             && inbound_) {
                             inbound_->pushDoor(dp.ownerId, dp);
+                        }
+                    } else if (type == PKT_DOOR_INTENT) {
+                        // Reliable idempotent door request (protocol 57,
+                        // Join -> Host). The game thread validates and mutates.
+                        DoorIntentPacket di;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &di)
+                            && inbound_) {
+                            inbound_->pushDoorIntent(di.ownerId, di);
                         }
                     } else if (type == PKT_PROD) {
                         // Reliable host-authoritative machine state row
@@ -931,6 +1023,15 @@ void NetLink::threadLoop() {
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &pp)
                             && inbound_) {
                             inbound_->pushProd(pp.ownerId, pp);
+                        }
+                    } else if (type == PKT_PROD_INTENT) {
+                        // Reliable idempotent recipe request (protocol 56,
+                        // join -> host). The host validates; this packet never
+                        // writes machine state directly on the receiver thread.
+                        ProdIntentPacket pi;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &pi)
+                            && inbound_) {
+                            inbound_->pushProdIntent(pi.ownerId, pi);
                         }
                     } else if (type == PKT_RESEARCH) {
                         // Reliable host-authoritative known-research row
@@ -955,6 +1056,26 @@ void NetLink::threadLoop() {
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &fxp)
                             && inbound_) {
                             inbound_->pushFixture(fxp.ownerId, fxp);
+                        }
+                    } else if (type == PKT_FURNITURE) {
+                        // Reliable join intent / host-canonical bed+cage row (v58).
+                        FurniturePacket fp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &fp)
+                            && inbound_) {
+                            // Unlike legacy owner-tagged rows, intents need the
+                            // transport identity so a payload cannot impersonate
+                            // another owner. The server is always owner 0.
+                            u32 senderId = isHost_
+                                ? (u32)(size_t)ev.peer->data : (u32)0;
+                            inbound_->pushFurniture(senderId, fp);
+                        }
+                    } else if (type == PKT_BOUNTY) {
+                        // Reliable host-authoritative bounty/crime row
+                        // (protocol 62), applied via the BountyManager levers.
+                        BountyPacket bp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &bp)
+                            && inbound_) {
+                            inbound_->pushBounty(bp.ownerId, bp);
                         }
                     } else if (type == PKT_BUILD_PLACE) {
                         // Reliable placed-building announcement (protocol 27):
@@ -981,12 +1102,22 @@ void NetLink::threadLoop() {
                             inbound_->pushBuildDoor(bd.ownerId, bd);
                         }
                     } else if (type == PKT_BUILD_REMOVE) {
-                        // Reliable placer-authoritative building removal
-                        // (protocol 28).
+                        // Reliable Host-canonical building removal (protocol 60).
                         BuildRemovePacket br;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &br)
                             && inbound_) {
                             inbound_->pushBuildRemove(br.ownerId, br);
+                        }
+                    } else if (type == PKT_BUILD_INTENT) {
+                        // Reliable idempotent placement/removal request
+                        // (protocol 60, Join -> Host). Stamp the actual peer id;
+                        // the game thread rejects a forged packet owner.
+                        BuildIntentPacket bi;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &bi)
+                            && inbound_) {
+                            u32 senderId = isHost_
+                                ? (u32)(size_t)ev.peer->data : (u32)0;
+                            inbound_->pushBuildIntent(senderId, bi);
                         }
                     } else if (type == PKT_STEALTH) {
                         // Unreliable stealth detection-map snapshot (protocol 20).
@@ -1339,12 +1470,35 @@ void NetLink::threadLoop() {
             }
         }
 
+        // Drain + send any queued save-native pickup notices on CH_RELIABLE (protocol 56).
+        std::vector<WorldNativeTakenPacket> takes;
+        EnterCriticalSection(&outCs_);
+        takes.swap(outNativeTaken_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < takes.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&takes[i], sizeof(WorldNativeTakenPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
         // Drain + send any queued container-contents snapshots on CH_RELIABLE. Each
         // is [InvSnapshotHeader][InvItemEntry*count]; only enqueued on content-change,
         // so this channel stays quiet. Reliable so the change survives WAN loss.
         std::vector<OutInv> invs;
+        std::vector<InvSaveFencePacket> invSaveFences;
         EnterCriticalSection(&outCs_);
         invs.swap(outInv_);
+        // Swap snapshots and fence markers under ONE lock. The main thread
+        // queues every checkpoint snapshot before its ACK; this atomic batch
+        // observation plus the send order below means an ACK can never overtake
+        // a snapshot, even if the two threads meet between queue calls.
+        invSaveFences.swap(outInvSaveFence_);
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < invs.size(); ++i) {
             unsigned count = (unsigned)invs[i].items.size();
@@ -1367,6 +1521,20 @@ void NetLink::threadLoop() {
             if (count > 0)
                 std::memcpy(out->data + sizeof(hdr), &invs[i].items[0],
                             count * sizeof(InvItemEntry));
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+        // Same CH_RELIABLE and strictly AFTER invs: protocol 60 relies on ENet's
+        // per-channel ordering to make ACK a real snapshot-delivery fence.
+        for (size_t i = 0; i < invSaveFences.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&invSaveFences[i],
+                                                 sizeof(InvSaveFencePacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);
             } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
@@ -1688,8 +1856,8 @@ void NetLink::threadLoop() {
             }
         }
 
-        // Drain + send any queued baked-door state rows on CH_RELIABLE
-        // (protocol 26). Change-gated by the Replicator; a settled town is
+        // Drain + send any queued Host-canonical baked-door state rows on
+        // CH_RELIABLE (protocol 26/57). Change-gated by the Replicator; a settled town is
         // silent. A lost row would leave a door diverged until the safety
         // resend, so reliable is the right channel.
         std::vector<DoorPacket> doorPkts;
@@ -1702,6 +1870,24 @@ void NetLink::threadLoop() {
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);
             } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send Join door intents on CH_RELIABLE. This vector is empty
+        // at rest; while an acknowledgement is missing the same seq may retry.
+        std::vector<DoorIntentPacket> doorIntentPkts;
+        EnterCriticalSection(&outCs_);
+        doorIntentPkts.swap(outDoorIntent_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < doorIntentPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&doorIntentPkts[i],
+                                                 sizeof(DoorIntentPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (!isHost_ && serverPeer_ &&
+                serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
                 enet_peer_send(serverPeer_, CH_RELIABLE, out);
             } else {
                 enet_packet_destroy(out);
@@ -1722,6 +1908,24 @@ void NetLink::threadLoop() {
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);
             } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send join recipe intents. At rest this vector is empty; while
+        // an acknowledgement is missing the same seq may be retried safely.
+        std::vector<ProdIntentPacket> prodIntentPkts;
+        EnterCriticalSection(&outCs_);
+        prodIntentPkts.swap(outProdIntent_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < prodIntentPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&prodIntentPkts[i],
+                                                 sizeof(ProdIntentPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (!isHost_ && serverPeer_ &&
+                serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
                 enet_peer_send(serverPeer_, CH_RELIABLE, out);
             } else {
                 enet_packet_destroy(out);
@@ -1768,6 +1972,27 @@ void NetLink::threadLoop() {
             }
         }
 
+        // Drain + send any queued bounty/crime rows on CH_RELIABLE (protocol
+        // 62). Host -> joins only (the Replicator only publishes on the host);
+        // change-gated + safety-resent by the caller, so a settled wanted level
+        // is near-silent. A lost row would leave a bounty diverged until the
+        // safety resend, so reliable is the right channel.
+        std::vector<BountyPacket> bountyPkts;
+        EnterCriticalSection(&outCs_);
+        bountyPkts.swap(outBounty_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < bountyPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&bountyPkts[i], sizeof(BountyPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
         // Drain + send any queued runtime-fixture identity rows on CH_RELIABLE
         // (protocol 55). SYMMETRIC: the pose path is bidirectional, so each side
         // must be able to translate the other's fixture hands.
@@ -1787,13 +2012,35 @@ void NetLink::threadLoop() {
             }
         }
 
-        // Drain + send any queued placed-building announcements + progress
-        // rows on CH_RELIABLE (protocol 27). PLACE is a one-shot describe/mint
-        // edge (a lost one strands an invisible building on the peer - the
-        // protocol-21 lesson); STATE rows are change-gated by the Replicator
-        // (~1 Hz sample, 10 s safety resend while incomplete), so the channel
-        // is silent once every site completes. Same-channel ordered-reliable
-        // guarantees a STATE row never arrives before its PLACE.
+        // Bed/cage intent and canonical state share one reliable ordered shape
+        // (protocol 59). The join sends intents to the server; the host only
+        // queues canonical rows and therefore broadcasts them.
+        std::vector<FurniturePacket> furniturePkts;
+        EnterCriticalSection(&outCs_);
+        furniturePkts.swap(outFurniture_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < furniturePkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&furniturePkts[i], sizeof(FurniturePacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send placed-building announcements + progress rows on
+        // CH_RELIABLE (protocol 27). PLACE is a one-shot describe/mint edge (a
+        // lost one strands an invisible building on the peer - the protocol-21
+        // lesson); canonical PLACE/STATE rows are Host-published, while the
+        // Join's placer-authored STATE rows (its own placements) go to the
+        // Host, which applies and re-publishes them. STATE rows are
+        // change-gated by the Replicator (~1 Hz sample, 10 s safety resend
+        // while incomplete), so the channel is silent once every site
+        // completes. Same-channel ordered-reliable guarantees a STATE row
+        // never arrives before its PLACE.
         std::vector<BuildPlacePacket> buildPlacePkts;
         std::vector<BuildStatePacket> buildStatePkts;
         EnterCriticalSection(&outCs_);
@@ -1805,8 +2052,6 @@ void NetLink::threadLoop() {
                                                  ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);
-            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
-                enet_peer_send(serverPeer_, CH_RELIABLE, out);
             } else {
                 enet_packet_destroy(out);
             }
@@ -1845,13 +2090,29 @@ void NetLink::threadLoop() {
                 enet_packet_destroy(out);
             }
         }
+
+        // Join build intents are silent at rest; a pending request retries the
+        // same idempotent sequence after two seconds until canonical state acks.
+        std::vector<BuildIntentPacket> buildIntentPkts;
+        EnterCriticalSection(&outCs_);
+        buildIntentPkts.swap(outBuildIntent_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < buildIntentPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&buildIntentPkts[i],
+                                                 sizeof(BuildIntentPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (!isHost_ && serverPeer_ &&
+                serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
         for (size_t i = 0; i < buildRemovePkts.size(); ++i) {
             ENetPacket* out = enet_packet_create(&buildRemovePkts[i], sizeof(BuildRemovePacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);
-            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
-                enet_peer_send(serverPeer_, CH_RELIABLE, out);
             } else {
                 enet_packet_destroy(out);
             }

@@ -410,10 +410,16 @@ void Replicator::applyTargets(GameWorld* gw) {
         // still drain it so the engine-side accumulator stays bounded.
         if (reportCombat_) {
             float rf = 0.0f, rb = 0.0f;
-            if (engine::takeReportedDamage(c, &rf, &rb) && !isSquad &&
-                (rf > 0.0f || rb > 0.0f)) {
+            bool haveDamage = engine::takeReportedDamage(c, &rf, &rb);
+            float koSkill = 1.0f;
+            bool knockout = engine::takeReportedKnockout(c, &koSkill);
+            if (!isSquad && ((haveDamage && (rf > 0.0f || rb > 0.0f)) || knockout)) {
                 PendingHit& ph = pendingHits_[it->first];
                 ph.flesh += rf; ph.blood += rb;
+                if (knockout) {
+                    ph.knockout = true;
+                    ph.knockoutSkill = koSkill;
+                }
             }
         }
 
@@ -533,7 +539,7 @@ void Replicator::applyTargets(GameWorld* gw) {
                 continue;
             }
         }
-        // ---- Furniture carve-out + self-heal (protocol 19) ----------------------
+        // ---- Furniture carve-out + self-heal (protocols 58 / 41) ----------------
         // A body in a bed/cage (streamed BODY_IN_BED/BODY_IN_CAGE, or LOCALLY
         // occupying - the local placement may lead/trail the stream by a beat) is
         // transform-owned by its furniture attach: the down override and any
@@ -587,19 +593,65 @@ void Replicator::applyTargets(GameWorld* gw) {
             }
         }
         if (furnSync_ && !engine::taskIsBedPose((int)out.task)) {
-            // Chained/pole prisoner (protocol 41) rides this carve-out as
-            // kind=3 (Character::isChained). Gated by chainSync_ so it can be
-            // turned off without disabling bed/cage occupancy.
-            int streamKind = (out.bodyState & BODY_IN_BED) ? 1
-                           : ((out.bodyState & BODY_IN_CAGE) ? 2
-                           : ((chainSync_ && (out.bodyState & BODY_CHAINED)) ? 3 : 0));
             engine::FurnitureRead lfr;
             bool haveFr = engine::readFurniture(c, &lfr);
             int localKind = (haveFr && lfr.valid) ? lfr.kind : 0;
             if (localKind == 3 && !chainSync_) localKind = 0;
+
+            // Protocol 59: on the Host, the continuous owner stream is evidence,
+            // never authority, for bed/cage bits. First fold any real Host-engine
+            // change (including a guard placing/removing a captive), then rebuild
+            // those two bits from the canonical row. This closes the bypass where
+            // a fast Join body packet could undo a reliable Host verdict.
+            u16 furnitureState = out.bodyState;
+            Key furnitureKey = keyOf(out);
+            if (hostRole_) {
+                FurnitureRow& row = furnitureRows_[furnitureKey];
+                int localSeatKind = (localKind == 1 || localKind == 2) ? localKind : 0;
+                if (!row.seeded) {
+                    row.seeded = true; row.on = localSeatKind != 0;
+                    row.kind = localSeatKind;
+                    for (int fi = 0; fi < 5; ++fi)
+                        row.furn[fi] = localSeatKind ? lfr.furn[fi] : 0;
+                } else {
+                    bool changed = (row.on ? row.kind : 0) != localSeatKind;
+                    for (int fi = 0; !changed && localSeatKind && fi < 5; ++fi)
+                        changed = row.furn[fi] != lfr.furn[fi];
+                    if (changed) {
+                        // Host simulation changed the actual attachment. Queue an
+                        // EXIT for the old anchor before an ENTER for a new one so
+                        // even the rare direct cage->bed switch remains applicable.
+                        if (row.on) {
+                            PendFurnState pe;
+                            pe.occ = furnitureKey; pe.on = false; pe.kind = row.kind;
+                            for (int fi = 0; fi < 5; ++fi) pe.furn[fi] = row.furn[fi];
+                            furnitureHostPend_.push_back(pe);
+                        }
+                        if (localSeatKind) {
+                            PendFurnState pe;
+                            pe.occ = furnitureKey; pe.on = true; pe.kind = localSeatKind;
+                            for (int fi = 0; fi < 5; ++fi) pe.furn[fi] = lfr.furn[fi];
+                            furnitureHostPend_.push_back(pe);
+                        }
+                        row.on = localSeatKind != 0; row.kind = localSeatKind;
+                        for (int fi = 0; fi < 5; ++fi)
+                            row.furn[fi] = localSeatKind ? lfr.furn[fi] : 0;
+                    }
+                }
+                furnitureState &= (u16)~(BODY_IN_BED | BODY_IN_CAGE);
+                if (row.on && row.kind == 1) furnitureState |= BODY_IN_BED;
+                if (row.on && row.kind == 2) furnitureState |= BODY_IN_CAGE;
+            }
+            // Chained/pole prisoner (protocol 41) rides this carve-out as
+            // kind=3 (Character::isChained). Gated by chainSync_ so it can be
+            // turned off without disabling bed/cage occupancy.
+            int streamKind = (furnitureState & BODY_IN_BED) ? 1
+                           : ((furnitureState & BODY_IN_CAGE) ? 2
+                           : ((chainSync_ && (furnitureState & BODY_CHAINED)) ? 3 : 0));
             // Jail put-to-work desync spike (TOKELACOOP_JAIL_PROBE, read-only):
             // the DRIVEN view of a peer-owned captive (the host's copy of the
-            // join's jailed PC). streamKind is what the owner reports;
+            // join's jailed PC). On the Join streamKind is what the Host reports;
+            // on the Host it is the canonical row rebuilt above.
             // localKind is where our copy actually sits. A streamKind=2/3 with
             // localKind=0 (or vice-versa) is the twitch. Pairs with side=own.
             if (jailProbe_ && (streamKind != 0 || localKind != 0)) {
@@ -642,8 +694,73 @@ void Replicator::applyTargets(GameWorld* gw) {
             // unified drive owns transform AND task for chained bodies (it
             // AI-suspends driven bodies itself; applyRest reproduces the
             // host's work pose at rest). Cage/bed (kinds 1-2) remain true
-            // transform anchors below - BUT only when the OWNER streams them.
+            // transform anchors below, driven by protocol 59's Host row.
             if (streamKind == 3) {
+                // Kind-conflict anchor (spike 58 follow-up 1): the owner's
+                // reliable furniture state settles a chained+caged prisoner on
+                // the CAGE (protocol 59's canonical FURNITURE_STATE row), but
+                // the lossy continuous batch can still say CHAINED-only - so
+                // the CAGE-BREAK below used to break that vouched cage and
+                // re-chain every tick, a median 75-88 u (tail 885 u) re-seat
+                // teleport on 10-15 bodies per session. While a reliable edge
+                // vouches the local cage/bed (d.furnEdgeKind, stamped when the
+                // canonical STATE row is applied), the cage/bed stays the
+                // transform anchor and the shackle is an EQUIP-only state:
+                // hold the body like the kind 1/2 path below and re-assert
+                // setChainedMode WITHOUT breaking the anchor. An UNVOUCHED
+                // local cage/bed is a stale attach at the wrong spot (the
+                // Flashbox case) and still takes the break+re-chain path.
+                if (coop::chainAnchorStep(streamKind, localKind,
+                                          d.furnEdgeKind) ==
+                    coop::CHAIN_ANCHOR_HOLD) {
+                    d.furnNoSeeTick = 0;
+                    // Same hold as the kind 1/2 branch: an anchored captive
+                    // must not run its own decision layer, and a committed
+                    // destination must not walk it out between heals.
+                    if (aiSuspend_) {
+                        engine::addAiSuspend(c);
+                        engine::haltMovement(c);
+                    }
+                    // EQUIP-only shackle re-assert (throttled like the unlock
+                    // guard): remember the owner while chained, re-lock if the
+                    // local copy lost the chain (lockpick / AI break-out).
+                    engine::ShackleRead asr;
+                    bool haveAsr = engine::readShackle(c, &asr) && asr.valid;
+                    if (haveAsr && asr.chained &&
+                        (asr.owner[3] != 0 || asr.owner[4] != 0)) {
+                        for (int fi = 0; fi < 5; ++fi)
+                            d.chainOwner[fi] = asr.owner[fi];
+                        d.haveChainOwner = true;
+                    }
+                    if (haveAsr && !asr.chained &&
+                        (now - d.chainHealTick) >= FURN_HEAL_MS) {
+                        d.chainHealTick = now;
+                        bool ok = d.haveChainOwner
+                            ? engine::applyFurniture(gw, c, d.chainOwner, 3, true)
+                            : engine::applyFurniture(gw, c, 0, 3, true);
+                        engine::endAction(c);
+                        char b[160]; _snprintf(b, sizeof(b) - 1,
+                            "[furn] CHAIN EQUIP occ=%u,%u anchor=%d ok=%d",
+                            out.hIndex, out.hSerial, localKind, ok ? 1 : 0);
+                        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    }
+                    // Distinct trace for the skipped CAGE-BREAK, throttled per
+                    // body (the hold is the steady state; an unthrottled line
+                    // would spam once per drive tick per anchored captive).
+                    static std::map<Key, unsigned long> s_holdLogMs;
+                    Key hk = keyOf(out);
+                    std::map<Key, unsigned long>::iterator ht = s_holdLogMs.find(hk);
+                    if (ht == s_holdLogMs.end() || (now - ht->second) >= FURN_HEAL_MS) {
+                        s_holdLogMs[hk] = now;
+                        char vb[160]; _snprintf(vb, sizeof(vb) - 1,
+                            "[furn] CAGE-HOLD occ=%u,%u kind=%d stream=3 (vouched)",
+                            out.hIndex, out.hSerial, localKind);
+                        vb[sizeof(vb) - 1] = '\0'; coop::logLine(vb);
+                    }
+                    d.parked = false; d.haveDest = false;
+                    if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                    continue;
+                }
                 // Unvouched local bed/cage while the owner streams chained-
                 // not-caged (world_parity camp, Flashbox): the host's guards
                 // re-jail the peer-driven copy locally. The cage is a true
@@ -713,7 +830,17 @@ void Replicator::applyTargets(GameWorld* gw) {
                 // exception: suspend its decisions so it stays put. The suspend set is
                 // rebuilt every drive tick, so this self-clears the moment the host
                 // stops streaming the furniture bit (body released) and its AI resumes.
-                if (aiSuspend_) engine::addAiSuspend(c);
+                if (aiSuspend_) {
+                    engine::addAiSuspend(c);
+                    // Spike 58 follow-up 2: the suspend hook only blocks NEW
+                    // decisions - a destination the local AI committed before
+                    // it still walks the copy out between heals (8/22 jailed
+                    // SNAPs carried localStep>2 u, up to 28.6 u). Halt the
+                    // in-flight goal per tick, exactly like the census-freeze
+                    // upkeep, so localStep stays 0 and the twitch is a pure
+                    // (and now rare) re-seat instead of exit-then-snap.
+                    engine::haltMovement(c);
+                }
                 if (haveFr && localKind != streamKind &&
                     (now - d.furnHealTick) >= FURN_HEAL_MS) {
                     d.furnHealTick = now;
@@ -785,48 +912,14 @@ void Replicator::applyTargets(GameWorld* gw) {
                     out.hIndex, out.hSerial, ok ? 1 : 0);
                 bfe[sizeof(bfe) - 1] = '\0'; coop::logLine(bfe);
             } else if (localKind != 0) {
-                // Third-party placement authority (protocol 36): a HOST-sim
-                // actor (a guard jailing an arrested player) put this PEER-
-                // OWNED squad body into furniture. The occupant's owner never
-                // sees the action, so the occupant-owner ENTER can't fire -
-                // the owner's stream keeps reporting no bit and the debounced
-                // HEAL EXIT below ejected the body every 3 s ("the host kept
-                // taking it out of the cage", 2026-07-09). The host is the
-                // world authority for NPC actions: author the ENTER for the
-                // owner (buffered; publishOwned sends), HOLD the self-heal
-                // exit while it crosses, and re-author every FURN_PEER_MS
-                // until the owner's stream carries the bit. KO'd/down bodies
-                // only - a conscious voluntary use stays owner-authored, which
-                // (protocol 53) is why the crawlers are excluded by name: a
-                // crippled body reads Character::isDown() while conscious, so
-                // plain bodyIsDown would have us author bed-enters for someone
-                // who crawled past a bed under their own control.
-                bool downish = coop::bodyDownNotCrawling(out.bodyState) ||
-                               d.koLatched || d.deathLatched ||
-                               coop::bodyDownNotCrawling(engine::readBodyState(c));
-                if (streamNpcs_ && isSquad && downish) {
-                    if (d.furnPeerTick == 0 || (now - d.furnPeerTick) >= FURN_PEER_MS) {
-                        d.furnPeerTick = now;
-                        PendFurnEnter pe;
-                        pe.occ = keyOf(out);
-                        for (int fi = 0; fi < 5; ++fi) pe.furn[fi] = lfr.furn[fi];
-                        pe.kind = localKind;
-                        furnPeerPend_.push_back(pe);
-                        char b[160]; _snprintf(b, sizeof(b) - 1,
-                            "[furn] PEER-ENTER author occ=%u,%u furn=%u,%u kind=%d",
-                            out.hIndex, out.hSerial, lfr.furn[3], lfr.furn[4],
-                            localKind);
-                        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-                    }
-                    d.furnNoSeeTick = 0; // never self-heal-eject a host placement
-                    d.parked = false; d.haveDest = false;
-                    if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
-                    continue;
-                }
+                // Join-only local attachment without a Host row: debounce before
+                // ejecting it. On the Host, real local changes were folded into
+                // the canonical row above and never reach this branch.
                 if (d.furnNoSeeTick == 0) {
                     d.furnNoSeeTick = now;
                 } else if ((now - d.furnNoSeeTick) > FURN_EXIT_MS) {
                     d.furnNoSeeTick = 0;
+                    d.furnEdgeKind = 0; // debounced exit: the vouch dies with it
                     bool ok = engine::applyFurniture(gw, c, lfr.furn, localKind, false);
                     char b[160]; _snprintf(b, sizeof(b) - 1,
                         "[furn] HEAL EXIT occ=%u,%u kind=%d ok=%d",
@@ -1660,6 +1753,26 @@ void Replicator::applyTargets(GameWorld* gw) {
         // order already overrides AI movement, and clearGoals would CANCEL
         // our destination. removeFromUpdateList is never used: it freezes
         // the movement controller (walk + teleport both no-op).
+        // Walk-drive on-stop overshoot fix A/B toggle (default ON). Set
+        // TOKELACOOP_STOPFIX=0 to run the pre-fix behavior for a same-DLL before/
+        // after comparison (mirrors the repo's TOKELACOOP_NO_DETACH A/B knob).
+        // OFF forces the taper fraction to 1.0 (no taper) and skips the halting-
+        // settle branch, exactly reproducing the original walk-drive.
+        static int stopFixMode = -1;
+        if (stopFixMode < 0) {
+            const char* e = getenv("TOKELACOOP_STOPFIX");
+            stopFixMode = (e && e[0] == '0') ? 0 : 1;
+        }
+        // Per-frame drive trace for the driven squad leader (TOKELACOOP_DEBUG_
+        // STOP_PROBE=1): logs the rendered ACTUAL pos vs the streamed authoritative
+        // NEWEST pos each frame, so an on-stop overshoot (actual runs PAST newest
+        // then snaps back) is directly visible in the join log at each host stop.
+        static int stopProbeTrace = -1;
+        if (stopProbeTrace < 0) {
+            const char* e = getenv("TOKELACOOP_DEBUG_STOP_PROBE");
+            stopProbeTrace = (e && e[0] == '1') ? 1 : 0;
+        }
+
         bool snapOk;
         if (isSquad) {
             snapOk = haveNewest;
@@ -1770,7 +1883,42 @@ void Replicator::applyTargets(GameWorld* gw) {
                     out.hIndex, out.hSerial, (double)out.cSpeed);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
+        } else if (stopFixMode && isSquad && genuinelyMoving && vlen < SETTLE_VEL) {
+            // Halting settle (walk-drive overshoot/snap-back fix, concept ported
+            // from CTRL-ALT-E/KENSHI-CO-OP e36b960). The squad classifier
+            // (hostMoving) keys on cMoving/cSpeed, which decay SLOWLY and keep
+            // reading "moving" for many frames AFTER the body has physically
+            // stopped - so the walk-drive below kept aiming at a lead point past
+            // the stop and the engine coasted the body PAST the mark, then the
+            // rest-entry park snapped it back (THE on-stop rubberband). The TRUE
+            // translation velocity vlen (from the snapshot stream) collapses the
+            // instant real motion ceases, so gating the settle on IT holds the
+            // body exactly when the source halts. Constant-speed glide-in for any
+            // residual gap (a fixed small step per frame - no big first-frame jump
+            // off a lag = no snap); a genuine warp was already caught by the
+            // velocity-aware snap gate above. parked=true lets applyRest continue
+            // the identical settle once the classifier finally drops to rest.
+            if (!d.parked) { engine::endAction(c); d.parked = true; }
+            if (haveActual && haveNewest) {
+                EntityState k = newest;
+                if (gapNewest > MAX_CATCHUP_STEP) {
+                    float f = MAX_CATCHUP_STEP / gapNewest;
+                    k.x = ax + (newest.x - ax) * f;
+                    k.y = ay + (newest.y - ay) * f;
+                    k.z = az + (newest.z - az) * f;
+                } // else already within one step: settle exactly onto the mark
+                engine::applyRaw(c, k);
+            }
+            d.haveDest = false;
         } else if (genuinelyMoving) {
+            // Deceleration taper (walk-drive overshoot fix, same source commit):
+            // shrink the lead projection, the gap catch-up boost, and the speed
+            // cap in lockstep with the source's TRUE translation velocity (vlen),
+            // so a decelerating body converges to the source's velocity at the
+            // stop instead of running past it and snapping back. speedFrac ~1 at
+            // cruise, ->0 as the source halts.
+            float speedFrac = stopFixMode ? driveSpeedTaper(vlen, CATCHUP_REF_SPEED)
+                                          : 1.0f; // A/B off = no taper (original)
             float tx = newest.x, ty = newest.y, tz = newest.z;
             // Lead only while the instantaneous velocity is meaningful: the
             // debounced classifier keeps the walk verdict through mid-walk
@@ -1781,7 +1929,7 @@ void Replicator::applyTargets(GameWorld* gw) {
                 float segSec  = (float)segMs / 1000.0f * 1.5f;
                 if (segSec > leadSec) leadSec = segSec;
                 if (leadSec > 3.0f)   leadSec = 3.0f;
-                float lead = vlen * leadSec;
+                float lead = vlen * leadSec * speedFrac;
                 tx += vx / vlen * lead; ty += vy / vlen * lead; tz += vz / vlen * lead;
             }
             float moved = d.haveDest ? dist3(tx, ty, tz, d.dx, d.dy, d.dz)
@@ -1795,9 +1943,9 @@ void Replicator::applyTargets(GameWorld* gw) {
             // metre of target movement is the hysteresis.
             bool sourceMoving = vlen > NPC_MOVE_VEL;
             if (moved > REISSUE_DIST) {
-                float spd = out.cSpeed + gapNewest * catchupK_;
+                float spd = out.cSpeed + gapNewest * catchupK_ * speedFrac;
                 float base = (out.cSpeed > 1.0f) ? out.cSpeed : 12.0f;
-                float cap = base * 2.5f;
+                float cap = base * (1.0f + 1.5f * speedFrac); // 2.5x cruise -> 1x stop
                 if (spd > cap) spd = cap;
                 engine::walkTo(c, tx, ty, tz, spd);
                 if (isSquad) ++walkReissueSquad_;
@@ -1876,6 +2024,29 @@ void Replicator::applyTargets(GameWorld* gw) {
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
         d.walkBranchPrev = genuinelyMoving;
+
+        // Per-frame stop-probe trace (TOKELACOOP_DEBUG_STOP_PROBE=1): the driven
+        // squad leader's rendered ACTUAL pos vs the streamed authoritative NEWEST.
+        // At a host stop, newest freezes; a pre-fix body overshoots (actual runs
+        // PAST newest, gap re-grows) then snaps back, a fixed body converges. gapAN
+        // is |actual-newest|; over is the signed progress of actual PAST newest
+        // along the source travel direction (positive = overshoot beyond the mark).
+        if (stopProbeTrace && isSquad && haveActual && haveNewest) {
+            float over = 0.0f;
+            float vl = std::sqrt(vx * vx + vy * vy + vz * vz);
+            if (vl > 0.01f) {
+                // component of (actual-newest) along the travel unit vector: >0
+                // means the body is ahead of the authoritative mark (overshoot).
+                over = ((ax - newest.x) * vx + (ay - newest.y) * vy +
+                        (az - newest.z) * vz) / vl;
+            }
+            char pb[220]; _snprintf(pb, sizeof(pb) - 1,
+                "[stopprobe] fix=%d moving=%d gapAN=%.2f over=%.2f vlen=%.2f "
+                "cSpeed=%.2f parked=%d actual=%.1f,%.1f newest=%.1f,%.1f",
+                stopFixMode, genuinelyMoving ? 1 : 0, gapNewest, over, vlen,
+                out.cSpeed, d.parked ? 1 : 0, ax, az, newest.x, newest.z);
+            pb[sizeof(pb) - 1] = '\0'; coop::logLine(pb);
+        }
 
         // ---- Oracles (measured from the body's ACTUAL rendered motion) --------
         // "Active" == the host is genuinely translating, matching the drive's own
@@ -2017,6 +2188,11 @@ void Replicator::applyTargets(GameWorld* gw) {
         }
         if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
     }
+    // Owner-side carried self-heal (SYNC_GAPS 16b): reconcile each OWN member's
+    // local carry against the peer's streamed claim. Runs right after the drive
+    // loop (needs gw + the captured squad still in scope) before the telemetry
+    // epilogue phases.
+    healOwnCarried(gw, oracleSquad, oracleSquadN, now);
     pruneDriveGrace(now);
     logDriveTelemetry(now);
     ageOutStaleTargets(now);
@@ -2129,6 +2305,123 @@ void Replicator::logDriveTelemetry(unsigned long now) {
                   trusted, (unsigned)targets_.size() - trusted, trustGrants_, trustRevokes_);
         b[sizeof(b) - 1] = '\0';
         coop::logLine(b);
+    }
+}
+
+
+// --- Drive-tick epilogue phase: owner-side carried self-heal (SYNC_GAPS 16b) --
+// Split out of applyTargets' post-loop tail like the other epilogue phases, but
+// this one also reconciles LOCAL carry state, so it needs gw + the already
+// captured squad (oracleSquad/oracleSquadN) - passed in rather than read from
+// Replicator members alone. Body is verbatim the original applyTargets hook.
+void Replicator::healOwnCarried(GameWorld* gw, const EntityState* oracleSquad,
+                                unsigned int oracleSquadN, unsigned long now) {
+    // ---- Carried-body sync (SYNC_GAPS 16b): owner-side carried self-heal ----
+    // Carry edges are CARRIER-authored (EVT_PICKUP_BODY/EVT_DROP_BODY; the host
+    // authors them for world-NPC carriers, doctrine 28), and the loop above
+    // skips ownHands_ - so an OWNED body on someone's shoulder had NO reconcile
+    // path of its own: when the host's EVT_DROP_BODY failed to apply on the
+    // local carrier copy (resolve fail, carrier re-containered, or the local
+    // sim never executed the pickup) the owner stayed carried indefinitely
+    // (2026-07-11 field report: the join PC, KO'd + hauled by an enemy pack,
+    // was put down in the host's world but stayed carried on the join). Heal
+    // the owner side: an own squad member whose LOCAL isBeingCarried is set
+    // while NO live streamed row claims it as its carry subject
+    // (TASK_CARRY_BODY + subject hand) gets a debounced local release through
+    // the ordinary engine drop chain on its LOCAL carrier. The heal only ever
+    // judges carries whose truth lives on the PEER: a carrier we own, and a
+    // world-NPC carrier when WE are the world authority (streamNpcs_), are
+    // local sim facts with no stream to reconcile against - never touched.
+    // Debounced like the carrier-side carryNoSeeTick (stance samples ride the
+    // lossy batch), and a row only stops "claiming" once it either streams a
+    // non-carry task or ages past the claim horizon - a WAN stall alone must
+    // never rip a genuine carry apart.
+    if (carrySync_) {
+        for (unsigned int i = 0; i < oracleSquadN; ++i) {
+            const EntityState& m = oracleSquad[i];
+            Key mk; mk.t = m.hType; mk.c = m.hContainer;
+            mk.cs = m.hContainerSerial; mk.i = m.hIndex; mk.s = m.hSerial;
+            // Owner-scope only: the PEER's tab members are its owner's job
+            // (this heal running on both machines covers both directions).
+            if (ownHands_.find(mk) == ownHands_.end()) continue;
+            Character* mc = engine::resolveCharByHand(m.hIndex, m.hSerial, m.hType,
+                                                      m.hContainer, m.hContainerSerial);
+            engine::CarryRead mcr;
+            if (!mc || !engine::readCarry(mc, &mcr) || !mcr.beingCarried) {
+                ownCarriedNoSee_.erase(mk); // not carried (or unreadable): disarm
+                continue;
+            }
+            // Find the LOCAL carrier and classify its authority. Squad pass
+            // first (a player hauling a player); world-NPC scan only where an
+            // NPC carrier could ever be healed (the join - on the host a world
+            // NPC IS the authority, and an unfound carrier is indistinguishable
+            // from one, so the host judges peer-squad carriers only). Scans by
+            // live local state, not the streamed hand: carrier re-container is
+            // one of the very failure modes this heals.
+            Character* carrier = 0;
+            bool carrierLocal = false; // carrier's truth is OUR local sim
+            unsigned int cIdx = 0, cSer = 0;
+            for (unsigned int j = 0; j < oracleSquadN && !carrier; ++j) {
+                if (j == i) continue;
+                const EntityState& q = oracleSquad[j];
+                Character* qc = engine::resolveCharByHand(q.hIndex, q.hSerial,
+                                    q.hType, q.hContainer, q.hContainerSerial);
+                engine::CarryRead qcr;
+                if (qc && engine::readCarry(qc, &qcr) && qcr.carrying &&
+                    qcr.carried[3] == m.hIndex && qcr.carried[4] == m.hSerial) {
+                    carrier = qc; cIdx = q.hIndex; cSer = q.hSerial;
+                    Key qk; qk.t = q.hType; qk.c = q.hContainer;
+                    qk.cs = q.hContainerSerial; qk.i = q.hIndex; qk.s = q.hSerial;
+                    carrierLocal = (ownHands_.find(qk) != ownHands_.end());
+                }
+            }
+            if (!carrier && !streamNpcs_) {
+                static Character*  healChars[96];  // main-thread only
+                static EntityState healStates[96];
+                unsigned int nn = engine::listNpcs(gw, healChars, healStates, 96);
+                for (unsigned int j = 0; j < nn && !carrier; ++j) {
+                    engine::CarryRead ccr;
+                    if (engine::readCarry(healChars[j], &ccr) && ccr.carrying &&
+                        ccr.carried[3] == m.hIndex && ccr.carried[4] == m.hSerial) {
+                        carrier = healChars[j];
+                        cIdx = healStates[j].hIndex; cSer = healStates[j].hSerial;
+                    }
+                }
+            }
+            if (carrierLocal || (!carrier && streamNpcs_)) {
+                ownCarriedNoSee_.erase(mk); // locally-authoritative carry: believe it
+                continue;
+            }
+            // Does any live streamed row still claim this member as its carry
+            // subject? latest() (not this tick's sample) so a between-batches
+            // gap on a slow-streamed carrier does not read as a drop.
+            bool claimed = false;
+            for (std::map<Key, Driven>::iterator ct = targets_.begin();
+                 !claimed && ct != targets_.end(); ++ct) {
+                if (ownHands_.find(ct->first) != ownHands_.end()) continue;
+                if (ct->second.lastSeenMs == 0 ||
+                    (now - ct->second.lastSeenMs) > CARRY_CLAIM_STALE_MS) continue;
+                EntityState ls;
+                if (!ct->second.interp.latest(&ls, 0, 0, 0)) continue;
+                claimed = coop::taskIsCarry(ls.task) &&
+                          ls.sIndex == m.hIndex && ls.sSerial == m.hSerial;
+            }
+            unsigned long& tick = ownCarriedNoSee_[mk];
+            if (coop::carriedHealStep(true, claimed, now, CARRY_DROP_MS,
+                                      &tick) == coop::CARRIED_HEAL_FIRE) {
+                // No carrier found at all: nothing to drop - the fired log line
+                // is the triage evidence (and the window re-arms, so a body
+                // stuck this way reports once per window, not per tick).
+                bool ok = carrier ? engine::applyDrop(carrier, /*ragdoll*/true)
+                                  : false;
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[carry] OWNER HEAL DROP subj=%u,%u carrier=%u,%u ok=%d",
+                    m.hIndex, m.hSerial, cIdx, cSer, ok ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                // drop refused / carrier missing: carriedHealStep re-armed the
+                // window, so a still-stuck body retries a full window later.
+            }
+        }
     }
 }
 

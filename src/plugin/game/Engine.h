@@ -76,6 +76,12 @@ bool installSaveHook();
 // JOIN under save-sync: suppress the LOCAL write entirely (the host's save is
 // authoritative; a manual edge is forwarded as PKT_SAVE_REQ instead).
 void setSaveSuppress(bool on);
+// Protocol 61 host-side fenced re-save: the next save still runs natively but
+// does not enqueue another SaveEdge (which would recursively start a new fence).
+void setSaveEdgeBypassOnce();
+// Cancels a bypass that was armed but not consumed (for example when the
+// resolved engine save entry point rejects the re-save before reaching hook).
+void clearSaveEdgeBypass();
 unsigned int drainSaveEdges(SaveEdge* out, unsigned int maxOut);
 
 // ---- Protocol 32: coordinated load ------------------------------------------
@@ -346,6 +352,10 @@ void  markerDestroy(void* label);
 // too. Cheap (a pointer scan of the GUI's own label registry).
 bool  markerAlive(void* label);
 
+// True while any inventory/trade window is open (the engine UI holds Item
+// pointers). Inventory-sync must not free items during this window. SEH-guarded.
+bool  inventoryUiOpen();
+
 // ---- In-game co-op session panel ---------------------------------------------
 // Moved to EngineUi.h (Phase 5a domain split): CoopPanelState, CoopConnectFn,
 // CoopDisconnectFn, coopPanelTick, coopOverlayTick. The UI root (Plugin.cpp)
@@ -363,6 +373,9 @@ bool  markerAlive(void* label);
 // knockDown drops a Character into (on=true) / out of (on=false) full-body
 // ragdoll - the join calls it to reproduce a host-authoritative down edge.
 bool knockDown(Character* c, bool on);
+// Apply a real engine-calculated knockout without replacing its duration with
+// the short forced timer used by the down-state replication scaffold.
+bool applyKnockout(Character* c, float skill);
 // Maintain an already-down body each tick by topping the KO timer (no re-collapse).
 // Prevents the get-up/flop flicker without re-triggering the ragdoll fall. Join-side.
 bool holdDown(Character* c);
@@ -391,10 +404,18 @@ bool describeCharacter(Character* c, char* charSid, unsigned int charSidLen,
 // doesn't resolve), parked at the host transform, created at the host's 'age'
 // (animals scale body size by age; <= 0 or non-finite falls back to the adult
 // default). Appearance/equipment are the template's (randomized gear) -
-// cosmetic; combat outcomes stay host-authoritative + damage-guarded. Returns
-// the proxy Character* or 0.
+// cosmetic; combat outcomes stay host-authoritative + damage-guarded. 'name'
+// (protocol 63) gives the proxy the host body's display name ("" keeps the
+// template default). Returns the proxy Character* or 0.
 Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
-                         float x, float y, float z, float heading, float age);
+                         float x, float y, float z, float heading, float age,
+                         const char* name);
+
+// Age read/write (protocol 63 animal-scale sync over the stats channel).
+// SEH-guarded; charAge returns <= 0 on fault, setCharAge no-ops a
+// non-finite/<=0 value.
+float charAge(Character* c);
+void  setCharAge(Character* c, float age);
 
 // SEH-guarded (Phase 1 spawn parity, game/ZoneQuery.cpp): is the world block at
 // (x,y,z) fully LOADED locally (loaded and not mid-load)? Within a loaded block
@@ -647,6 +668,13 @@ int dropItemFromNestedContainer(GameWorld* gw, const unsigned int cHand[5], cons
 int countInNestedContainer(GameWorld* gw, const unsigned int cHand[5], const char* sid,
                            unsigned int typeCat, unsigned int which = 0);
 
+// SEH-guarded: the (sid,type) of the FIRST stack inside carried container `which`, or 0
+// when it is absent or empty. Both clients load the same save, so a probe picked this way
+// is the SAME sid on both sides regardless of game language (unlike commonTestItemSid,
+// which matches English name preferences against the LOCALIZED gd->name).
+int firstNestedContainerItemSid(GameWorld* gw, const unsigned int cHand[5], unsigned int which,
+                                char* outSid, unsigned int outLen, unsigned int* outType);
+
 // SEH-guarded (protocol 48): how many CONTAINERS the character at cHand carries, worn or
 // loose. Two bags of the SAME template are the case the apply side can confuse, so a gate
 // needs to assert they are both present before it can assert where their contents landed.
@@ -695,7 +723,10 @@ int removeTestItemsFromContainer(GameWorld* gw, const unsigned int cHand[5], int
 
 // SEH-guarded: report the deterministic common test-item template (the one
 // addTestItemsToContainer uses) WITHOUT adding anything, so both clients can track the
-// same probe sid independently (same gamedata -> same template). Returns 1 on success.
+// same probe sid independently (same gamedata -> same template). CAVEAT: the match runs
+// over LOCALIZED display names, so clients in different game languages can pick different
+// templates - a cross-client probe must come from shared save state instead (see
+// firstNestedContainerItemSid). Returns 1 on success.
 int commonTestItemSid(GameWorld* gw, char* outSid, unsigned int outLen,
                       unsigned int* outType);
 
@@ -842,9 +873,40 @@ struct WorldItemRaw {
 // SEH-guarded (host): enumerate free GROUND items within `radius` of the local leader
 // (interest scope) into out[] (up to maxOut), deduped by hand. Items inside inventories
 // are NOT enumerated by the engine's sphere query (confirmed by the W0 drop_probe), so
-// every result is a real world item. Returns the number written.
+// every result is a real world item. Items OWNED by a non-player faction (the "red"
+// stealing items placed in towns/shops) are excluded: they are save-natives both
+// clients already hold, and streaming one mints an unowned grey duplicate on the peer
+// (the theft-bypass dup, upstream #63/#66). Returns the number written.
+// A save-native owned item the scan SAW but excluded (protocol 56): just enough
+// identity for the native-pickup watch - the local hand (per-session; a fast path
+// on the same client only), the stringID and the world position (which together are
+// the notice's cross-client identity).
+struct WorldNativeRaw {
+    unsigned int hand[5];
+    char         stringID[48];
+    float        x, y, z;
+};
+
+// natOut/natMax/natCount (optional): receive the owned items the filter skipped, deduped
+// by (index, serial) like the main rows, so the caller can watch natives for local
+// pickups (protocol 56) without a second scan.
 unsigned int captureWorldItems(GameWorld* gw, WorldItemRaw* out, unsigned int maxOut,
-                               float radius);
+                               float radius, WorldNativeRaw* natOut = 0,
+                               unsigned int natMax = 0, unsigned int* natCount = 0);
+
+// SEH-guarded (protocol 56): destroy OUR copy of a save-native ground item a peer
+// reported consumed. Identity is template + position (expectSid within posTol of
+// expectPos - an item's engine hand is per-session and does NOT resolve on the
+// other client; itemHand is only a same-client fast path and may be all-zero).
+// Destroys ONLY a LIVE GROUND item of that template nearest to expectPos within
+// posTol; already-bagged, already-gone or absent copies are left alone, so a
+// stale or echoed notice cannot delete anything a local actor holds. Returns 1 if
+// destroyed (outHand, optional, receives the destroyed object's LOCAL hand), 0 if
+// skipped (*whySkipped set to a static reason string when given).
+int destroyNativeGroundItem(GameWorld* gw, const unsigned int itemHand[5],
+                            const char* expectSid, const float expectPos[3],
+                            float posTol, unsigned int outHand[5],
+                            const char** whySkipped = 0);
 
 // ---- Phase W1b: query-free ground-drop capture (town reliability) ----------
 // The W1 stream above discovers ground items with getObjectsWithinSphere, which
@@ -947,6 +1009,12 @@ void diagGroundScan(GameWorld* gw, const unsigned int cHand[5], const char* sid,
 // within radius of cHand. Lets the relocation spike isolate the item lying on the ground.
 int countFreeGroundItemsNear(GameWorld* gw, const unsigned int cHand[5],
                              const char* sid, unsigned int typeCat, float radius);
+
+// SEH-guarded: count ALL free ground items within radius of cHand, any template. The
+// language-independent probe for scenarios where one client authors a drop and the other
+// must recognize it (unlike commonTestItemSid, which matches English name preferences
+// against the LOCALIZED gd->name). Use as a DELTA against a baseline taken at onStart.
+int countAllFreeGroundItemsNear(GameWorld* gw, const unsigned int cHand[5], float radius);
 
 // SEH-guarded SPIKE: pick up a free ground item of (sid,type) near cHand by RELOCATING the
 // real object into the character's inventory (no createItem) - the conservation primitive
@@ -1298,6 +1366,9 @@ void         setTaskSelectSpike(bool on);
 // Same pattern as the AI-suspend detour: pointer-compared set, rebuilt each tick
 // on the main thread, hook installed once.
 bool         installDamageGuardHook();
+// Join only: capture MedicalSystem::knockout calls on guarded world-NPC copies.
+// Assassinations bypass hitByMeleeAttack, so this is their combat-report edge.
+bool         installKnockoutReportHook();
 void         clearDamageGuard();
 void         addDamageGuard(Character* c);
 unsigned int damageGuardCount();
@@ -1328,6 +1399,7 @@ unsigned long remoteSwingsVetoed();    // cumulative, for logs / oracles
 // Drain the accumulated join-dealt damage for one victim copy (returns false if
 // nothing pending). flesh/blood are the summed deltas since the last drain.
 bool         takeReportedDamage(Character* c, float* outFlesh, float* outBlood);
+bool         takeReportedKnockout(Character* c, float* outSkill);
 
 // Read a character's current blood level by hand (medical.blood). The vitals
 // ground-truth read for the damage_guard conformance oracle: the HOST's victim
@@ -1517,6 +1589,59 @@ int readSlaveState(Character* c);
 // the env var is unset; SEH-guarded per body. `isHost` only tags the line.
 void shackleDbgTick(GameWorld* gw, bool isHost);
 bool shackleDbgOn();
+// Spike 59: env-gated ([bounty], TOKELACOOP_BOUNTY_PROBE) read-only observer
+// for the engine's bounty/crime system - the SYNC_GAPS gap-3 "remaining edge"
+// that so far only has indirect [fac] AFFECT cause evidence. Character::crimes
+// is an INLINE BountyManager at Character+0xF0 (KenshiLib PDB layout);
+// BountyManager::me points back at the owning Character and is checked as a
+// validity sentinel BEFORE any parse (a mismatch logs one SENTINEL-MISMATCH
+// tripwire and reads nothing). Enumerates the local player squad + nearby
+// world NPCs ~1 Hz and logs only bodies with live crime/bounty state, plus a
+// 10 s [bounty] SCAN heartbeat (valid==n is the layout-health signal). No-op
+// when the env var is unset; SEH-guarded per body; zero behavior change.
+void bountyProbeTick(GameWorld* gw, bool isHost);
+bool bountyProbeOn();
+
+// Protocol 62: bounty/crime sync engine shims (the SEH-guarded read/write
+// levers the host-authoritative PKT_BOUNTY channel rides on).
+// ONE durable bounty row a host-side character carries (its own hand + the
+// faction sid + the Bounty value). Emitted per (character, faction) pair by the
+// enumeration below; the publisher keys the wire packet by these.
+struct BountyPubRow {
+    unsigned int hand[5];  // owning character hand (readObjectHand layout)
+    char         sid[48];  // faction GameData stringID (cross-client identity)
+    int          amount;   // Bounty::amount (cats)
+    unsigned int crimes;   // Bounty::crimes bitmask (CrimeEnum bits)
+    int          claimed;  // Bounty::bountyHasBeenClaimedOnce (0/1)
+};
+// SEH-guarded: enumerate every durable bounty row on the characters this engine
+// carries (the same subject set the probe scans - local player squad + nearby
+// world NPCs, which on the host includes its DRIVEN copies of join-owned PCs
+// where the H2 row lives). One BountyPubRow per (character, faction). The
+// BountyManager::me sentinel is checked per body before any parse. Returns the
+// count written (rows only, bodies with no live bounty contribute none).
+unsigned int enumBountyRows(GameWorld* gw, BountyPubRow* out, unsigned int maxOut);
+// Manual-validation helper (host only, TOKELACOOP_AUTOCRIME): programmatically
+// assign a test bounty to the player-squad character at playerIndex via the
+// engine's OWN unfairAddToBounty lever, against the first real world faction.
+// On the host in inhabit mode a non-zero index is a JOIN-owned character's
+// DRIVEN copy, so this reproduces the exact H2 state (a bounty on the host's
+// copy of a join-owned PC) the replication channel must then carry to the owner
+// WITHOUT relying on a hand-driven witnessed crime. Fills outHand (readObjectHand
+// layout) + outSid (the enforcer faction). Returns true when the bounty landed.
+bool injectTestBounty(GameWorld* gw, unsigned int playerIndex, int amount,
+                      unsigned int outHand[5], char* outSid, unsigned int sidLen);
+
+// SEH-guarded: apply one received bounty row onto the local (owning) copy of
+// the character at hand, for the faction sid, via the engine's OWN levers -
+// unfairAddToBounty for a raise, clearBounty for a drop to zero (never a raw
+// map poke, so derived expiry/GUI stay consistent). Convergence-first: a row
+// already equal to getActualBounty is a no-op. outBefore/outAfter capture the
+// (char, faction) amount around the write for the RECV log. Returns true when
+// the character + faction resolved locally and the lever ran (or was a no-op).
+bool applyBountyRow(GameWorld* gw, const unsigned int hand[5], const char* sid,
+                    int amount, unsigned int crimes, int claimed,
+                    int* outBefore, int* outAfter);
 // Place the local occupant into / remove it from the furniture at furnHand via
 // the engine's own setBedMode/setPrisonMode (kind: 1 bed, 2 cage) - pose,
 // attach and transform are engine-native. Idempotent: already in the desired
@@ -1817,12 +1942,13 @@ unsigned int enumDoorsNear(GameWorld* gw, float radius, DoorRead* out, unsigned 
 // SEH-guarded single-door read by hand. Returns false when the hand does not
 // resolve locally or is not a door.
 bool readDoorByHand(const unsigned int dHand[5], DoorRead* out);
-// SEH-guarded door write through the engine's own action entries:
-// openDoor/closeDoor (the polite path - animation, navmesh, sound), falling
-// back to _forceDoorOpenUT/_forceDoorClosedUT when the polite call refuses;
-// lockDoor/unlockDoor for the lock bit (skipped when the door has no lock).
-// wantLocked < 0 leaves the lock untouched. Returns false on resolve failure
-// or fault; *outAfter reports the post-write DoorRead when non-null.
+// SEH-guarded door write through the engine's own action entries. Unlock is
+// applied before an open/close request and lock after it, so combined
+// unlock+open / close+lock intents use a coherent order. Polite openDoor/
+// closeDoor runs first (animation, navmesh, sound), with the UT force path only
+// when it refuses. wantLocked < 0 leaves the lock untouched. Returns true only
+// when a post-read proves every requested field converged; *outAfter always
+// reports that post-write state when non-null.
 bool writeDoorByHand(const unsigned int dHand[5], int wantOpen, int wantLocked,
                      DoorRead* outAfter);
 
@@ -2027,6 +2153,7 @@ struct ProdRead {
     float miningLevel;    // _resourceMiningLevel (ore drills / mines)
     // output buffer (StorageBuilding::productionItem; sid "" / -1 = no buffer)
     char  outSid[48];     // output item template GameData stringID
+    unsigned int outType; // output item template GameData::type
     float outAmount;      // productionItem->amount (stack + progress toward next)
     int   outCap;         // productionItem->maxCapacity
     // input buffers (ProductionBuilding::consumptionItems, first 2; -1 = absent)
@@ -2051,6 +2178,15 @@ unsigned int enumMachinesNear(GameWorld* gw, float radius, ProdRead* out,
 // SEH-guarded single-machine read by local hand. Returns false when the hand
 // does not resolve locally or is not a machine-class building.
 bool readMachineByHand(const unsigned int mHand[5], ProdRead* out);
+// Apply an exact recipe identity through ProductionBuilding::setProductionItem.
+// requireEmpty=true is the host-validation mode: a different recipe is refused
+// while the canonical output buffer holds any amount, so accepting a remote
+// click can never destroy produced items. amount is stack+progress (negative ->
+// zero). Returns true only when a post-read proves the requested sid+type landed.
+bool writeMachineRecipeByHand(GameWorld* gw, const unsigned int mHand[5],
+                              const char* recipeSid, unsigned int recipeType,
+                              float amount, bool requireEmpty,
+                              ProdRead* outAfter);
 // SEH-guarded machine write through the engine's own levers. All fields are
 // optional (sentinel = leave untouched):
 //   wantPower  - -1 leave, 0/1 switchPowerOn (vtable, the engine's own toggle)

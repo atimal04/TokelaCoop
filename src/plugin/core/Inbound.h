@@ -47,6 +47,15 @@ struct InboundInv {
     std::vector<InvItemEntry> items;
 };
 
+// One side of the protocol-60 inventory save fence. REQ asks the join to
+// publish every stable owner-authored inventory; ACK is queued after those
+// snapshots on the same reliable ordered channel. World-state: a fence for a
+// world that was reloaded/disconnected must not trigger a save in the new one.
+struct InboundInvSaveFence {
+    u32                ownerId;
+    InvSaveFencePacket pkt;
+};
+
 // One received world-item snapshot (Phase W1): the authoritative owner (host) and the
 // netId-keyed ground items in its interest sphere. The join reconciles its local proxies
 // (spawn new / update moved / leave the rest) to match.
@@ -95,6 +104,14 @@ struct InboundWorldDrop {
 struct InboundWorldPickup {
     u32               ownerId;
     WorldPickupPacket pkt;
+};
+
+// One received save-native pickup notice (protocol 56): a peer consumed a save-native
+// ground item (shop stock / town placement - never streamed, no netId). The receiver
+// destroys its OWN still-on-ground copy, located by template + position.
+struct InboundNativeTaken {
+    u32                   ownerId;
+    WorldNativeTakenPacket pkt;
 };
 
 // One received cross-owner TRANSFER intent (protocol 37): a peer performed a
@@ -192,6 +209,13 @@ struct InboundDoor {
     DoorPacket pkt;
 };
 
+// One received Join -> Host door intent (protocol 57). keyKind selects a baked
+// door hand or a placed-building key + door index; only the Host mutates state.
+struct InboundDoorIntent {
+    u32              ownerId;
+    DoorIntentPacket pkt;
+};
+
 // One received placed-building announcement (protocol 27): the sender placed
 // a building; the receiver mints a local construction site and maps the
 // sender's key to its own local hand.
@@ -222,6 +246,13 @@ struct InboundBuildRemove {
     BuildRemovePacket pkt;
 };
 
+// One reliable Join -> Host placement/removal request (protocol 60). ownerId is
+// stamped from the actual ENet peer rather than trusted from the packet body.
+struct InboundBuildIntent {
+    u32               ownerId;
+    BuildIntentPacket pkt;
+};
+
 // One received machine state row (protocol 33): the HOST's authoritative
 // power/production/farm state for a machine; the join resolves the key
 // (baked hand or protocol-27 placer key) and applies through the engine's
@@ -229,6 +260,13 @@ struct InboundBuildRemove {
 struct InboundProd {
     u32        ownerId;
     ProdPacket pkt;
+};
+
+// One received recipe intent (protocol 56): the join asks, the host remains the
+// only machine-state writer and answers through the ordinary ProdPacket stream.
+struct InboundProdIntent {
+    u32              ownerId;
+    ProdIntentPacket pkt;
 };
 
 // One received known-research row (protocol 38): the HOST reports a RESEARCH
@@ -253,6 +291,20 @@ struct InboundDeed {
 struct InboundFixture {
     u32           ownerId;
     FixturePacket pkt;
+};
+
+// One received bed/cage intent or canonical state row (protocol 59).
+struct InboundFurniture {
+    u32             ownerId;
+    FurniturePacket pkt;
+};
+
+// One received bounty/crime row (protocol 62): the HOST's authoritative durable
+// bounty for a (character, faction) pair; the owning client applies it onto its
+// own (clean) copy via the BountyManager levers (unfairAddToBounty/clearBounty).
+struct InboundBounty {
+    u32          ownerId;
+    BountyPacket pkt;
 };
 
 // One received stealth detection-map snapshot (protocol 20): the detection
@@ -438,18 +490,22 @@ public:
         // without bound. ent_ = ~12 s of a 20 Hz * 17-entity stream; stealth/cam
         // are ~1 Hz refreshes. Every other queue is reliable and stays unbounded.
         ent_(worldReset_, 4096),  evt_(worldReset_),        inv_(worldReset_),
+        invSaveFence_(worldReset_),
         wi_(worldReset_),         wir_(worldReset_),        wic_(worldReset_),
         npcCensus_(worldReset_),
         wd_(worldReset_),         invXfer_(worldReset_),    invXferAck_(worldReset_),
-        wp_(worldReset_),
+        wp_(worldReset_),         nativeTaken_(worldReset_),
         med_(worldReset_),        treat_(worldReset_),      combatHit_(worldReset_),
         speed_(worldReset_),
         stats_(worldReset_),      money_(worldReset_),      moneyDelta_(worldReset_),
         faction_(worldReset_),
-        time_(worldReset_),       door_(worldReset_),       prod_(worldReset_),
+        time_(worldReset_),       door_(worldReset_),       doorIntent_(worldReset_),
+        prod_(worldReset_),       prodIntent_(worldReset_),
         research_(worldReset_),   deed_(worldReset_),       fixture_(worldReset_),
+        furniture_(worldReset_),  bounty_(worldReset_),
         buildPlace_(worldReset_), buildState_(worldReset_),
-        buildDoor_(worldReset_),  buildRemove_(worldReset_), stealth_(worldReset_, 512),
+        buildDoor_(worldReset_),  buildRemove_(worldReset_), buildIntent_(worldReset_),
+        stealth_(worldReset_, 512),
         spawnReq_(worldReset_),   spawnInfo_(worldReset_),  camHint_(worldReset_, 64),
         cellClaim_(worldReset_, 64) {
         InitializeCriticalSection(&cs_);
@@ -507,6 +563,11 @@ public:
         if (items && count > 0) ii.items.assign(items, items + count);
         EnterCriticalSection(&cs_); inv_.push_back(ii); LeaveCriticalSection(&cs_);
     }
+    // NET thread: one inventory save-fence request/ack, owner-tagged.
+    void pushInvSaveFence(u32 ownerId, const InvSaveFencePacket& pkt) {
+        InboundInvSaveFence isf; isf.ownerId = ownerId; isf.pkt = pkt;
+        EnterCriticalSection(&cs_); invSaveFence_.push_back(isf); LeaveCriticalSection(&cs_);
+    }
     // NET thread: one received world-item snapshot, owner-tagged.
     void pushWorldItems(u32 ownerId, const WorldItemEntry* items, unsigned int count) {
         InboundWorldItems wi;
@@ -546,6 +607,11 @@ public:
     void pushWorldPickup(u32 ownerId, const WorldPickupPacket& pkt) {
         InboundWorldPickup wp; wp.ownerId = ownerId; wp.pkt = pkt;
         EnterCriticalSection(&cs_); wp_.push_back(wp); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received save-native pickup notice (protocol 56), owner-tagged.
+    void pushNativeTaken(u32 ownerId, const WorldNativeTakenPacket& pkt) {
+        InboundNativeTaken nt; nt.ownerId = ownerId; nt.pkt = pkt;
+        EnterCriticalSection(&cs_); nativeTaken_.push_back(nt); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received cross-owner transfer intent (protocol 37), owner-tagged.
     void pushInvXfer(u32 ownerId, const InvXferPacket& pkt) {
@@ -607,10 +673,20 @@ public:
         InboundDoor ido; ido.ownerId = ownerId; ido.pkt = pkt;
         EnterCriticalSection(&cs_); door_.push_back(ido); LeaveCriticalSection(&cs_);
     }
+    // NET thread: one reliable Join -> Host door request (protocol 57).
+    void pushDoorIntent(u32 ownerId, const DoorIntentPacket& pkt) {
+        InboundDoorIntent idi; idi.ownerId = ownerId; idi.pkt = pkt;
+        EnterCriticalSection(&cs_); doorIntent_.push_back(idi); LeaveCriticalSection(&cs_);
+    }
     // NET thread: one received machine state row (protocol 33), owner-tagged.
     void pushProd(u32 ownerId, const ProdPacket& pkt) {
         InboundProd ip; ip.ownerId = ownerId; ip.pkt = pkt;
         EnterCriticalSection(&cs_); prod_.push_back(ip); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one join -> host recipe intent (protocol 56), owner-tagged.
+    void pushProdIntent(u32 ownerId, const ProdIntentPacket& pkt) {
+        InboundProdIntent ip; ip.ownerId = ownerId; ip.pkt = pkt;
+        EnterCriticalSection(&cs_); prodIntent_.push_back(ip); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received known-research row (protocol 38), owner-tagged.
     void pushResearch(u32 ownerId, const ResearchPacket& pkt) {
@@ -626,6 +702,16 @@ public:
     void pushFixture(u32 ownerId, const FixturePacket& pkt) {
         InboundFixture ifx; ifx.ownerId = ownerId; ifx.pkt = pkt;
         EnterCriticalSection(&cs_); fixture_.push_back(ifx); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received host-canonical furniture row (protocol 59).
+    void pushFurniture(u32 ownerId, const FurniturePacket& pkt) {
+        InboundFurniture ifn; ifn.ownerId = ownerId; ifn.pkt = pkt;
+        EnterCriticalSection(&cs_); furniture_.push_back(ifn); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received bounty/crime row (protocol 62), owner-tagged.
+    void pushBounty(u32 ownerId, const BountyPacket& pkt) {
+        InboundBounty ib; ib.ownerId = ownerId; ib.pkt = pkt;
+        EnterCriticalSection(&cs_); bounty_.push_back(ib); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received placed-building announcement (protocol 27), owner-tagged.
     void pushBuildPlace(u32 ownerId, const BuildPlacePacket& pkt) {
@@ -646,6 +732,11 @@ public:
     void pushBuildRemove(u32 ownerId, const BuildRemovePacket& pkt) {
         InboundBuildRemove ibr; ibr.ownerId = ownerId; ibr.pkt = pkt;
         EnterCriticalSection(&cs_); buildRemove_.push_back(ibr); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one reliable Join -> Host build request (protocol 60).
+    void pushBuildIntent(u32 ownerId, const BuildIntentPacket& pkt) {
+        InboundBuildIntent ibi; ibi.ownerId = ownerId; ibi.pkt = pkt;
+        EnterCriticalSection(&cs_); buildIntent_.push_back(ibi); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received stealth detection-map snapshot, owner-tagged.
     void pushStealth(u32 ownerId, const StealthPacket& pkt) {
@@ -733,6 +824,9 @@ public:
     void drainInv(std::deque<InboundInv>& out) {
         EnterCriticalSection(&cs_); out.swap(inv_); LeaveCriticalSection(&cs_);
     }
+    void drainInvSaveFences(std::deque<InboundInvSaveFence>& out) {
+        EnterCriticalSection(&cs_); out.swap(invSaveFence_); LeaveCriticalSection(&cs_);
+    }
     void drainWorldItems(std::deque<InboundWorldItems>& out) {
         EnterCriticalSection(&cs_); out.swap(wi_); LeaveCriticalSection(&cs_);
     }
@@ -750,6 +844,9 @@ public:
     }
     void drainWorldPickups(std::deque<InboundWorldPickup>& out) {
         EnterCriticalSection(&cs_); out.swap(wp_); LeaveCriticalSection(&cs_);
+    }
+    void drainNativeTaken(std::deque<InboundNativeTaken>& out) {
+        EnterCriticalSection(&cs_); out.swap(nativeTaken_); LeaveCriticalSection(&cs_);
     }
     void drainInvXfers(std::deque<InboundInvXfer>& out) {
         EnterCriticalSection(&cs_); out.swap(invXfer_); LeaveCriticalSection(&cs_);
@@ -781,8 +878,14 @@ public:
     void drainDoor(std::deque<InboundDoor>& out) {
         EnterCriticalSection(&cs_); out.swap(door_); LeaveCriticalSection(&cs_);
     }
+    void drainDoorIntents(std::deque<InboundDoorIntent>& out) {
+        EnterCriticalSection(&cs_); out.swap(doorIntent_); LeaveCriticalSection(&cs_);
+    }
     void drainProd(std::deque<InboundProd>& out) {
         EnterCriticalSection(&cs_); out.swap(prod_); LeaveCriticalSection(&cs_);
+    }
+    void drainProdIntents(std::deque<InboundProdIntent>& out) {
+        EnterCriticalSection(&cs_); out.swap(prodIntent_); LeaveCriticalSection(&cs_);
     }
     void drainResearch(std::deque<InboundResearch>& out) {
         EnterCriticalSection(&cs_); out.swap(research_); LeaveCriticalSection(&cs_);
@@ -792,6 +895,12 @@ public:
     }
     void drainFixture(std::deque<InboundFixture>& out) {
         EnterCriticalSection(&cs_); out.swap(fixture_); LeaveCriticalSection(&cs_);
+    }
+    void drainFurniture(std::deque<InboundFurniture>& out) {
+        EnterCriticalSection(&cs_); out.swap(furniture_); LeaveCriticalSection(&cs_);
+    }
+    void drainBounty(std::deque<InboundBounty>& out) {
+        EnterCriticalSection(&cs_); out.swap(bounty_); LeaveCriticalSection(&cs_);
     }
     void drainBuildPlace(std::deque<InboundBuildPlace>& out) {
         EnterCriticalSection(&cs_); out.swap(buildPlace_); LeaveCriticalSection(&cs_);
@@ -804,6 +913,9 @@ public:
     }
     void drainBuildRemove(std::deque<InboundBuildRemove>& out) {
         EnterCriticalSection(&cs_); out.swap(buildRemove_); LeaveCriticalSection(&cs_);
+    }
+    void drainBuildIntents(std::deque<InboundBuildIntent>& out) {
+        EnterCriticalSection(&cs_); out.swap(buildIntent_); LeaveCriticalSection(&cs_);
     }
     void drainMoney(std::deque<InboundMoney>& out) {
         EnterCriticalSection(&cs_); out.swap(money_); LeaveCriticalSection(&cs_);
@@ -894,6 +1006,7 @@ private:
     WorldQ<InboundEntity>          ent_;
     WorldQ<InboundEvent>           evt_;
     WorldQ<InboundInv>             inv_;
+    WorldQ<InboundInvSaveFence>    invSaveFence_;
     WorldQ<InboundWorldItems>      wi_;
     WorldQ<InboundWorldRemove>     wir_;
     WorldQ<InboundWorldClaim>      wic_;
@@ -902,6 +1015,7 @@ private:
     WorldQ<InboundInvXfer>         invXfer_;
     WorldQ<InboundInvXferAck>      invXferAck_;
     WorldQ<InboundWorldPickup>     wp_;
+    WorldQ<InboundNativeTaken>     nativeTaken_;
     WorldQ<InboundMedical>         med_;
     WorldQ<InboundTreatment>       treat_;
     WorldQ<InboundCombatHit>       combatHit_;
@@ -912,14 +1026,21 @@ private:
     WorldQ<InboundFaction>         faction_;
     WorldQ<InboundTime>            time_;
     WorldQ<InboundDoor>            door_;
+    WorldQ<InboundDoorIntent>      doorIntent_;
     WorldQ<InboundProd>            prod_;
+    WorldQ<InboundProdIntent>      prodIntent_;
     WorldQ<InboundResearch>        research_;
     WorldQ<InboundDeed>            deed_;
     WorldQ<InboundFixture>         fixture_;
+    WorldQ<InboundFurniture>       furniture_;
+    // Bounty/crime rows (protocol 62): reliable, so unbounded; world-state, so
+    // auto-cleared on a session reset (a bounty describes the CURRENT world).
+    WorldQ<InboundBounty>          bounty_;
     WorldQ<InboundBuildPlace>      buildPlace_;
     WorldQ<InboundBuildState>      buildState_;
     WorldQ<InboundBuildDoor>       buildDoor_;
     WorldQ<InboundBuildRemove>     buildRemove_;
+    WorldQ<InboundBuildIntent>     buildIntent_;
     WorldQ<InboundStealth>         stealth_;
     WorldQ<InboundSpawnReq>        spawnReq_;
     WorldQ<InboundSpawnInfo>       spawnInfo_;
