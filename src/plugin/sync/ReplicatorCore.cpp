@@ -189,6 +189,7 @@ void Replicator::resetSession() {
     rekeyLogged_.clear();      // and the change-detector for its [rekey] line
     jailObs_.clear();          // jail-observe spike per-captive last sample
     proxyByKey_.clear();
+    peerSquadKeys_.clear();
     suppressed_.clear();
     midBand_.clear();          // host mid-band round-robin (rebuilt by next census)
     midCursor_ = 0; midSliceMs_ = 0;
@@ -604,6 +605,7 @@ void Replicator::reseedTabsForPeer() {
 Character* Replicator::resolvePeerChar(const Key& k) const {
     Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
     if (c) return c;
+    if (!peerSquadKeys_.count(k)) return 0;   // only the friend's own characters
     std::map<Key, Character*>::const_iterator p = proxyByKey_.find(k);
     if (p == proxyByKey_.end() || !p->second) return 0;
     if (mintedBodies_.count(p->second)) return 0;
@@ -615,6 +617,7 @@ Character* Replicator::resolvePeerChar(const Key& k) const {
 }
 
 bool Replicator::localHandForPeerChar(const Key& k, unsigned int out[5]) const {
+    if (!peerSquadKeys_.count(k)) return false;
     std::map<Key, Character*>::const_iterator p = proxyByKey_.find(k);
     if (p == proxyByKey_.end() || !p->second || mintedBodies_.count(p->second)) return false;
     unsigned int lh[5];

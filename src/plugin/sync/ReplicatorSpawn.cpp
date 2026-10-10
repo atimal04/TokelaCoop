@@ -1077,7 +1077,7 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
         // destination tab and pins the actual local hand OWNED so publishOwned
         // streams it; the drive teardown after that clears any residual stream
         // state for an immediate control hand-off.
-        if (!destOwned) proxyByKey_[newK] = c;
+        if (!destOwned) { proxyByKey_[newK] = c; peerSquadKeys_.insert(newK); }
         forceReqHands_.erase(newK); // bound - no force-REQ needed
         if (!destOwned) lifeSet(newK, LIFE_RESOLVED, "rekey");
         // Recruit audit (Ruka diagnosis): the body is now bound + host-driven,
