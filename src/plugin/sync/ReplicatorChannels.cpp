@@ -2108,8 +2108,10 @@ void Replicator::publishSquadMoves(GameWorld* gw, NetLink& net, u32 ownerId) {
                     // The drive resolves the friend's key by hand first, and the
                     // body no longer answers to it here: bind it by pointer, as
                     // rekeyPeerBody does.
-                    if (cf != canonicalOf_.end() && (cf->second < nk || nk < cf->second))
+                    if (cf != canonicalOf_.end() && (cf->second < nk || nk < cf->second)) {
                         proxyByKey_[cf->second] = ec;
+                        peerSquadKeys_.insert(cf->second);
+                    }
                 }
                 char hb[192]; _snprintf(hb, sizeof(hb) - 1,
                     "[own] SQUAD-HOLD friend's character old=%u,%u,%u,%u,%u "
@@ -2201,7 +2203,9 @@ void Replicator::publishStealth(GameWorld* gw, NetLink& net, u32 ownerId) {
         }
         // else: falling edge - send ONE empty snapshot immediately (clears the
         // owner's stale arrows), then go quiet.
-        sp.hash = h; sp.lastSendMs = now; sp.active = active;
+        // A clear sends no seers, so it must not stamp their fingerprint: a
+        // sneak that resumes under the same stares would be held back 2 s.
+        sp.hash = active ? h : 0u; sp.lastSendMs = now; sp.active = active;
         StealthPacket pkt;
         memset(&pkt, 0, sizeof(pkt));
         pkt.type    = (u8)PKT_STEALTH;

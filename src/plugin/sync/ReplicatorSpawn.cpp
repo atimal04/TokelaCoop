@@ -599,8 +599,10 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
         // member on this client too (same as the ok=1 path) and retire the
         // force-REQ. Only force-REQ hands become members: an ordinary world-NPC
         // census mint must NOT be dropped into the player squad.
-        if (forceReqHands_.erase(k))
+        if (forceReqHands_.erase(k)) {
             insertPeerMember(gw, proxy, k, "recruit");
+            peerSquadKeys_.insert(k);   // the friend's character (resolvePeerChar)
+        }
     }
 
     // Force-REQ injection (protocol 23 interest-split recruit fix): a recruit/
