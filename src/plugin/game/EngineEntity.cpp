@@ -13,6 +13,7 @@
 // the API consumed by the PowerShell oracles (see resources/CODE_MAP.md).
 
 #include "EngineInternal.h"
+#include "ProdTemplateMatch.h" // es_ES/stringID building-template matching (pure)
 
 // The co-op session panel + status overlay (the DatapanelGUI/Win32/clipboard
 // surface) moved to EngineUi.cpp in Phase 5e, taking its <kenshi/gui/...>,
@@ -745,11 +746,63 @@ unsigned int interestCenters(GameWorld* gw, Ogre::Vector3 outC[4]) {
         outC[nc] = m->getPosition();
         ++nc;
     }
-    if (nc == 0 || !s_camInterest) return nc;
-    // Fold in the camera anchors (local first, then the peer hint), deduped
-    // against everything already in the set. nc==0 stays 0: no players in
-    // gameplay means no streaming at all (the camera alone must not stream).
+    // nc==0 stays 0: no players in gameplay means no streaming at all (the
+    // camera alone must not stream).
+    if (nc == 0) return 0;
     const float DEDUPE_DIST_SQ = 100.0f * 100.0f;
+
+    // Combat/flee promotion (guard-teleport-chase fix, 2026-07-21). The two
+    // tab-leader anchors above are picked GLOBALLY - the first two distinct hand
+    // containers in playerCharacters, whoever they belong to. If ONE player
+    // spreads their squad across two tabs they take BOTH slots, leaving the other
+    // player's fleeing character - and the guards chasing it - with no anchor:
+    // everyone ends up >260u from any center, drops to the mid tier, streams
+    // sparsely, the pursuer's follow gap grows past the snap threshold, and the
+    // body hard-teleports repeatedly (the visible "blink" during a chase). A
+    // player character that is actively fighting or fleeing is interest by
+    // definition, so give it its own anchor regardless of the tab-leader cut.
+    // Anchoring on the contested PC also pulls the pursuers within the
+    // near-capture radius into the near tier, which is what actually stops the
+    // teleport. Deduped by distance (a PC already covered by another anchor costs
+    // nothing) and capped at the 4-anchor budget, so combat outranks the camera
+    // anchors below. Runs even with CAM_INTEREST off: this is a correctness fix,
+    // not the optional camera-anchor feature. The tab-leader budget itself is
+    // deliberately untouched here (that is a streaming-budget question for the
+    // upstream author).
+    for (unsigned int i = 0; i < total && nc < 4; ++i) {
+        Character* m = pl->playerCharacters[i];
+        if (!m) continue;
+        CombatRead cr;
+        if (!readCombat(m, &cr)) continue;
+        if (!(cr.inCombat || cr.modeActive || cr.fleeing)) continue;
+        Ogre::Vector3 p = m->getPosition();
+        bool dup = false;
+        for (unsigned int k = 0; k < nc && !dup; ++k) {
+            float dx = outC[k].x - p.x;
+            float dy = outC[k].y - p.y;
+            float dz = outC[k].z - p.z;
+            dup = (dx * dx + dy * dy + dz * dz) <= DEDUPE_DIST_SQ;
+        }
+        if (dup) continue;
+        outC[nc++] = p;
+        // Throttled (~5s) so a chase leaves a visible trail in the log without
+        // flooding it; a new line (not an existing oracle string).
+        static unsigned long lastPromoLog = 0;
+        unsigned long promoNow = GetTickCount();
+        if (promoNow - lastPromoLog >= 5000) {
+            lastPromoLog = promoNow;
+            char b[96];
+            _snprintf(b, sizeof(b) - 1,
+                      "[interest] combat anchor pos=%.1f,%.1f,%.1f flee=%d",
+                      p.x, p.y, p.z, cr.fleeing ? 1 : 0);
+            b[sizeof(b) - 1] = '\0';
+            coop::logLine(b);
+        }
+    }
+
+    if (!s_camInterest) return nc;
+    // Fold in the camera anchors (local first, then the peer hint), deduped
+    // against everything already in the set.
     const float* cams[2] = { s_localCamValid ? s_localCam : 0,
                              s_peerCamValid  ? s_peerCam  : 0 };
     for (unsigned int ci = 0; ci < 2 && nc < 4; ++ci) {
@@ -1082,11 +1135,16 @@ GameData* findSeatTemplate(GameWorld* gw) {
     g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, BUILDING);
     unsigned int n = g_dataScratch.size();
     // Ordered keyword preference; first present keyword that any template matches.
-    const char* prefs[] = { "bar stool", "stool", "chair", "throne" };
-    for (unsigned int k = 0; k < 4; ++k) {
+    // Lists + matching in ProdTemplateMatch.h: name (EN or ES) OR stringID, so an
+    // es_ES game matches too (the "no template" class).
+    unsigned int nPrefs = 0;
+    const char* const* prefs = prodtmpl::seatPrefs(&nPrefs);
+    for (unsigned int k = 0; k < nPrefs; ++k) {
         for (unsigned int i = 0; i < n; ++i) {
             GameData* gd = g_dataScratch[i];
-            if (gd && ciContains(gd->name.c_str(), prefs[k])) return gd;
+            if (gd && prodtmpl::matches(gd->name.c_str(),
+                                        gd->stringID.c_str(), prefs[k]))
+                return gd;
         }
     }
     return 0;
@@ -1100,11 +1158,14 @@ GameData* findBedTemplate(GameWorld* gw) {
     g_dataScratch.clear();
     g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, BUILDING);
     unsigned int n = g_dataScratch.size();
-    const char* prefs[] = { "camp bed", "bedroll", "bed" };
-    for (unsigned int k = 0; k < 3; ++k) {
+    unsigned int nPrefs = 0;
+    const char* const* prefs = prodtmpl::bedPrefs(&nPrefs); // EN + ES + stringID
+    for (unsigned int k = 0; k < nPrefs; ++k) {
         for (unsigned int i = 0; i < n; ++i) {
             GameData* gd = g_dataScratch[i];
-            if (gd && ciContains(gd->name.c_str(), prefs[k])) return gd;
+            if (gd && prodtmpl::matches(gd->name.c_str(),
+                                        gd->stringID.c_str(), prefs[k]))
+                return gd;
         }
     }
     return 0;
@@ -1116,11 +1177,14 @@ GameData* findCageTemplate(GameWorld* gw) {
     g_dataScratch.clear();
     g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, BUILDING);
     unsigned int n = g_dataScratch.size();
-    const char* prefs[] = { "prisoner cage", "cage" };
-    for (unsigned int k = 0; k < 2; ++k) {
+    unsigned int nPrefs = 0;
+    const char* const* prefs = prodtmpl::cagePrefs(&nPrefs); // EN + ES + stringID
+    for (unsigned int k = 0; k < nPrefs; ++k) {
         for (unsigned int i = 0; i < n; ++i) {
             GameData* gd = g_dataScratch[i];
-            if (gd && ciContains(gd->name.c_str(), prefs[k])) return gd;
+            if (gd && prodtmpl::matches(gd->name.c_str(),
+                                        gd->stringID.c_str(), prefs[k]))
+                return gd;
         }
     }
     return 0;
@@ -1154,13 +1218,16 @@ GameData* findPoleTemplate(GameWorld* gw) {
         }
     }
     // A pole/shackle keyword (never a bare "cage") is what marks the standing
-    // post; "cage pole" still qualifies because it contains "pole".
-    const char* prefs[] = { "prisoner pole", "cage pole", "shackle", "pole" };
-    const unsigned int nprefs = sizeof(prefs) / sizeof(prefs[0]);
+    // post; "cage pole" still qualifies because it contains "pole". Lists +
+    // matching in ProdTemplateMatch.h: name (EN or ES) OR stringID.
+    unsigned int nprefs = 0;
+    const char* const* prefs = prodtmpl::polePrefs(&nprefs);
     for (unsigned int k = 0; k < nprefs; ++k) {
         for (unsigned int i = 0; i < n; ++i) {
             GameData* gd = g_dataScratch[i];
-            if (gd && ciContains(gd->name.c_str(), prefs[k])) return gd;
+            if (gd && prodtmpl::matches(gd->name.c_str(),
+                                        gd->stringID.c_str(), prefs[k]))
+                return gd;
         }
     }
     return 0;
@@ -1176,15 +1243,15 @@ GameData* findMachineTemplate(GameWorld* gw) {
     g_dataScratch.clear();
     g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, BUILDING);
     unsigned int n = g_dataScratch.size();
-    const char* prefs[] = {
-        "training dummy", "combat dummy", "punching bag", "research bench",
-        "engineering bench", "weapon smithy", "spinning wheel", "loom"
-    };
-    const unsigned int nprefs = sizeof(prefs) / sizeof(prefs[0]);
+    // Lists + matching in ProdTemplateMatch.h: name (EN or ES) OR stringID.
+    unsigned int nprefs = 0;
+    const char* const* prefs = prodtmpl::machinePrefs(&nprefs);
     for (unsigned int k = 0; k < nprefs; ++k) {
         for (unsigned int i = 0; i < n; ++i) {
             GameData* gd = g_dataScratch[i];
-            if (gd && ciContains(gd->name.c_str(), prefs[k])) return gd;
+            if (gd && prodtmpl::matches(gd->name.c_str(),
+                                        gd->stringID.c_str(), prefs[k]))
+                return gd;
         }
     }
     return 0;
@@ -1237,11 +1304,8 @@ RootObject* findWorkFixtureNear(GameWorld* gw, int* outTask) {
         g_npcQuery.clear();
         g_getObjsFn(gw, &g_npcQuery, &center, 60.0f, BUILDING, 256, 0);
         unsigned int total = g_npcQuery.size();
-        const char* prefs[] = {
-            "training dummy", "combat dummy", "punching bag", "research bench",
-            "engineering bench", "weapon smithy", "spinning wheel", "loom"
-        };
-        const unsigned int nprefs = sizeof(prefs) / sizeof(prefs[0]);
+        unsigned int nprefs = 0;
+        const char* const* prefs = prodtmpl::machinePrefs(&nprefs); // EN+ES+stringID
         // The baked dummy by its stringID first ("Training Dummy MkI"): names are
         // localized, and a Spanish Kenshi found no fixture here at all.
         for (unsigned int i = 0; i < total; ++i) {
@@ -1258,10 +1322,11 @@ RootObject* findWorkFixtureNear(GameWorld* gw, int* outTask) {
                 RootObject* o = g_npcQuery[i];
                 if (!o) continue;
                 GameData* gd = o->getGameData();
-                if (gd && ciContains(gd->name.c_str(), prefs[k])) {
+                if (gd && prodtmpl::matches(gd->name.c_str(),
+                                            gd->stringID.c_str(), prefs[k])) {
                     if (outTask)
-                        *outTask = (ciContains(gd->name.c_str(), "dummy") ||
-                                    ciContains(gd->name.c_str(), "bag"))
+                        *outTask = prodtmpl::isTrainingFixture(
+                                       gd->name.c_str(), gd->stringID.c_str())
                                        ? USE_TRAINING_DUMMY : OPERATE_MACHINERY;
                     return o;
                 }

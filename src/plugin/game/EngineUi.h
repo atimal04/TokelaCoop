@@ -100,6 +100,14 @@ void coopOverlayTick(const char* text, int state, bool show);
 // reproduced 2026-09-24: panel open at close -> crash, closed first -> clean).
 // Called from the MSVCR100!exit hook (Plugin.cpp). Main thread only; idempotent.
 void coopUiShutdown();
+// Ephemeral co-op TOAST: a second fixed-position floating label, pinned just
+// below the persistent banner, that announces a peer CONNECT/DISCONNECT transition
+// for a few seconds and then self-hides. Same floating-label render path and state
+// colouring as the banner, but an independent widget with its own lifetime - the
+// caller drives show via ToastTimer's toastVisible(), passing show=false once the
+// window elapses so this removes it. Needs no player character (title screen too).
+// Main-thread only; SEH-guarded.
+void coopToastTick(const char* text, int state, bool show);
 
 } // namespace engine
 } // namespace coop

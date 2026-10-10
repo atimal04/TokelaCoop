@@ -1,11 +1,16 @@
 # TokelaCoop
 
-**Current version: v0.54.** Up to v0.53 this project was called **KenshiCoop**.
+**Current version: v0.55.** Up to v0.53 this project was called **KenshiCoop**.
 TokelaCoop is a modified fork of [nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop).
 In game, the top-left banner and the F2 panel title show the name and the
-version ("TokelaCoop v0.54"): check that you and your friend see the same one.
+version ("TokelaCoop v0.55"): check that you and your friend see the same one.
 
 Setup + Demo (upstream KenshiCoop): [https://www.youtube.com/watch?v=OqwVRRZEYGM](https://www.youtube.com/watch?v=OqwVRRZEYGM)
+
+> **Merge fork (atimal04):** this branch merges [TokelaCoop](https://github.com/dentroytu/TokelaCoop) v0.54
+> with [KenshiDuo](https://github.com/jaime37/KenshiDuo), which carries the community pull requests
+> that never landed upstream (doors/locks, beds/cages, construction, recipes, bounties, inventory save
+> fence, duplicate ground items). Protocol 65: it refuses both parents. AGPL-3.0, like upstream.
 
 Experimental **co-op multiplayer for [Kenshi](https://lofigames.com/)**, built as an
 [RE_Kenshi](https://github.com/BFrizzleFoShizzle/RE_Kenshi) /

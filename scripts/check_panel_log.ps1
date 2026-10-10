@@ -16,7 +16,7 @@
   each local install.
 
 .EXAMPLE
-  powershell -ExecutionPolicy Bypass -File scripts\check_panel_log.ps1 -Log "C:\Program Files (x86)\Steam\steamapps\common\Kenshi\TokelaCoop_host.log"
+  powershell -ExecutionPolicy Bypass -File scripts\check_panel_log.ps1 -Log "C:\path\to\Kenshi\TokelaCoop_host.log"
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File scripts\check_panel_log.ps1
@@ -30,13 +30,16 @@ param(
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Import-Module (Join-Path $scriptDir "CoopOracles.psm1") -Force
+Import-Module (Join-Path $scriptDir "CoopHarness.psm1") -Force
 
 if ($Log.Count -eq 0) {
+    $hostDir = Get-CoopKenshiDir
+    $joinDir = Get-CoopKenshiJoinDir
     $candidates = @(
-        (Join-Path ${env:ProgramFiles(x86)} "Steam\steamapps\common\Kenshi\TokelaCoop_host.log"),
-        (Join-Path ${env:ProgramFiles(x86)} "Steam\steamapps\common\Kenshi\TokelaCoop_join.log"),
-        (Join-Path $env:USERPROFILE "Kenshi-Join\TokelaCoop_host.log"),
-        (Join-Path $env:USERPROFILE "Kenshi-Join\TokelaCoop_join.log")
+        (Join-Path $hostDir "TokelaCoop_host.log"),
+        (Join-Path $hostDir "TokelaCoop_join.log"),
+        (Join-Path $joinDir "TokelaCoop_host.log"),
+        (Join-Path $joinDir "TokelaCoop_join.log")
     )
     $Log = @($candidates | Where-Object { Test-Path $_ })
     if ($Log.Count -eq 0) {

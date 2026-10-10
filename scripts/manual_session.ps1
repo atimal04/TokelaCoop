@@ -55,6 +55,14 @@ param(
     # "join me" hits. Use to validate recruit sync on a populated save that has
     # no dialog-hireable NPC (camp/squad1). 0 = off.
     [int]$AutoRecruit = 0,
+    # Host-only bounty helper (TOKELACOOP_AUTOCRIME=N seconds): N s after gameplay
+    # settles, the host ONCE programmatically assigns a test bounty (500) to the
+    # player-squad member at -AutoCrimeIndex via unfairAddToBounty. In -Inhabit
+    # mode a non-zero index is a JOIN-owned character's driven copy, so this
+    # reproduces the H2 witness-local state and validates protocol-62 sync
+    # deterministically (host publishes, join applies). 0 = off.
+    [int]$AutoCrime = 0,
+    [int]$AutoCrimeIndex = 1,
     # Inhabit mode: both clients load the SAME save (so NPC sync works) but each
     # OWNS a different subset of the shared squad. Default split: host owns the
     # leader (index 0), join inhabits everyone else (~0). Overridable via
@@ -74,8 +82,10 @@ param(
     [switch]$JoinFromMenu,
     [int]$Port = 27800,
     [string]$Ip = "127.0.0.1",
-    [string]$HostDir = "C:\Program Files (x86)\Steam\steamapps\common\Kenshi",
-    [string]$JoinDir = "$env:USERPROFILE\Kenshi-Join",
+    # Install dirs. Empty -> TOKELACOOP_KENSHI_DIR / TOKELACOOP_KENSHI_JOIN_DIR
+    # env override, else the harness defaults (CoopHarness.psm1).
+    [string]$HostDir = "",
+    [string]$JoinDir = "",
     [switch]$Sync,
     [switch]$SkipBuild,
     [switch]$SkipDeploy,
@@ -165,6 +175,13 @@ param(
     # observing side (a diagnostic divergence, NOT a real desync). Do NOT use for
     # parity/visual A-B; use plain -JailProbe for that.
     [switch]$JailObserve,
+    # Bounty/crime probe (spike 59, TOKELACOOP_BOUNTY_PROBE=1 on BOTH clients):
+    # arms the read-only [bounty] observer (STATE/ROW per body with live crime or
+    # bounty state, + 10 s SCAN heartbeat) so a manual session that commits a
+    # witnessed crime captures whether the bounty/crime state forks host<->join
+    # and which fields move. Reads the inline BountyManager at Character+0xF0
+    # (me-sentinel guarded); read-only, zero behavior change, OFF by default.
+    [switch]$BountyProbe,
     # Manual sessions tile the two game windows side-by-side BY DEFAULT (host left,
     # join right; scripts\arrange_windows.ps1, re-pinned through the load screen) on
     # the ULTRAWIDE (widest monitor, 3440x1440): each client window is sized to half
@@ -188,6 +205,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+Import-Module (Join-Path $scriptDir "CoopHarness.psm1") -Force
+if ($HostDir -eq "") { $HostDir = Get-CoopKenshiDir }
+if ($JoinDir -eq "") { $JoinDir = Get-CoopKenshiJoinDir }
 
 # Tiling is the manual-session default; -NoTile opts out (-Tile kept for compat).
 $doTile = -not $NoTile
@@ -348,6 +369,10 @@ function Set-CoopEnv {
     $env:TOKELACOOP_SETUP        = if ($Mode -eq "join") { "" } else { $SetupScene }
     # Host-only auto-recruit (N s after gameplay): recruit nearest world NPC.
     $env:TOKELACOOP_AUTORECRUIT  = if ($Mode -eq "join") { "" } else { "$AutoRecruit" }
+    # Host-only auto-crime (protocol 62 validation): inject a test bounty on a
+    # driven join-owned PC N s in, so the channel carries it to the owner.
+    $env:TOKELACOOP_AUTOCRIME       = if ($Mode -eq "join") { "" } else { "$AutoCrime" }
+    $env:TOKELACOOP_AUTOCRIME_INDEX = if ($Mode -eq "join") { "" } else { "$AutoCrimeIndex" }
     $env:TOKELACOOP_PROBE_RECRUIT = if ($Mode -eq "join" -and $ProbeRecruit) { "1" } else { "" }
     $env:TOKELACOOP_PROBE_AISUSPEND = if ($Mode -eq "join" -and $ProbeAiSuspend) { "1" } else { "" }
     # Inventory sync is bidirectional, so enable it on BOTH clients.
@@ -383,6 +408,10 @@ function Set-CoopEnv {
     $env:TOKELACOOP_JAIL_PROBE   = if ($JailProbe) { "1" } else { "" }
     $env:TOKELACOOP_TASK_SPIKE   = if ($JailProbe) { "1" } else { "" }
     $env:TOKELACOOP_JAIL_OBSERVE = if ($JailObserve) { "1" } else { "" }
+    # Bounty/crime read-only probe on BOTH clients (spike 59, see -BountyProbe):
+    # bounties are a player-facing per-character system, so both squads are read
+    # on both sides - the fork evidence is the host-vs-join ROW diff per hand.
+    $env:TOKELACOOP_BOUNTY_PROBE = if ($BountyProbe) { "1" } else { "" }
     # Per-mode log next to the install so host/join don't clobber each other.
     $env:TOKELACOOP_LOG          = if ($Mode -eq "join") { "TokelaCoop_join.log" } else { "TokelaCoop_host.log" }
 }

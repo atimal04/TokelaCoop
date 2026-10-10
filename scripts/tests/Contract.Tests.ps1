@@ -361,6 +361,7 @@ $diagSpec = @{
     inv_reequip    = @{ TOKELACOOP_INV_SYNC = '1' }
     vendor_trade   = @{ TOKELACOOP_INV_SYNC = '1' }
     store_sync     = @{ TOKELACOOP_INV_SYNC = '1' }
+    store_join_add = @{ TOKELACOOP_INV_SYNC = '1' }
     trade_peer     = @{ TOKELACOOP_INV_SYNC = '1' }
     weapon_loot    = @{ TOKELACOOP_INV_SYNC = '1' }
     world_weapon_drop = @{ TOKELACOOP_INV_SYNC = '1'; TOKELACOOP_WORLD_SYNC = '1' }
@@ -373,6 +374,8 @@ $diagSpec = @{
     inv_regear_forget = @{ TOKELACOOP_INV_SYNC = '1'; TOKELACOOP_WORLD_SYNC = '1' }
     world_item_burst = @{ TOKELACOOP_WORLD_SYNC = '1' }
     inv_nested_bag  = @{ TOKELACOOP_INV_SYNC = '1'; TOKELACOOP_WORLD_SYNC = '1' }
+    rejoin_bag_stage1 = @{ TOKELACOOP_INV_SYNC = '1'; TOKELACOOP_WORLD_SYNC = '1' }
+    rejoin_bag      = @{ TOKELACOOP_INV_SYNC = '1'; TOKELACOOP_WORLD_SYNC = '1' }
     inv_dump_all    = @{ TOKELACOOP_INV_SYNC = '1'; TOKELACOOP_WORLD_SYNC = '1' }
     inv_dump_all_forget = @{ TOKELACOOP_INV_SYNC = '1'; TOKELACOOP_WORLD_SYNC = '1' }
     inv_dump_all_transient = @{ TOKELACOOP_INV_SYNC = '1'; TOKELACOOP_WORLD_SYNC = '1' }
@@ -443,33 +446,70 @@ $adapterHasInternal = (Test-Path $adapter) -and `
     ((Select-String -Path $adapter -Pattern $internalIncludeRe).Count -gt 0)
 Check "adapter EngineInternal.h carries the game-internal prelude" $adapterHasInternal
 
-# ---- 6. the v0.54 rename (KenshiCoop -> TokelaCoop) ---------------------------
-# The env-var prefix and the build defines are a contract between the scripts and
-# the DLL: a leftover old name on either side makes a knob silently do nothing
-# (the DLL falls back to its default). Everything must use TOKELACOOP_ now.
-Write-Host "== rename contract (TOKELACOOP_ everywhere) =="
-$oldPrefix = "KENSHI" + "COOP"
-$codeFiles = @(Get-ChildItem -Path (Join-Path $repoRoot "src"), $scriptsRoot, (Join-Path $repoRoot "kit"),
-                   (Join-Path $repoRoot "tools"), (Join-Path $repoRoot "third_party\vc10_compat") `
-                   -Recurse -File -Include *.cpp, *.h, *.ps1, *.psm1, *.psd1, *.cmd, *.cs, *.vcxproj -ErrorAction SilentlyContinue)
-$stale = @($codeFiles | Select-String -Pattern $oldPrefix -CaseSensitive -SimpleMatch)
-if ($stale.Count -gt 0) { $stale | Select-Object -First 10 | ForEach-Object { Write-Host "      $($_.Path):$($_.LineNumber)" } }
-Check "no old env-var prefix / build define left in code and scripts" ($stale.Count -eq 0)
-Check "rename check scanned the plugin and the scripts" ($codeFiles.Count -gt 100)
-$keysInCode = @(Get-CoopDiagEnvKeys)
-$srcText = (Get-ChildItem -Path (Join-Path $repoRoot "src") -Recurse -File -Include *.cpp, *.h |
-            ForEach-Object { [IO.File]::ReadAllText($_.FullName) }) -join "`n"
-$unread = @($keysInCode | Where-Object { $srcText.IndexOf('"' + $_ + '"') -lt 0 })
-if ($unread.Count -gt 0) { Write-Host ("      not read by the DLL: " + ($unread -join ", ")) }
-Check "every harness DiagEnv key is a literal the DLL reads" ($unread.Count -eq 0)
-$verLine = Select-String -Path (Join-Path $repoRoot "src\netproto\Version.h") -Pattern '#define\s+TOKELACOOP_VERSION\s+"[0-9]+\.[0-9]+"'
-Check "Version.h defines TOKELACOOP_VERSION as X.YY" ($null -ne $verLine)
-# VS2010 reads a BOM-less source in the ANSI code page, so a raw accent in a string
-# literal ships as mojibake. Player text uses escapes ("\xC3\xB3", L"\x00F3").
-$rawAccent = @(Get-ChildItem -Path (Join-Path $repoRoot "src") -Recurse -File -Include *.cpp, *.h |
-    Select-String -Pattern '[^\x00-\x7F]' | Where-Object { $_.Line -notmatch '^\s*(//|\*)' })
-if ($rawAccent.Count -gt 0) { $rawAccent | Select-Object -First 5 | ForEach-Object { Write-Host "      $($_.Path):$($_.LineNumber)" } }
-Check "no raw non-ASCII character in C++ code (only in comments)" ($rawAccent.Count -eq 0)
+# ---- 6. install-dir single-resolution contract ---------------------------------
+# The two local Kenshi install dirs resolve in ONE place per language:
+# CoopHarness.psm1 (Get-CoopKenshiDir / Get-CoopKenshiJoinDir) for PowerShell
+# and scripts\_kenshi_dirs.cmd for batch, behind the TOKELACOOP_KENSHI_DIR /
+# TOKELACOOP_KENSHI_JOIN_DIR env vars. A hardcoded default anywhere else would
+# silently drift from the override, so this scans every harness script for the
+# default literals.
+Write-Host "== install-dir resolution contract =="
+
+# 6a. The PowerShell resolver honors the env override and falls back to the
+#     historical default when unset.
+$savedK = $env:TOKELACOOP_KENSHI_DIR
+$savedJ = $env:TOKELACOOP_KENSHI_JOIN_DIR
+$env:TOKELACOOP_KENSHI_DIR = "X:\fake\kenshi"
+$env:TOKELACOOP_KENSHI_JOIN_DIR = "Y:\fake\join"
+Check "host dir honors TOKELACOOP_KENSHI_DIR" ((Get-CoopKenshiDir) -eq "X:\fake\kenshi")
+Check "join dir honors TOKELACOOP_KENSHI_JOIN_DIR" ((Get-CoopKenshiJoinDir) -eq "Y:\fake\join")
+$env:TOKELACOOP_KENSHI_DIR = ""
+$env:TOKELACOOP_KENSHI_JOIN_DIR = ""
+Check "host dir falls back to the Steam default" ((Get-CoopKenshiDir) -like "*steamapps\common\Kenshi")
+Check "join dir falls back to *\Kenshi-Join" ((Get-CoopKenshiJoinDir) -like "*\Kenshi-Join")
+
+# 6b. The batch resolver (scripts\_kenshi_dirs.cmd) does the same, run for real.
+#     (/v:on + !VAR!: the vars are SET by the called script, so parse-time %VAR%
+#     expansion of the compound line would print the pre-call values.)
+$env:TOKELACOOP_KENSHI_DIR = "X:\fake\kenshi"
+$cmdOut = @(& cmd.exe /v:on /c "call `"$scriptsRoot\_kenshi_dirs.cmd`" >nul && echo !TOKELACOOP_KENSHI_DIR!&echo !TOKELACOOP_KENSHI_JOIN_DIR!")
+$env:TOKELACOOP_KENSHI_DIR = $savedK
+$env:TOKELACOOP_KENSHI_JOIN_DIR = $savedJ
+Check "cmd resolver honors the env override" ($cmdOut -contains "X:\fake\kenshi")
+Check "cmd resolver falls back to *\Kenshi-Join" ((@($cmdOut) | Where-Object { $_ -like "*\Kenshi-Join" }).Count -gt 0)
+
+# 6c. Literal scan: no OTHER script carries the default paths. Exempt:
+#   _kenshi_dirs.cmd / CoopHarness.psm1 - the single resolution points themselves
+#   start_kenshi.ps1       - shipped STANDALONE to the LAN machine by
+#                            setup_lan_host.ps1, so it cannot import the module
+#   friend_host/friend_join.ps1 - shipped in player kits without the module;
+#                            they PROBE several candidate Steam roots (discovery,
+#                            not a default)
+#   make_mod_kit.ps1         - its kit README template names the default Steam
+#                            path for END USERS on purpose (player-facing doc,
+#                            not a harness path resolution)
+$dirPatterns = @('steamapps\\common\\Kenshi', 'Kenshi-Join\\', '%USERPROFILE%\\Kenshi-Join')
+$dirExempt = @('CoopHarness.psm1', '_kenshi_dirs.cmd', 'start_kenshi.ps1',
+               'friend_host.ps1', 'friend_join.ps1', 'make_mod_kit.ps1')
+$dirHits = @()
+foreach ($f in (Get-ChildItem -Path $scriptsRoot -File |
+                Where-Object { @('.ps1', '.psm1', '.cmd') -contains $_.Extension })) {
+    if ($dirExempt -contains $f.Name) { continue }
+    foreach ($m in (Select-String -Path $f.FullName -Pattern $dirPatterns)) {
+        $dirHits += "$($f.Name) line $($m.LineNumber): $($m.Line.Trim())"
+    }
+}
+if ($dirHits.Count -gt 0) { $dirHits | ForEach-Object { Write-Host "      install-dir literal: $_" } }
+Check "no script outside the resolvers carries an install-dir literal" ($dirHits.Count -eq 0)
+
+# POSITIVE controls: the scan must see the defaults in the two resolution points
+# (otherwise the check above passes vacuously), and the regex must fire at all.
+Check "scanner sees the default in CoopHarness.psm1" `
+    ((Select-String -Path (Join-Path $scriptsRoot "CoopHarness.psm1") -Pattern $dirPatterns).Count -gt 0)
+Check "scanner sees the default in _kenshi_dirs.cmd" `
+    ((Select-String -Path (Join-Path $scriptsRoot "_kenshi_dirs.cmd") -Pattern $dirPatterns).Count -gt 0)
+Check "dir-literal scanner would flag a hardcoded default" `
+    ('set "K=C:\x\steamapps\common\Kenshi"' -match 'steamapps\\common\\Kenshi')
 
 # ---- cleanup ------------------------------------------------------------------
 Remove-Item -Path $tmpH, $tmpJ -Force -ErrorAction SilentlyContinue

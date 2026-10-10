@@ -25,6 +25,21 @@
 
 namespace coop {
 
+// --- Cross-thread connection-error channel (NET thread -> UI) ----------------
+// The NET thread rejects/aborts a connection for reasons a player must see
+// (protocol/version mismatch above all): before this channel those reasons only
+// reached the file log via netErr(), so a failed JOIN just sat on "Connecting..."
+// and then fell back to "Offline" with no explanation on screen. setNetUiError()
+// publishes a one-line human reason under an internal lock; the MAIN-thread F2
+// panel/overlay reads it each tick via netUiError() and shows it over the generic
+// status. clearNetUiError() is called when a fresh connect attempt starts so a
+// stale reason from a previous try never lingers. The buffer is guarded by a
+// CRITICAL_SECTION constructed at DLL load (before any net thread exists), so
+// every access is race-free.
+void        setNetUiError(const char* msg); // NET thread: publish a reject reason
+const char* netUiError();                   // MAIN thread: "" when none pending
+void        clearNetUiError();              // MAIN thread: wipe on a new attempt
+
 class NetLink {
 public:
     NetLink();
@@ -61,6 +76,10 @@ public:
     // the receiver reconciles additive-only instead of deleting past the cap.
     void queueInvSnapshot(u32 ownerId, u8 keyKind, const u32 cKey[5],
                           const InvItemEntry* items, unsigned int count, u8 flags = 0);
+    // MAIN thread: queue one side of the protocol-60 inventory save fence.
+    // The net thread swaps this queue atomically with outInv_ and sends it
+    // AFTER those snapshots on CH_RELIABLE, preserving snapshot-before-ACK.
+    void queueInvSaveFence(const InvSaveFencePacket& pkt);
 
     // MAIN thread: queue a reliable world-item snapshot (Phase W1). The net thread
     // serializes [WorldItemSnapshotHeader][WorldItemEntry*count] and sends it on the
@@ -92,6 +111,10 @@ public:
     // MAIN thread: queue a reliable conservation PICKUP intent (Phase W3), mirror of the
     // drop. The peer re-homes its tracked ground copy back into the character's bag.
     void queueWorldPickup(const WorldPickupPacket& pkt);
+
+    // MAIN thread: queue a reliable save-native pickup notice (protocol 56). The peer
+    // destroys its own still-on-ground copy of the consumed native, resolved by hand.
+    void queueNativeTaken(const WorldNativeTakenPacket& pkt);
 
     // MAIN thread: queue a reliable cross-owner TRANSFER intent (protocol 37). The peer
     // relocates the real item between its own copies of the two containers.
@@ -132,10 +155,15 @@ public:
     void queueMoneyDelta(const MoneyDeltaPacket& pkt);
     void queueFaction(const FactionPacket& pkt);
     void queueTime(const TimePacket& pkt);
+    // MAIN thread: queue a reliable Host-canonical baked-door state row.
     void queueDoor(const DoorPacket& pkt);
+    // MAIN thread: queue a reliable door request (protocol 57, Join -> Host).
+    void queueDoorIntent(const DoorIntentPacket& pkt);
     // MAIN thread: queue a reliable host-authoritative machine state row
     // (protocol 33). Change-gated + safety-resent by the caller.
     void queueProd(const ProdPacket& pkt);
+    // MAIN thread: queue a reliable recipe intent (protocol 56, join -> host).
+    void queueProdIntent(const ProdIntentPacket& pkt);
     // MAIN thread: queue a reliable host-authoritative known-research row
     // (protocol 38). First-sight sent + safety-resent by the caller.
     void queueResearch(const ResearchPacket& pkt);
@@ -147,10 +175,17 @@ public:
     // Symmetric and static (a fixture's position/template never change), so this
     // is first-sight plus a slow safety resend and idles at zero traffic.
     void queueFixture(const FixturePacket& pkt);
+    // MAIN thread: queue a reliable bed/cage intent or canonical state (v58).
+    void queueFurniture(const FurniturePacket& pkt);
+    // MAIN thread: queue a reliable host-authoritative bounty/crime row
+    // (protocol 62). Change-gated + safety-resent by the caller (host only).
+    void queueBounty(const BountyPacket& pkt);
     void queueBuildPlace(const BuildPlacePacket& pkt);
     void queueBuildState(const BuildStatePacket& pkt);
     void queueBuildDoor(const BuildDoorPacket& pkt);
     void queueBuildRemove(const BuildRemovePacket& pkt);
+    // MAIN thread: reliable idempotent placement/removal request (Join -> Host).
+    void queueBuildIntent(const BuildIntentPacket& pkt);
 
     // MAIN thread: queue an UNRELIABLE stealth detection-map snapshot (protocol
     // 20, host -> the sneaker's owner). Latest wins; change-gated + throttled by
@@ -304,6 +339,7 @@ private:
         std::vector<InvItemEntry> items;
     };
     std::vector<OutInv>      outInv_;
+    std::vector<InvSaveFencePacket> outInvSaveFence_;
     // Reliable world-item snapshots / culls queued by the main thread (Phase W1),
     // drained + serialized by the net thread. Guarded by outCs_.
     struct OutWorldItems { u32 ownerId; std::vector<WorldItemEntry> items; };
@@ -319,6 +355,8 @@ private:
     // Reliable conservation DROP intents (Phase W2), fixed-size PODs. Guarded by outCs_.
     std::vector<WorldDropPacket> outWorldDrops_;
     std::vector<WorldPickupPacket> outWorldPickups_;
+    // Reliable save-native pickup notices (protocol 56). Guarded by outCs_.
+    std::vector<WorldNativeTakenPacket> outNativeTaken_;
     // Reliable cross-owner transfer intents (protocol 37). Guarded by outCs_.
     std::vector<InvXferPacket>   outInvXfers_;
     // Reliable transfer verdicts (protocol 50). Guarded by outCs_.
@@ -337,18 +375,24 @@ private:
     std::vector<FactionPacket>   outFaction_;
     std::vector<TimePacket>      outTime_;
     std::vector<DoorPacket>      outDoor_;
+    std::vector<DoorIntentPacket> outDoorIntent_;
     // Reliable machine state rows (protocol 33). Guarded by outCs_.
     std::vector<ProdPacket>      outProd_;
+    std::vector<ProdIntentPacket> outProdIntent_;
     // Reliable known-research rows (protocol 38). Guarded by outCs_.
     std::vector<ResearchPacket>  outResearch_;
     // Reliable property-deed ownership rows (protocol 54). Guarded by outCs_.
     std::vector<DeedPacket>      outDeed_;
     // Reliable runtime-fixture identity rows (protocol 55). Guarded by outCs_.
     std::vector<FixturePacket>   outFixture_;
+    std::vector<FurniturePacket> outFurniture_;
+    // Reliable bounty/crime rows (protocol 62). Guarded by outCs_.
+    std::vector<BountyPacket>    outBounty_;
     std::vector<BuildPlacePacket> outBuildPlace_;
     std::vector<BuildStatePacket> outBuildState_;
     std::vector<BuildDoorPacket>  outBuildDoor_;
     std::vector<BuildRemovePacket> outBuildRemove_;
+    std::vector<BuildIntentPacket> outBuildIntent_;
     // Unreliable stealth detection-map snapshots (protocol 20). Guarded by outCs_.
     std::vector<StealthPacket>   outStealth_;
     // Unreliable camera hints (protocol 43, ~1 Hz latest-wins). Guarded by outCs_.

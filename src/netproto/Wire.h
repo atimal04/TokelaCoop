@@ -21,11 +21,13 @@ typedef float          f32;
 typedef double         f64;
 
 // Protocol version. The full version-by-version history (what each bump added
-// and why) lives in resources/PROTOCOL_HISTORY.md - keep it there, not here, so
+// and why) lives in docs/PROTOCOL_HISTORY.md - keep it there, not here, so
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 57;
+// 65 = merge of TokelaCoop v0.54 (57) and KenshiDuo (64): both older lines are
+// refused at handshake instead of playing with different packet tags.
+const u16 PROTOCOL_VERSION = 65;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -53,10 +55,10 @@ enum PacketType {
     PKT_FACTION          = 22,// RELIABLE player-faction relation row (protocol 24); FactionPacket
     PKT_TIME             = 23,// RELIABLE host-authoritative game clock (protocol 25); TimePacket
     PKT_DOOR             = 24,// RELIABLE baked-door open/lock state row (protocol 26); DoorPacket
-    PKT_BUILD_PLACE      = 25,// RELIABLE placed-building describe/mint (protocol 27); BuildPlacePacket
-    PKT_BUILD_STATE      = 26,// RELIABLE placer-authoritative construction progress (protocol 27); BuildStatePacket
+    PKT_BUILD_PLACE      = 25,// RELIABLE Host-canonical placed-building result; BuildPlacePacket
+    PKT_BUILD_STATE      = 26,// RELIABLE Host-canonical construction progress; BuildStatePacket
     PKT_BUILD_DOOR       = 27,// RELIABLE placed-building door row, translated key (protocol 28); BuildDoorPacket
-    PKT_BUILD_REMOVE     = 28,// RELIABLE placer-authoritative building removal (protocol 28); BuildRemovePacket
+    PKT_BUILD_REMOVE     = 28,// RELIABLE Host-canonical building removal; BuildRemovePacket
     PKT_SAVE_REQ         = 29,// RELIABLE join save request (join -> host, protocol 31); SaveReqPacket
     PKT_SAVE_BEGIN       = 30,// RELIABLE save-transfer announce (host -> join, protocol 31); SaveBeginPacket
     PKT_SAVE_FILE        = 31,// RELIABLE save-file chunk (host -> join, protocol 31); SaveFileHeader + path + payload
@@ -77,7 +79,14 @@ enum PacketType {
     PKT_MONEY_DELTA      = 46,// RELIABLE join money-pool delta (join -> host, protocol 52); MoneyDeltaPacket
     PKT_DEED             = 47,// RELIABLE property-ownership row (protocol 54); DeedPacket
     PKT_FIXTURE          = 48,// RELIABLE runtime-fixture identity row (protocol 55); FixturePacket
-    PKT_MODLIST          = 49 // RELIABLE active-mod list, both directions on connect (protocol 56); ModListPacket
+    PKT_NATIVE_TAKEN     = 49,// RELIABLE save-native ground item consumed (protocol 56); WorldNativeTakenPacket
+    PKT_PROD_INTENT      = 50,// RELIABLE recipe intent (join -> host, protocol 57); ProdIntentPacket
+    PKT_DOOR_INTENT      = 51,// RELIABLE join -> host open/lock request (protocol 58); DoorIntentPacket
+    PKT_FURNITURE        = 52,// RELIABLE join intent / host-canonical bed+cage row (protocol 59)
+    PKT_BUILD_INTENT     = 53,// RELIABLE join -> host place/remove request (protocol 60); BuildIntentPacket
+    PKT_INV_SAVE_FENCE   = 54,// RELIABLE pre-save inventory checkpoint marker (protocol 61); InvSaveFencePacket
+    PKT_BOUNTY           = 55,// RELIABLE host-authoritative bounty/crime row (protocol 62, PR #18; tag 42 was taken by PKT_COMBAT_HIT); BountyPacket
+    PKT_MODLIST          = 56 // RELIABLE active-mod list, both directions on connect (TokelaCoop protocol 56, retagged 49->56 in the protocol-65 merge); ModListPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -607,6 +616,33 @@ const u8 INV_FLAG_TRUNCATED = 0x01;
 // routine case. Bounded by the u8 `count` field (255).
 const unsigned int INV_ITEMS_MAX = 64;
 
+// ---- Protocol 61: inventory save fence -------------------------------------
+// A coordinated save is authoritative only if the host has first applied the
+// join's latest owner-authored inventory snapshots. SaveManager::save starts a
+// deferred multi-file write immediately, while an inventory edit may still be
+// waiting out the snapshot settle window or crossing the network; without a
+// fence, the host can bake the prior backpack contents and the next load erases
+// the join's newer items.
+//
+// The host sends REQ with a monotonic fenceId. The join waits until every
+// inventory it authors is stable under the ordinary cursor/removal debounce,
+// queues a full reliable snapshot for each, then queues ACK on the SAME ordered
+// reliable channel. The host therefore knows all snapshots preceding the ACK
+// have reached its inbound queues. Because snapshots and ACKs drain through
+// separate main-thread queues, it waits two complete game ticks for ingestion
+// and post-engine apply, then re-issues the native save before watching and
+// transferring that folder.
+//
+// containers/truncated are ACK diagnostics (zero in REQ). A truncated snapshot
+// remains additive-only, so the save is loss-safe but the warning stays visible.
+struct InvSaveFencePacket {
+    u8  type;       // = PKT_INV_SAVE_FENCE; Host->Join REQ, Join->Host ACK
+    u32 ownerId;    // network player id of the sender
+    u32 fenceId;    // host-monotonic request id
+    u16 containers; // ACK: number of full container snapshots queued
+    u16 truncated;  // ACK: how many carried INV_FLAG_TRUNCATED
+};
+
 // ---- Phase W1: world-item (ground drop) snapshot ---------------------------
 // Generalizes the Phase 4a content-snapshot/reconcile model from CONTAINERS to the open
 // WORLD. The W0 drop_probe proved a player drop produces a free-standing world Item that
@@ -674,6 +710,38 @@ struct WorldItemClaimHeader {
 
 // 16 * sizeof(WorldItemEntry)=1168 + header(6) stays under a 1400 B datagram.
 const unsigned int WORLD_ITEMS_MAX = 16;
+
+// ---- Protocol 56: save-native ground pickup notice --------------------------
+// The W1 CLAIM above mirrors pickups of STREAMED items (tracked, netId-keyed), but a
+// save-native world item - shop stock / town placements, exactly the owned items the
+// protocol-55 ownership filter keeps OUT of the stream - has no netId and no proxy.
+// When a character picked one up (stealing it), nothing told the peer, whose own
+// save-native copy stayed on the ground: the "host stole it but the join still sees
+// it" ghost (upstream #44). Both clients loaded the IDENTICAL save, so the item's
+// 5-field engine hand resolves on both machines; this notice names the consumed
+// native by hand and the receiver destroys its own still-on-ground copy. The receiver
+// only acts on an object that still reads as a LIVE GROUND item - a copy already in a
+// local bag, or already gone, is left alone - so a stale or echoed notice is a no-op.
+// takeId is monotonic per sender (idempotency under reliable resend).
+struct WorldNativeTakenPacket {
+    u8  type;    // = PKT_NATIVE_TAKEN
+    u32 ownerId; // network player id of the sender (whose side consumed the native)
+    u32 takeId;  // monotonic per-sender (idempotency)
+    // the consumed native's engine hand ON THE SENDER. Measured on 1.0.65: an item's
+    // (index, serial) is assigned per session, so this does NOT resolve on the
+    // other client even for the identical save; it is carried for the same-client
+    // fast path and for the log only.
+    u32 iType;
+    u32 iContainer;
+    u32 iContainerSerial;
+    u32 iIndex;
+    u32 iSerial;
+    // The shared identity: template + world position (the save data both clients
+    // loaded, which neither moved). The receiver destroys the LIVE ground item of
+    // this template nearest to this position, within a few units, or nothing.
+    char stringID[48];
+    f32 x, y, z;
+};
 
 // ---- Phase W2: conservation DROP intent ------------------------------------
 // A WEAPON cannot be rebuilt on a peer (RootObjectFactory::createItem returns null for all
@@ -955,6 +1023,10 @@ struct TreatmentPacket {
 // (blood + a frontal flesh wound), then the medical sim + vitals stream mirror
 // the result back. Idempotent-ish per hitId (log correlation only; the amounts
 // are deltas, so a dropped/duped datagram would mis-total - hence RELIABLE).
+enum CombatHitFlags {
+    COMBAT_HIT_KNOCKOUT = 1 << 0
+};
+
 struct CombatHitPacket {
     u8  type;    // = PKT_COMBAT_HIT
     u32 ownerId; // network player id of the sender (the ATTACKER's machine)
@@ -967,6 +1039,8 @@ struct CombatHitPacket {
     u32 sSerial;
     f32 flesh;   // accumulated flesh damage to apply (frontal part)
     f32 blood;   // accumulated blood loss to apply
+    u8  flags;   // CombatHitFlags outcome bits
+    f32 koSkill;  // MedicalSystem::knockout(skill) input for KO duration
 };
 
 // Consensus game speed (pause/1x/2x/3x). As PKT_SPEED_REQ it carries one
@@ -1019,6 +1093,7 @@ struct StatsPacket {
     f32 stats[STATS_SLOT_MAX]; // by StatsEnumerated index (-1 = unreadable)
     f32 xp;                    // CharStats::xp (-1 = unreadable)
     f32 freeAttributePoints;   // CharStats::freeAttributePoints (int on wire as f32; -1 = unreadable)
+    f32 age;                   // Character::getAge (protocol 63); animals scale body size by age. <= 0 = unreadable
 };
 
 // ---- Protocol 52: shared money pool ------------------------------------------
@@ -1105,27 +1180,25 @@ struct TimePacket {
     f64 gameHours; // absolute in-game clock, total hours
 };
 
-// ---- Protocol 26: baked-door open/lock state ----------------------------------
+// ---- Protocol 26/58: host-canonical baked-door open/lock state ----------------
 // One door/gate state row, keyed by the door Building's save-stable hand (the
 // furniture/bed identity precedent - door_probe run 160041 confirmed census
-// intersection on the shared save). SYMMETRIC change-gated channel: each
-// client samples doors near its interest centers ~1 Hz, streams rows whose
-// (open, locked) moved vs a seeded per-hand baseline, and applies received
-// rows through the engine's own openDoor/closeDoor/lockDoor/unlockDoor -
-// updating the baseline BEFORE the write, so an applied row is never
-// re-detected as a local change (echo-free). seq is per-sender monotonic so
-// a stale row never overwrites a newer one. open is the collapsed DESTINATION
-// state (OPENING counts as open, CLOSING as closed) so a door mid-swing never
-// publishes a transient. A receiver that cannot resolve the hand skips the
-// row silently (out-of-interest or a runtime-placed door - accepted edge).
+// intersection on the shared save). The HOST is the only state writer. A Join
+// sends DoorIntentPacket when its local UI/engine changes a door, the Host
+// resolves + validates + applies it, then publishes the resulting canonical row
+// with an explicit acknowledgement. seq is Host-monotonic. open is the collapsed
+// DESTINATION state (OPENING counts as open, CLOSING as closed), so a door
+// mid-swing never publishes a transient.
 struct DoorPacket {
     u8  type;      // = PKT_DOOR
-    u32 ownerId;   // network player id of the sender
-    u32 seq;       // per-sender monotonic (stale-row guard)
+    u32 ownerId;   // Host network player id
+    u32 seq;       // Host-monotonic canonical-state sequence
     // door hand [type, container, containerSerial, index, serial]
     u32 hand[5];
     u8  open;      // 1 = open/opening
     u8  locked;    // 1 = DoorLock engaged (only applied when the door has a lock)
+    u32 ackOwnerId;// Join whose latest intent this canonical row answers
+    u32 ackSeq;    // 0 = unsolicited state; otherwise covers <= this intent seq
 };
 
 // ---- Protocol 54: property-deed (building ownership) ------------------------
@@ -1230,14 +1303,38 @@ struct FixturePacket {
     u8  classType; // BuildingClassType, second match guard
 };
 
+// ---- Protocol 59: host-canonical bed/cage occupancy -------------------------
+// The join sends an INTENT after its local engine performs an enter/exit. The
+// host applies that intent to its canonical copy and broadcasts the resulting
+// STATE with an owner-scoped acknowledgement. Reliable ordered delivery plus
+// monotonic sequences makes retries idempotent. Chained/pole prisoners remain
+// on the protocol-41 path; kind is deliberately restricted to bed(1)/cage(2).
+enum FurnitureWireMode {
+    FURNITURE_INTENT = 0,
+    FURNITURE_STATE  = 1
+};
+
+struct FurniturePacket {
+    u8  type;       // = PKT_FURNITURE
+    u8  mode;       // FurnitureWireMode
+    u8  on;         // desired/actual occupancy (0 exit, 1 enter)
+    u8  kind;       // 1 bed, 2 cage
+    u32 ownerId;    // sender (join for intent, host for canonical state)
+    u32 seq;        // per-sender monotonic sequence
+    u32 occupant[5];// save-stable occupant hand
+    u32 furniture[5];// save-stable bed/cage hand
+    u32 ackOwnerId; // requester whose intent this state acknowledges (0 if none)
+    u32 ackSeq;     // highest folded intent sequence for ackOwnerId
+};
+
 // ---- Protocol 27: placed-building sync --------------------------------------
 // A placed building is a RUNTIME object: its hand exists only in the placer's
 // session (build_probe: minted-site hand intersection across clients is zero),
 // so the wire key is the PLACER's local hand and the receiver keeps a
 // key -> local-hand translation map, exactly the protocol-21 proxy precedent
-// for structures. The PLACER is the authority for its building's construction
-// progress (the describe/mint edge names the authority implicitly - whoever
-// announced the key streams its state).
+// for structures. Protocol 60 keeps that identity but makes the HOST the only
+// authority for existence, construction progress and removal. A Join placement
+// is an optimistic local preview plus an idempotent request, never a state row.
 //
 // PLACE announces one local placement (the UI commit detour on
 // PreviewBuilding::placeFinalPreviewBuilding, or a programmatic scenario
@@ -1249,8 +1346,8 @@ struct FixturePacket {
 // resends) are deduped by the translation map.
 struct BuildPlacePacket {
     u8  type;      // = PKT_BUILD_PLACE
-    u32 ownerId;   // network player id of the sender (the placer = the authority)
-    u32 seq;       // per-sender monotonic (diagnostics/ordering)
+    u32 ownerId;   // network player id of the sender (always the Host in v60)
+    u32 seq;       // Host-monotonic canonical-state sequence
     // the placed building's hand IN THE PLACER'S SESSION (the wire key)
     u32 key[5];
     char sid[48];  // building template GameData stringID
@@ -1259,10 +1356,14 @@ struct BuildPlacePacket {
     f32 z;
     f32 yaw;       // radians
     u8  fromUi;    // 1 = real build-mode commit, 0 = programmatic (diagnostics)
+    u8  accepted;  // 1 = canonical building exists, 0 = Host rejected the intent
+    u32 ackOwnerId;// Join whose latest placement intent this row answers
+    u32 ackSeq;    // 0 = unsolicited state; otherwise covers <= this intent seq
 };
 
-// One construction-progress row for a building the SENDER placed (keyed by
-// the sender's hand = the PLACE key). Change-gated ~1 Hz with a 10 s safety
+// One Host-canonical construction-progress row. The stable session key remains
+// the original placer's hand, but only the Host samples and publishes progress.
+// Change-gated ~1 Hz with a 10 s safety
 // resend while incomplete; complete=1 latches (the engine self-completes at
 // progress >= 1.0 through its own setter - scaffold off, navmesh updated).
 // A receiver whose translation map lacks the key skips the row silently
@@ -1270,8 +1371,8 @@ struct BuildPlacePacket {
 // latter transient).
 struct BuildStatePacket {
     u8  type;      // = PKT_BUILD_STATE
-    u32 ownerId;   // network player id of the sender (the placer)
-    u32 seq;       // per-sender monotonic (stale-row guard)
+    u32 ownerId;   // network player id of the sender (the Host)
+    u32 seq;       // Host-monotonic (stale-row guard)
     u32 key[5];    // the PLACER's hand for the building (translation-map key)
     f32 progress;  // ConstructionState::constructionProgress (0..1 while building)
     u8  complete;  // 1 = ConstructionState::isComplete (latched)
@@ -1284,31 +1385,72 @@ struct BuildStatePacket {
 // translation identity: the factory mints doors in template order, so
 // (PLACER's building hand, index in Building::doors) names the same physical
 // door on both clients once resolved through the protocol-27 build maps.
-// Symmetric change-gated rows, the protocol-26 door shape on the translated
-// key: both clients sample their placed/minted buildings' doors ~1 Hz and
-// stream rows whose (open, locked) moved vs the seeded baseline; the baseline
-// updates BEFORE the apply write (echo-free); per-sender seq drops stale rows.
+// Host-canonical rows, the protocol-26/58 door shape on the translated key.
+// A Join requests changes with DoorIntentPacket; only the Host publishes state.
 struct BuildDoorPacket {
     u8  type;      // = PKT_BUILD_DOOR
-    u32 ownerId;   // network player id of the sender
-    u32 seq;       // per-sender monotonic (stale-row guard)
+    u32 ownerId;   // Host network player id
+    u32 seq;       // Host-monotonic canonical-state sequence
     u32 bkey[5];   // the PLACER's hand for the owning building (map key)
     u8  doorIndex; // position in the building's ordered doors list
     u8  open;      // 1 = open/opening (collapsed destination state)
     u8  locked;    // 1 = DoorLock engaged (applied only when the door has one)
+    u32 ackOwnerId;// Join whose latest intent this canonical row answers
+    u32 ackSeq;    // 0 = unsolicited state; otherwise covers <= this intent seq
 };
 
-// Placer-authoritative removal of a session-placed building: the dismantle
-// detour (UI path) or a programmatic destroy queues the edge; the receiver
-// destroys its mapped proxy through the engine's own GameWorld::destroy and
-// tombstones the translation entry (later rows for the key skip silently).
-// Only buildings in the session's build maps ever stream removal - baked
-// buildings are untouched by this channel.
+// Protocol 58 Join -> Host request for either door identity. keyKind=0 names a
+// baked door directly by hand; keyKind=1 names a session-placed building plus
+// doorIndex. The request carries a complete desired pair because one local
+// interaction can unlock+open (or close+lock) between 200 ms samples. It is an
+// intent, never a second state writer: the Host validates and replies through
+// DoorPacket/BuildDoorPacket with the actual resulting state and ack fields.
+struct DoorIntentPacket {
+    u8  type;       // = PKT_DOOR_INTENT
+    u32 ownerId;    // requesting Join's network player id
+    u32 seq;        // per-Join monotonic; retries reuse the same seq
+    u8  keyKind;    // 0 = baked door hand, 1 = placed building key + doorIndex
+    u32 key[5];
+    u8  doorIndex;  // ignored for keyKind=0
+    u8  open;       // desired collapsed destination state (0/1)
+    u8  locked;     // desired lock bit (0/1; 1 rejected when no lock exists)
+};
+
+// Host-canonical removal result for a session-placed building. A Join asks with
+// BuildIntentPacket and keeps retrying the same seq until this state acks it.
 struct BuildRemovePacket {
     u8  type;    // = PKT_BUILD_REMOVE
-    u32 ownerId; // network player id of the sender (the placer)
-    u32 seq;     // per-sender monotonic
+    u32 ownerId; // network player id of the sender (the Host)
+    u32 seq;     // Host-monotonic canonical-state sequence
     u32 key[5];  // the PLACER's hand for the removed building
+    u8  accepted;// 1 = Host canonical state is removed, 0 = unknown/rejected key
+    u32 ackOwnerId;
+    u32 ackSeq;
+};
+
+enum BuildIntentOp {
+    BUILD_INTENT_PLACE  = 1,
+    BUILD_INTENT_REMOVE = 2
+};
+
+// Protocol 60 Join -> Host request. Placement is intentionally optimistic: the
+// Join has already committed its local preview, and the stable key is that local
+// hand. The Host validates and mints its canonical copy under the same wire key,
+// then acknowledges with BuildPlacePacket. Removal likewise reports a local UI
+// dismantle, but only the Host publishes the canonical tombstone. Reliable
+// retries reuse seq, making both operations idempotent.
+struct BuildIntentPacket {
+    u8  type;      // = PKT_BUILD_INTENT
+    u32 ownerId;   // requesting Join's network player id
+    u32 seq;       // per-Join monotonic; retries reuse the same seq
+    u8  op;        // BuildIntentOp
+    u32 key[5];    // original placer's stable session key
+    char sid[48];  // PLACE only
+    f32 x;
+    f32 y;
+    f32 z;
+    f32 yaw;
+    u8  fromUi;    // PLACE only
 };
 
 // ---- Protocol 20: stealth detection-map snapshot ---------------------------
@@ -1382,6 +1524,7 @@ struct SpawnInfoPacket {
     u32 hSerial;
     char charSid[48]; // character template GameData stringID
     char facSid[48];  // faction GameData stringID ("" = unknown -> join fallback)
+    char name[48];    // host body's display name (protocol 63); "" = unnamed
     f32 x;            // world transform at reply time
     f32 y;
     f32 z;
@@ -1518,7 +1661,7 @@ struct LoadNackPacket {
     char name[48];    // save name ('\0'-padded)
 };
 
-// ---- Protocol 33: production machine sync ------------------------------------
+// ---- Protocol 33/57: production state + host-validated recipe intent ----------
 // One machine state row, HOST-authoritative (world-simulation precedent: the
 // host's engine is the one whose production/power/farming ticks count; the
 // join's copies are quieted by convergence, not suppression - its machines
@@ -1541,6 +1684,7 @@ struct ProdPacket {
     i8  powerOn;   // 0/1; -1 = unreadable (not applied)
     i8  prodState; // ProductionBuilding::ProductionState; -1 = not carried
     f32 outAmount; // output buffer amount; -1 = not carried
+    u32 outType;     // output GameData::type (0 when outSid is not carried)
     char outSid[48]; // output item template sid ("" = not carried) - lets the
                    // receiver MATERIALIZE a still-null buffer with the same
                    // item via the native setProductionItem lever
@@ -1549,6 +1693,25 @@ struct ProdPacket {
     f32 died;
     f32 growStart;
     f32 harvested; // int on the engine side; carried as f32 (-1 = not a farm)
+    u32 ackOwnerId; // sender whose latest recipe intent this state answers
+    u32 ackSeq;     // 0 = no intent answered; otherwise covers <= this seq
+};
+
+// Join -> host: request a recipe change on one canonical production machine.
+// This is an INTENT, never a second state writer: the host resolves the key,
+// validates the exact GameData identity and that changing recipes cannot discard
+// a non-empty output buffer, applies through setProductionItem, then answers by
+// publishing ProdPacket with ackOwnerId/ackSeq and the resulting canonical state.
+// Reliable ordered delivery plus monotonic seq makes retries idempotent; the join
+// may resend the same seq while waiting for an acknowledgement.
+struct ProdIntentPacket {
+    u8  type;       // = PKT_PROD_INTENT
+    u32 ownerId;    // network player id of the requesting join
+    u32 seq;        // monotonic per-session intent sequence (starts at 1)
+    u8  keyKind;    // same identity scheme as ProdPacket
+    u32 key[5];
+    u32 recipeType; // exact GameData::type of recipeSid
+    char recipeSid[48];
 };
 
 // ---- Protocol 38: research tech-tree sync -------------------------------------
@@ -1632,7 +1795,7 @@ struct TimePongPacket {
     u32 responderWallMs; // host's wallClockMs() at echo
 };
 
-// Active-mod list (protocol 56). Each side sends its own once on the connect
+// Active-mod list (TokelaCoop protocol 56, tag 56 since protocol 65). Each side sends its own once on the connect
 // edge; the receiver diffs it against its own list and warns (panel, banner,
 // TokelaCoop_mods_diff.txt). Advisory only - a mismatch never disconnects.
 // text: one "file|version\n" line per active mod in load order (ModInfo::file
@@ -1651,7 +1814,81 @@ struct ModListPacket {
     char text[MODLIST_TEXT_MAX];
 };
 
+// ---- Protocol 62: host-authoritative bounty/crime row ------------------------
+// ONE per-(character, faction) durable bounty row, keyed by the OWNING
+// character's save-stable hand (the per-character key every other per-character
+// channel uses - BountyManager is inline per-Character, NOT per-squad) plus the
+// faction's GameData stringID (cross-client stable, proven by the faction
+// probe). The HOST is the sole authority (H2 witness-local, settled by the
+// 2026-07-20 live run): only the host's guard simulation runs the
+// witness->assignBountyForCrimes pipeline, so the row lives on the host's
+// driven copy of a join-owned PC while the owner stays clean. The host diffs
+// each row's {amount, crimes, claimed} against a silently-seeded shared-save
+// baseline and streams movement DOWN to the clients; the owning client applies
+// it via the engine's own levers (unfairAddToBounty / clearBounty). Reliable
+// (a lost row would leave the wanted level diverged until the safety resend).
+struct BountyPacket {
+    u8  type;      // = PKT_BOUNTY
+    u32 ownerId;   // network player id of the sender (the HOST = the authority)
+    u32 seq;       // per-sender monotonic (stale-row guard, as PKT_FACTION)
+    u32 hand[5];   // owning character hand [type,container,containerSerial,index,serial]
+    char sid[48];  // faction GameData stringID ("" never sent) - cross-client identity
+    int  amount;   // Bounty::amount (cats) for that (char, faction) row
+    u32  crimes;   // Bounty::crimes bitmask (CrimeEnum bits)
+    u8   claimed;  // Bounty::bountyHasBeenClaimedOnce
+};
+
 #pragma pack(pop)
+
+// ---- Protocol 62: pure bounty decision logic (header-testable) ---------------
+// The side-effect-free core of the channel, extracted so prototest can lock the
+// authority + convergence rules without a live engine (the engine read/write
+// shims stay behind SEH in EngineCharState.cpp). One value triple per row.
+struct BountyVal {
+    int amount;      // Bounty::amount (cats)
+    u32 crimes;      // Bounty::crimes bitmask
+    int claimed;     // Bounty::bountyHasBeenClaimedOnce (0/1)
+};
+
+// HOST publish gate. Host-authoritative (H2): a NON-host caller NEVER publishes
+// its own bounty state (the join must not push its clean/forked copy upstream -
+// there is no echo path). On the host, a row streams only after its baseline is
+// seeded (both clients load the same save, so a bounty already present at load
+// is shared and silent) and either its value MOVED or a safety resend is due.
+// Returns 1 = queue the row, 0 = skip.
+inline int bountyShouldSend(int isHost, int seeded,
+                            const BountyVal* known, const BountyVal* cur,
+                            int resendDue) {
+    if (!isHost) return 0;   // unidirectional host->clients: the join never publishes
+    if (!seeded) return 0;   // first sight seeds the shared-save baseline silently
+    if (!known || !cur) return 0;
+    int changed = (known->amount != cur->amount) ||
+                  (known->crimes != cur->crimes) ||
+                  (known->claimed != cur->claimed);
+    return (changed || resendDue) ? 1 : 0;
+}
+
+// Receiver apply decision. Given the last-applied per-sender seq, the incoming
+// seq, and the target vs currently-live amount on the local (driven) copy,
+// decide what the engine lever must do. Drops stale rows, skips already-
+// converged rows (a resend or the echo of our own apply), else picks the lever:
+// a raise is an additive unfairAddToBounty(delta); a drop to <= 0 is clearBounty.
+enum BountyApplyAction {
+    BOUNTY_APPLY_SKIP_STALE     = 0, // incoming seq <= seqSeen: a newer row already landed
+    BOUNTY_APPLY_SKIP_CONVERGED = 1, // local already equals target: nothing to do
+    BOUNTY_APPLY_CLEAR          = 2, // target <= 0: clearBounty(fac)
+    BOUNTY_APPLY_ADD            = 3  // non-zero delta: unfairAddToBounty(fac, delta)
+};
+inline int bountyApplyDecision(u32 seqSeen, u32 incomingSeq,
+                               int targetAmount, int currentAmount,
+                               int* outDelta) {
+    if (outDelta) *outDelta = 0;
+    if (seqSeen != 0 && incomingSeq <= seqSeen) return BOUNTY_APPLY_SKIP_STALE;
+    if (targetAmount == currentAmount)          return BOUNTY_APPLY_SKIP_CONVERGED;
+    if (targetAmount <= 0)                      return BOUNTY_APPLY_CLEAR;
+    if (outDelta) *outDelta = targetAmount - currentAmount;
+    return BOUNTY_APPLY_ADD;
+}
 
 // Returns the packet type tag (first byte) of a received buffer, or 0 if empty.
 inline u8 packetType(const void* data, unsigned int len) {

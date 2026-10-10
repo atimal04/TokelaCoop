@@ -25,6 +25,7 @@
 
 #include "../netproto/Wire.h"
 #include "../netproto/ContentHash.h"
+#include "../netproto/HostIntent.h"
 #include "../plugin/sync/Interp.h"
 #include "../plugin/core/OwnRanks.h"
 #include "../plugin/core/SteamId.h"
@@ -39,8 +40,16 @@
 #include "../plugin/core/TabLedger.h" // v0.54: squad-tab owners kept with the save
 #include "../plugin/game/EngineFaults.h" // Phase 5c: fault throttle (pure inline)
 #include "../plugin/game/EngineCaps.h"   // Phase 5d: capability registry (pure inline)
+#include "../plugin/game/ToastTimer.h"   // ephemeral connect/disconnect toast clock
 #include "../plugin/sync/ChangeGate.h"   // Phase 6: change-gated send/accept policy
+#include "../plugin/core/BuildOwnership.h" // protocol-27 peer-copy ownership policy
 #include "../plugin/sync/SaveXfer.h"     // Part A: real save-transfer receiver end-to-end
+#include "../plugin/core/StaleGuard.h"   // per-sender stale-row guard (symmetric channels)
+#include "../plugin/core/ResearchUnion.h" // protocol 38 symmetric grow-only union
+#include "../plugin/game/ProdTemplateMatch.h" // es_ES/stringID template matching
+#include "../plugin/core/JailAnchor.h" // captive kind-conflict anchor (spike 58)
+#include "../plugin/core/CarriedHeal.h"  // owner-side carried self-heal (16b)
+#include "../plugin/sync/DriveTaper.h"    // walk-drive deceleration taper (pure inline)
 
 #include <set>
 #include <string>
@@ -57,8 +66,13 @@ namespace coop {
     void logErrLine(const char*) {}
 }
 
-static int g_failed = 0;
-static int g_total  = 0;
+
+// Non-static: savexfer_test.cpp folds its checks into the same run total.
+int g_failed = 0;
+int g_total  = 0;
+
+// SaveXfer receiver data-safety coverage (src/prototest/savexfer_test.cpp).
+void testSaveXfer();
 
 #define CHECK(name, cond) do { \
     ++g_total; \
@@ -85,6 +99,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(EntityBatchHeader)",       sizeof(EntityBatchHeader),       14); // v35: +sendMs; v44: +epoch
     CHECK_EQ("sizeof(InvItemEntry)",            sizeof(InvItemEntry),            159); // v42: +locked, v48: reserved byte became parentIdx (size unchanged), v51: +level (craft grade)
     CHECK_EQ("sizeof(InvSnapshotHeader)",       sizeof(InvSnapshotHeader),       28); // v33: +keyKind; v46: +flags
+    CHECK_EQ("sizeof(InvSaveFencePacket)",      sizeof(InvSaveFencePacket),      13); // v61: pre-save inventory barrier
     CHECK_EQ("sizeof(WorldItemEntry)",          sizeof(WorldItemEntry),          73);
     CHECK_EQ("sizeof(WorldItemSnapshotHeader)", sizeof(WorldItemSnapshotHeader), 6);
     CHECK_EQ("sizeof(WorldItemRemoveHeader)",   sizeof(WorldItemRemoveHeader),   6);
@@ -96,21 +111,23 @@ static void testSizes() {
     CHECK_EQ("sizeof(MedPartEntry)",            sizeof(MedPartEntry),            19);
     CHECK_EQ("sizeof(MedicalPacket)",           sizeof(MedicalPacket),           467);
     CHECK_EQ("sizeof(TreatmentPacket)",         sizeof(TreatmentPacket),         77);
-    CHECK_EQ("sizeof(CombatHitPacket)",         sizeof(CombatHitPacket),         37);
+    CHECK_EQ("sizeof(CombatHitPacket)",         sizeof(CombatHitPacket),         42);
     CHECK_EQ("sizeof(SpeedPacket)",             sizeof(SpeedPacket),             14);
-    CHECK_EQ("sizeof(StatsPacket)",             sizeof(StatsPacket),             194);
+    CHECK_EQ("sizeof(StatsPacket)",             sizeof(StatsPacket),             198);
     CHECK_EQ("sizeof(StealthPacket)",           sizeof(StealthPacket),           427);
     CHECK_EQ("sizeof(SpawnReqPacket)",          sizeof(SpawnReqPacket),          25);
-    CHECK_EQ("sizeof(SpawnInfoPacket)",         sizeof(SpawnInfoPacket),         143);
+    CHECK_EQ("sizeof(SpawnInfoPacket)",         sizeof(SpawnInfoPacket),         191);
     CHECK_EQ("sizeof(MoneyPacket)",             sizeof(MoneyPacket),             13);
     CHECK_EQ("sizeof(MoneyDeltaPacket)",        sizeof(MoneyDeltaPacket),        13);
     CHECK_EQ("sizeof(FactionPacket)",           sizeof(FactionPacket),           61);
     CHECK_EQ("sizeof(TimePacket)",              sizeof(TimePacket),              17);
-    CHECK_EQ("sizeof(DoorPacket)",              sizeof(DoorPacket),              31);
-    CHECK_EQ("sizeof(BuildPlacePacket)",        sizeof(BuildPlacePacket),        94);
+    CHECK_EQ("sizeof(DoorPacket)",              sizeof(DoorPacket),              39);
+    CHECK_EQ("sizeof(DoorIntentPacket)",        sizeof(DoorIntentPacket),        33);
+    CHECK_EQ("sizeof(BuildPlacePacket)",        sizeof(BuildPlacePacket),       103);
     CHECK_EQ("sizeof(BuildStatePacket)",        sizeof(BuildStatePacket),        34);
-    CHECK_EQ("sizeof(BuildDoorPacket)",         sizeof(BuildDoorPacket),         32);
-    CHECK_EQ("sizeof(BuildRemovePacket)",       sizeof(BuildRemovePacket),       29);
+    CHECK_EQ("sizeof(BuildDoorPacket)",         sizeof(BuildDoorPacket),         40);
+    CHECK_EQ("sizeof(BuildRemovePacket)",       sizeof(BuildRemovePacket),       38);
+    CHECK_EQ("sizeof(BuildIntentPacket)",       sizeof(BuildIntentPacket),       95);
     CHECK_EQ("sizeof(SaveReqPacket)",           sizeof(SaveReqPacket),           57);
     CHECK_EQ("sizeof(SaveBeginPacket)",         sizeof(SaveBeginPacket),         67);
     CHECK_EQ("sizeof(SaveFileHeader)",          sizeof(SaveFileHeader),          19);
@@ -119,15 +136,18 @@ static void testSizes() {
     CHECK_EQ("sizeof(LoadGoPacket)",            sizeof(LoadGoPacket),            61);
     CHECK_EQ("sizeof(LoadReqPacket)",           sizeof(LoadReqPacket),           57);
     CHECK_EQ("sizeof(LoadNackPacket)",          sizeof(LoadNackPacket),          61);
-    CHECK_EQ("sizeof(ProdPacket)",              sizeof(ProdPacket),              109);
+    CHECK_EQ("sizeof(ProdPacket)",              sizeof(ProdPacket),              121);
+    CHECK_EQ("sizeof(ProdIntentPacket)",        sizeof(ProdIntentPacket),         82);
     CHECK_EQ("sizeof(NpcCensusHeader)",         sizeof(NpcCensusHeader),         7); // v35: census
     CHECK_EQ("sizeof(ResearchPacket)",          sizeof(ResearchPacket),          57); // v37: research
     CHECK_EQ("sizeof(DeedPacket)",              sizeof(DeedPacket),              78); // v54: deeds
     CHECK_EQ("sizeof(FixturePacket)",           sizeof(FixturePacket),           90); // v55: fixture identity
     CHECK_EQ("sizeof(ModListPacket)",           sizeof(ModListPacket),           4014); // v56: mod list
+    CHECK_EQ("sizeof(FurniturePacket)",         sizeof(FurniturePacket),         60); // v58: bed/cage intent+state
     CHECK_EQ("sizeof(CamHintPacket)",           sizeof(CamHintPacket),           17); // v43: camera hint
     CHECK_EQ("sizeof(CellClaimPacket)",         sizeof(CellClaimPacket),         21); // v49: cell claim
     CHECK_EQ("sizeof(InvXferAckPacket)",        sizeof(InvXferAckPacket),        18); // v50: transfer verdict
+    CHECK_EQ("sizeof(BountyPacket)",            sizeof(BountyPacket),            86); // v62: bounty/crime row
     // A full entity batch must fit one ~1400 B datagram (NetLink chunking cap).
     CHECK("entity batch fits datagram",
           sizeof(EntityBatchHeader) + ENTITY_BATCH_MAX * sizeof(EntityState) <= 1428);
@@ -317,9 +337,64 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v57: v0.54 own characters + squad owners; refuses v0.53)",
-             (int)PROTOCOL_VERSION, 57);
-    CHECK_EQ("PKT_MODLIST id", (int)PKT_MODLIST, 49);
+    CHECK_EQ("PROTOCOL_VERSION (v65: TokelaCoop v0.54 (57) + KenshiDuo (64) merge)",
+             (int)PROTOCOL_VERSION, 65);
+    CHECK_EQ("PKT_MODLIST id (TokelaCoop 49, retagged to 56 in the merge)", (int)PKT_MODLIST, 56);
+    CHECK("PKT_MODLIST distinct from the KenshiDuo series",
+          PKT_MODLIST != PKT_NATIVE_TAKEN && PKT_MODLIST != PKT_BOUNTY &&
+          PKT_MODLIST != PKT_INV_SAVE_FENCE);
+
+    // Protocol 56: save-native pickup notice. The ownership filter (protocol 55)
+    // keeps owned town/shop items out of the stream, so their pickup needs its own
+    // mirror: a notice keyed by template + position (the shared save data).
+    CHECK_EQ("PKT_NATIVE_TAKEN id", (int)PKT_NATIVE_TAKEN, 49);
+    CHECK("PKT_NATIVE_TAKEN distinct",
+          PKT_NATIVE_TAKEN != PKT_WORLD_ITEM_CLAIM &&
+          PKT_NATIVE_TAKEN != PKT_WORLD_PICKUP &&
+          PKT_NATIVE_TAKEN != PKT_WORLD_ITEM_REMOVE &&
+          PKT_NATIVE_TAKEN != PKT_FIXTURE);
+    {
+        WorldNativeTakenPacket nt; std::memset(&nt, 0, sizeof(nt));
+        nt.type = (u8)PKT_NATIVE_TAKEN; nt.ownerId = 2u; nt.takeId = 9u;
+        nt.iType = 0; nt.iContainer = 2069; nt.iContainerSerial = 11111;
+        nt.iIndex = 469; nt.iSerial = 346801760u;
+        nt.x = -51174.32f; nt.y = 1594.71f; nt.z = 2718.17f;
+        CHECK("native-taken carries the 5-field hand",
+              nt.iContainer == 2069 && nt.iSerial == 346801760u && nt.takeId == 9u);
+        // The receiver's identity checksum rides along: sid + the sender's ground
+        // position (a hand alone can name a different object on the other client).
+        CHECK("native-taken carries the position checksum",
+              nt.x < -51174.0f && nt.y > 1594.0f && nt.z > 2718.0f);
+    }
+    // Protocol 57: production recipe intents. Tag 49 was already taken by
+    // PKT_NATIVE_TAKEN (protocol 56), so the intent rides tag 50.
+    CHECK("PKT_PROD_INTENT distinct", (int)PKT_PROD_INTENT == 50 &&
+          PKT_PROD_INTENT != PKT_PROD && PKT_PROD_INTENT != PKT_FIXTURE &&
+          PKT_PROD_INTENT != PKT_NATIVE_TAKEN);
+    // Protocol 58: door open/lock intents. The series tags shifted by one
+    // (49 was taken by PKT_NATIVE_TAKEN), so the door intent rides tag 51.
+    CHECK("PKT_DOOR_INTENT distinct",
+          (int)PKT_DOOR_INTENT == 51 && PKT_DOOR_INTENT != PKT_DOOR &&
+          PKT_DOOR_INTENT != PKT_BUILD_DOOR && PKT_DOOR_INTENT != PKT_FIXTURE &&
+          PKT_DOOR_INTENT != PKT_PROD_INTENT);
+    // Protocol 59: host-canonical bed/cage occupancy; same shift, tag 52.
+    CHECK_EQ("PKT_FURNITURE id", (int)PKT_FURNITURE, 52);
+    CHECK("PKT_FURNITURE distinct",
+          PKT_FURNITURE != PKT_DOOR_INTENT && PKT_FURNITURE != PKT_PROD_INTENT);
+    CHECK("furniture modes distinct", FURNITURE_INTENT != FURNITURE_STATE);
+    // Protocol 60: construction place/remove intents; same shift, tag 53.
+    CHECK("PKT_BUILD_INTENT distinct",
+          (int)PKT_BUILD_INTENT == 53 && PKT_BUILD_INTENT != PKT_BUILD_PLACE &&
+          PKT_BUILD_INTENT != PKT_BUILD_REMOVE && PKT_BUILD_INTENT != PKT_FIXTURE &&
+          PKT_BUILD_INTENT != PKT_FURNITURE);
+    CHECK("build intent operations distinct",
+          BUILD_INTENT_PLACE != BUILD_INTENT_REMOVE && BUILD_INTENT_PLACE != 0);
+    // Protocol 61: inventory save fence; same one-tag shift, tag 54.
+    CHECK_EQ("inventory save fence packet id",
+             (int)PKT_INV_SAVE_FENCE, 54);
+    CHECK("save fence distinct",
+          PKT_INV_SAVE_FENCE != PKT_BUILD_INTENT &&
+          PKT_INV_SAVE_FENCE != PKT_SAVE_REQ && PKT_INV_SAVE_FENCE != PKT_SAVE_BEGIN);
 
     // Protocol 52: the shared money pool. The two players spend from ONE wallet,
     // so the join reports CHANGES and the host the authoritative TOTAL - swap
@@ -432,6 +507,10 @@ static void testSizes() {
     // A claim batch is capped by the u8 count; even a full one must fit a datagram.
     CHECK("full world-item claim fits datagram",
           sizeof(WorldItemClaimHeader) + 255 * sizeof(u32) <= 1400);
+    // Protocol 64: join assassination knockouts bypass hitByMeleeAttack, so the
+    // join reports them via a MedicalSystem::knockout detour as a flag + skill
+    // on the existing CombatHitPacket (no new tag).
+    CHECK_EQ("COMBAT_HIT_KNOCKOUT flag", (int)COMBAT_HIT_KNOCKOUT, 1);
 }
 
 // ---- 2. readPacket / packetType round-trips -----------------------------------
@@ -474,6 +553,7 @@ static void testRoundTrips() {
     roundTrip<EventPacket>("EventPacket", (u8)PKT_EVENT);
     roundTrip<WorldDropPacket>("WorldDropPacket", (u8)PKT_WORLD_DROP);
     roundTrip<WorldPickupPacket>("WorldPickupPacket", (u8)PKT_WORLD_PICKUP);
+    roundTrip<WorldNativeTakenPacket>("WorldNativeTakenPacket", (u8)PKT_NATIVE_TAKEN);
     roundTrip<InvXferPacket>("InvXferPacket", (u8)PKT_INV_XFER);
     roundTrip<MedicalPacket>("MedicalPacket", (u8)PKT_MEDICAL);
     roundTrip<TreatmentPacket>("TreatmentPacket", (u8)PKT_TREATMENT);
@@ -486,10 +566,12 @@ static void testRoundTrips() {
     roundTrip<FactionPacket>("FactionPacket", (u8)PKT_FACTION);
     roundTrip<TimePacket>("TimePacket", (u8)PKT_TIME);
     roundTrip<DoorPacket>("DoorPacket", (u8)PKT_DOOR);
+    roundTrip<DoorIntentPacket>("DoorIntentPacket", (u8)PKT_DOOR_INTENT);
     roundTrip<BuildPlacePacket>("BuildPlacePacket", (u8)PKT_BUILD_PLACE);
     roundTrip<BuildStatePacket>("BuildStatePacket", (u8)PKT_BUILD_STATE);
     roundTrip<BuildDoorPacket>("BuildDoorPacket", (u8)PKT_BUILD_DOOR);
     roundTrip<BuildRemovePacket>("BuildRemovePacket", (u8)PKT_BUILD_REMOVE);
+    roundTrip<BuildIntentPacket>("BuildIntentPacket", (u8)PKT_BUILD_INTENT);
     roundTrip<StealthPacket>("StealthPacket", (u8)PKT_STEALTH);
     roundTrip<SpawnReqPacket>("SpawnReqPacket", (u8)PKT_SPAWN_REQ);
     roundTrip<SpawnInfoPacket>("SpawnInfoPacket", (u8)PKT_SPAWN_INFO);
@@ -500,12 +582,40 @@ static void testRoundTrips() {
     roundTrip<LoadReqPacket>("LoadReqPacket", (u8)PKT_LOAD_REQ);
     roundTrip<LoadNackPacket>("LoadNackPacket", (u8)PKT_LOAD_NACK);
     roundTrip<ProdPacket>("ProdPacket", (u8)PKT_PROD);
+    roundTrip<ProdIntentPacket>("ProdIntentPacket", (u8)PKT_PROD_INTENT);
     roundTrip<ResearchPacket>("ResearchPacket", (u8)PKT_RESEARCH);
     roundTrip<DeedPacket>("DeedPacket", (u8)PKT_DEED);
     roundTrip<FixturePacket>("FixturePacket", (u8)PKT_FIXTURE);
     roundTrip<ModListPacket>("ModListPacket", (u8)PKT_MODLIST);
+    roundTrip<FurniturePacket>("FurniturePacket", (u8)PKT_FURNITURE);
+    roundTrip<InvSaveFencePacket>("InvSaveFencePacket", (u8)PKT_INV_SAVE_FENCE);
     roundTrip<CellClaimPacket>("CellClaimPacket", (u8)PKT_CELL_CLAIM);
     roundTrip<InvXferAckPacket>("InvXferAckPacket", (u8)PKT_INV_XFER_ACK);
+
+    // Protocol 63: the new name/age fields must survive the wire byte-exact -
+    // the receiver applies SpawnInfoPacket.name to the minted proxy and
+    // StatsPacket.age to the subject, so a truncated/garbled field is exactly
+    // the regression this locks.
+    {
+        SpawnInfoPacket si; std::memset(&si, 0, sizeof(si));
+        si.type = (u8)PKT_SPAWN_INFO;
+        std::strncpy(si.name, "Beep the Brave", sizeof(si.name) - 1);
+        si.age = 3.5f;
+        unsigned char sbuf[sizeof(SpawnInfoPacket)];
+        std::memcpy(sbuf, &si, sizeof(si));
+        SpawnInfoPacket so; std::memset(&so, 0, sizeof(so));
+        CHECK("SpawnInfoPacket name+age round-trip",
+              readPacket(sbuf, (unsigned)sizeof(sbuf), &so) &&
+              std::strcmp(so.name, "Beep the Brave") == 0 && so.age == 3.5f);
+        StatsPacket sa; std::memset(&sa, 0, sizeof(sa));
+        sa.type = (u8)PKT_STATS;
+        sa.age = 12.25f;
+        unsigned char abuf[sizeof(StatsPacket)];
+        std::memcpy(abuf, &sa, sizeof(sa));
+        StatsPacket ao; std::memset(&ao, 0, sizeof(ao));
+        CHECK("StatsPacket age round-trip",
+              readPacket(abuf, (unsigned)sizeof(abuf), &ao) && ao.age == 12.25f);
+    }
 
     CHECK("packetType(null) == 0", packetType(0, 10) == 0);
     unsigned char b0[1] = { 0 };
@@ -961,6 +1071,16 @@ static EntityState entAt(float x) {
     return e;
 }
 
+// Same base body, but with an explicit locomotion state (the fields the
+// foot-slide fix time-aligns): moving flag, speed, and world-space motion.
+static EntityState entLoco(float x, unsigned char moving, float speed) {
+    EntityState e = entAt(x);
+    e.cMoving = moving;
+    e.cSpeed  = speed;
+    e.cMotionX = speed; e.cMotionY = 0.0f; e.cMotionZ = 0.0f;
+    return e;
+}
+
 static void testInterp() {
     std::printf("== interpolation buffer (Interp.cpp) ==\n");
     InterpConfig cfg; // min 50 / max 200 delay, extrap 250, snap 50u, stale 2000
@@ -1057,6 +1177,39 @@ static void testInterp() {
         EntityState out;
         bool ok = it.sample(1030, cfg, &out);
         CHECK("identity+state passthrough", ok && out.bodyState == BODY_DOWN && out.cMoving == 1 && out.task == 42 && out.hIndex == 1);
+    }
+
+    // Time-aligned locomotion (foot-slide fix, commit 0191d73): the moving FLAG
+    // and speed sample() returns must match the RENDER-DELAY position, not the
+    // newest snapshot. Feed a body walking x=0->3 over 1000..1150ms that is
+    // STOPPED at the newest snapshot. With a one-interval (50ms) render delay the
+    // buffer is still gliding through the last MOVING segment while the newest
+    // snapshot already reads idle - the exact on-stop foot-slide case. Loco must
+    // come from the segment START (still moving), not the newest (already idle).
+    // These CHECKs go RED if commit 0191d73 is reverted (loco falls back to the
+    // newest snapshot): mid.cMoving reads 0 and mid.cSpeed reads 0.
+    {
+        EntityInterp it;
+        it.push(entLoco(0.0f, 1, 10.0f), 1000); // moving
+        it.push(entLoco(1.0f, 1, 10.0f), 1050); // moving
+        it.push(entLoco(2.0f, 1, 10.0f), 1100); // moving: START of the stopping segment
+        it.push(entLoco(3.0f, 0,  0.0f), 1150); // STOPPED (newest): flag idle, speed 0
+
+        // nowMs=1175 -> renderTime=1125: mid of the [1100,1150] segment. Position
+        // still gliding (x~2.5); read s0 (moving,10) lerped toward s1 (idle,0).
+        EntityState mid;
+        bool okMid = it.sample(1175, cfg, &mid);
+        CHECK("stopping LERP still reads moving", okMid && mid.cMoving == 1);
+        CHECK("stopping LERP speed interpolated (not the stopped newest)",
+              okMid && mid.cSpeed > 4.9f && mid.cSpeed < 5.1f);
+        CHECK("stopping LERP position still gliding", okMid && mid.x > 2.4f && mid.x < 2.6f);
+
+        // nowMs=1225 -> renderTime=1175 >= newest.t: render has crossed onto the
+        // already-stopped newest, so the flag now correctly reads idle.
+        EntityState done;
+        bool okDone = it.sample(1225, cfg, &done);
+        CHECK("crossed onto stopped newest reads idle", okDone && done.cMoving == 0);
+        CHECK("crossed onto stopped newest speed zero", okDone && done.cSpeed < 0.1f);
     }
 }
 
@@ -1752,20 +1905,25 @@ static void testFlushWorldStateContract() {
     FactionPacket   fa;  std::memset(&fa,  0, sizeof(fa));
     TimePacket      ti;  std::memset(&ti,  0, sizeof(ti));
     DoorPacket      dp;  std::memset(&dp,  0, sizeof(dp));
+    DoorIntentPacket di; std::memset(&di,  0, sizeof(di));
     ProdPacket      pr;  std::memset(&pr,  0, sizeof(pr));
+    ProdIntentPacket pri; std::memset(&pri, 0, sizeof(pri));
     ResearchPacket  rp;  std::memset(&rp,  0, sizeof(rp));
     DeedPacket      de;  std::memset(&de,  0, sizeof(de));
     FixturePacket   fx;  std::memset(&fx,  0, sizeof(fx));
+    FurniturePacket fn;  std::memset(&fn,  0, sizeof(fn));
     BuildPlacePacket  bp; std::memset(&bp,  0, sizeof(bp));
     BuildStatePacket  bs; std::memset(&bs,  0, sizeof(bs));
     BuildDoorPacket   bd; std::memset(&bd,  0, sizeof(bd));
     BuildRemovePacket br; std::memset(&br,  0, sizeof(br));
+    BuildIntentPacket bi; std::memset(&bi,  0, sizeof(bi));
     StealthPacket   sl;  std::memset(&sl,  0, sizeof(sl));
     SpawnReqPacket  sq;  std::memset(&sq,  0, sizeof(sq));
     SpawnInfoPacket si;  std::memset(&si,  0, sizeof(si));
     CamHintPacket   ch;  std::memset(&ch,  0, sizeof(ch));
     CellClaimPacket cc;  std::memset(&cc,  0, sizeof(cc));
     InvXferAckPacket xa; std::memset(&xa,  0, sizeof(xa));
+    InvSaveFencePacket isf; std::memset(&isf, 0, sizeof(isf));
     // Session-preserving payloads.
     SaveReqPacket   srq; std::memset(&srq, 0, sizeof(srq));
     SaveBeginPacket sbg; std::memset(&sbg, 0, sizeof(sbg));
@@ -1777,7 +1935,7 @@ static void testFlushWorldStateContract() {
     LoadNackPacket  lnk; std::memset(&lnk, 0, sizeof(lnk));
     ModListPacket   mlp; std::memset(&mlp, 0, sizeof(mlp));
 
-    // --- Push one sentinel into every WORLD-STATE queue (34).
+    // --- Push one sentinel into every WORLD-STATE queue (35).
     in.pushEntity(1, 0, e);
     in.pushEvent(1, ev);
     in.pushInv(1, 0, cKey, 0, 0);
@@ -1798,20 +1956,25 @@ static void testFlushWorldStateContract() {
     in.pushFaction(1, fa);
     in.pushTime(1, ti);
     in.pushDoor(1, dp);
+    in.pushDoorIntent(1, di);
     in.pushProd(1, pr);
+    in.pushProdIntent(1, pri);
     in.pushResearch(1, rp);
     in.pushDeed(1, de);
     in.pushFixture(1, fx);
+    in.pushFurniture(1, fn);
     in.pushBuildPlace(1, bp);
     in.pushBuildState(1, bs);
     in.pushBuildDoor(1, bd);
     in.pushBuildRemove(1, br);
+    in.pushBuildIntent(1, bi);
     in.pushStealth(1, sl);
     in.pushSpawnReq(1, sq);
     in.pushSpawnInfo(1, si);
     in.pushCamHint(1, ch);
     in.pushCellClaim(1, cc);
     in.pushInvXferAck(1, xa);
+    in.pushInvSaveFence(1, isf);
 
     // --- Push one sentinel into every SESSION-PRESERVING queue (11).
     in.pushConnect(0);
@@ -1852,20 +2015,25 @@ static void testFlushWorldStateContract() {
     WS_EMPTY("faction",     InboundFaction,     drainFaction);
     WS_EMPTY("time",        InboundTime,        drainTime);
     WS_EMPTY("door",        InboundDoor,        drainDoor);
+    WS_EMPTY("doorIntent",  InboundDoorIntent,  drainDoorIntents);
     WS_EMPTY("prod",        InboundProd,        drainProd);
+    WS_EMPTY("prodIntent",  InboundProdIntent,  drainProdIntents);
     WS_EMPTY("research",    InboundResearch,    drainResearch);
     WS_EMPTY("deed",        InboundDeed,        drainDeed);
     WS_EMPTY("fixture",     InboundFixture,     drainFixture);
+    WS_EMPTY("furniture",   InboundFurniture,   drainFurniture);
     WS_EMPTY("buildPlace",  InboundBuildPlace,  drainBuildPlace);
     WS_EMPTY("buildState",  InboundBuildState,  drainBuildState);
     WS_EMPTY("buildDoor",   InboundBuildDoor,   drainBuildDoor);
     WS_EMPTY("buildRemove", InboundBuildRemove, drainBuildRemove);
+    WS_EMPTY("buildIntent", InboundBuildIntent, drainBuildIntents);
     WS_EMPTY("stealth",     InboundStealth,     drainStealth);
     WS_EMPTY("spawnReq",    InboundSpawnReq,    drainSpawnReqs);
     WS_EMPTY("spawnInfo",   InboundSpawnInfo,   drainSpawnInfos);
     WS_EMPTY("camHint",     InboundCamHint,     drainCamHints);
     WS_EMPTY("cellClaim",   InboundCellClaim,   drainCellClaims);
     WS_EMPTY("invXferAck",  InboundInvXferAck,  drainInvXferAcks);
+    WS_EMPTY("invSaveFence", InboundInvSaveFence, drainInvSaveFences);
     #undef WS_EMPTY
 
     // --- Every SESSION-PRESERVING queue must still hold its sentinel.
@@ -2191,6 +2359,550 @@ static void testChangeGate() {
     CHECK("door change no throttle",
           gateShouldSend(true, 80001, 80000, 0, 10000, false));
 }
+// ---- Reusable Host-canonical intent contract: one definition below ---------
+static void testBuildOwnershipPolicy() {
+    std::printf("== placed-building ownership policy ==\n");
+
+    CHECK("successful peer mint needs an ownership claim",
+          peerBuildNeedsOwnership(/*minted*/1, /*removed*/false,
+                                  /*ownershipApplied*/false));
+    CHECK("refused mint cannot be claimed",
+          !peerBuildNeedsOwnership(/*minted*/0, /*removed*/false,
+                                   /*ownershipApplied*/false));
+    CHECK("removed proxy is never reclaimed",
+          !peerBuildNeedsOwnership(/*minted*/1, /*removed*/true,
+                                   /*ownershipApplied*/false));
+    CHECK("confirmed ownership latches",
+          !peerBuildNeedsOwnership(/*minted*/1, /*removed*/false,
+                                   /*ownershipApplied*/true));
+
+    CHECK("save-resident building may publish a raw deed hand",
+          deedMayPublishRawHand(/*sessionPlaced*/false));
+    CHECK("session placement must use its translated build key",
+          !deedMayPublishRawHand(/*sessionPlaced*/true));
+}
+
+// ---- 15. Reusable host-intent contract (protocol 57+) --------------------------
+static void testHostIntentPolicy() {
+    std::printf("== host-canonical intent policy ==\n");
+    CHECK("intent sequence starts at one", hostIntentIsNew(0u, 1u));
+    CHECK("intent duplicate is idempotent", !hostIntentIsNew(7u, 7u));
+    CHECK("intent older row is stale", !hostIntentIsNew(7u, 6u));
+    CHECK("intent newer row accepted", hostIntentIsNew(7u, 8u));
+    CHECK("intent zero is reserved", !hostIntentIsNew(0u, 0u));
+
+    CHECK("ack settles matching owner+seq",
+          hostIntentAckCovers(22u, 5u, 22u, 5u));
+    CHECK("later ack covers pending",
+          hostIntentAckCovers(22u, 5u, 22u, 6u));
+    CHECK("other owner's ack cannot settle",
+          !hostIntentAckCovers(22u, 5u, 23u, 99u));
+    CHECK("older ack cannot settle",
+          !hostIntentAckCovers(22u, 5u, 22u, 4u));
+    CHECK("no pending intent cannot settle",
+          !hostIntentAckCovers(22u, 0u, 22u, 9u));
+
+    CHECK("intent first send due", hostIntentRetryDue(1000ul, 0ul, 2000ul));
+    CHECK("intent retry held before deadline",
+          !hostIntentRetryDue(2999ul, 1000ul, 2000ul));
+    CHECK("intent retry due at deadline",
+          hostIntentRetryDue(3000ul, 1000ul, 2000ul));
+}
+
+// ---- 12. Per-sender stale-row guard (StaleGuard.h staleRowAccept) ----------------
+// Guards the symmetric-channel fix (2026-07-19): the faction (24), door (26)
+// and placed-building-door (28) channels are published by BOTH clients, each
+// stamping its own independent seq counter on rows for the SAME key. The old
+// guard kept ONE shared high-water mark per row, so once the faster sender
+// pushed seq=N, every packet from the other sender with seq <= N was dropped
+// as "stale" - one player silently stopped seeing the other's changes on that
+// row. staleRowAccept keys the mark by the packet's ownerId; this locks that
+// contract (and the unchanged single-sender discipline around it).
+static void testStaleGuard() {
+    std::printf("== per-sender stale-row guard (StaleGuard.h) ==\n");
+    const unsigned int A = 1, B = 2; // two peers publishing the SAME row
+
+    // Single-sender semantics unchanged: first row lands, duplicates (safety
+    // resends) and reordered stragglers drop, newer seqs land, loss-gaps jump.
+    {
+        std::map<unsigned int, unsigned int> row;
+        CHECK("first row from a sender applies",      staleRowAccept(row, A, 1));
+        CHECK("duplicate seq drops (safety resend)", !staleRowAccept(row, A, 1));
+        CHECK("newer seq applies",                    staleRowAccept(row, A, 2));
+        CHECK("reordered straggler drops",           !staleRowAccept(row, A, 1));
+        CHECK("gap jump applies (loss tolerated)",    staleRowAccept(row, A, 9));
+        CHECK("straggler behind the gap drops",      !staleRowAccept(row, A, 5));
+    }
+
+    // THE FIX: two senders write the SAME row with independent counters. A's
+    // counter is far ahead (seq 500); B's fresh seq=1 must still land. The
+    // pre-fix shared mark rejected exactly this packet (1 <= 500 -> "stale").
+    {
+        std::map<unsigned int, unsigned int> row;
+        CHECK("fast sender A seq=500 applies",  staleRowAccept(row, A, 500));
+        CHECK("slow sender B seq=1 still applies (the fix)",
+              staleRowAccept(row, B, 1));
+        // Per-sender discipline holds independently on both counters.
+        CHECK("B duplicate seq=1 drops",       !staleRowAccept(row, B, 1));
+        CHECK("B seq=2 applies",                staleRowAccept(row, B, 2));
+        CHECK("A straggler seq=499 drops",     !staleRowAccept(row, A, 499));
+        CHECK("A seq=501 applies",              staleRowAccept(row, A, 501));
+    }
+
+    // Regression documentation (the RED half): the pre-fix shared-counter
+    // guard, replayed on the same trace, drops B's fresh packet - proof this
+    // scenario detects the bug the per-sender map removes.
+    {
+        unsigned int sharedSeen = 0;   // pre-fix FacRow::seqSeen (one u32)
+        sharedSeen = 500;              // A's seq=500 row applied
+        bool bDropped = (sharedSeen != 0 && 1u <= sharedSeen); // B's seq=1 arrives
+        CHECK("shared counter would drop B's row (the bug)", bDropped);
+    }
+
+    // MP-P-15: the deed (protocol 54) and fixture (55) channels are symmetric
+    // too (hostAuth=false: both roles publish the same row with independent
+    // counters) but kept the pre-fix scalar guard until 2026-09-24. Replay the
+    // exact starvation trace on their row shape: the host has resent a fixture
+    // row up to seq=37 (15 s safety resends), the join's FIRST publish of the
+    // same row is seq=1 and must still land.
+    {
+        std::map<unsigned int, unsigned int> row;
+        CHECK("deed/fixture: fast host seq=37 applies",
+              staleRowAccept(row, A, 37));
+        CHECK("deed/fixture: slow join seq=1 still applies (MP-P-15)",
+              staleRowAccept(row, B, 1));
+        unsigned int sharedSeen = 0;  // pre-fix DeedRow/FixtureRow::seqSeen (one u32)
+        sharedSeen = 37;              // host's seq=37 row applied
+        bool joinDropped = (sharedSeen != 0 && 1u <= sharedSeen);
+        CHECK("deed/fixture: scalar guard would drop the join's row (the bug)",
+              joinDropped);
+    }
+
+    // Interleaving: both sides toggling the same door alternately - every
+    // fresh packet from either side lands, every safety resend drops, and
+    // neither counter ever disturbs the other's progress.
+    {
+        std::map<unsigned int, unsigned int> row;
+        bool ok = true;
+        for (unsigned int s = 1; s <= 10; ++s) {
+            ok = ok &&  staleRowAccept(row, A, s);  // A's fresh row
+            ok = ok &&  staleRowAccept(row, B, s);  // B's fresh row, same key
+            ok = ok && !staleRowAccept(row, A, s);  // A's safety resend
+            ok = ok && !staleRowAccept(row, B, s);  // B's safety resend
+        }
+        CHECK("alternating same-row writes all land, resends all drop", ok);
+    }
+
+    // The guard state is per ROW: a second row's counters start clean, so a
+    // sender's high counter on one door never stales its rows on another.
+    {
+        std::map<unsigned int, unsigned int> door1, door2;
+        CHECK("row1 A seq=3 applies",                    staleRowAccept(door1, A, 3));
+        CHECK("row2 A seq=1 applies (rows independent)", staleRowAccept(door2, A, 1));
+    }
+}
+
+static void testResearchUnion() {
+    std::printf("== research symmetric grow-only union (ResearchUnion.h) ==\n");
+
+    // Channel direction contract: the union is SYMMETRIC, not host-
+    // authoritative - both sides publish their known set AND apply the
+    // peer's, so a research completed by the JOIN reaches the host.
+    CHECK("research channel is symmetric (hostAuth=false)",
+          !researchChannelHostAuth());
+
+    // First sight of a sid applies and advances the scalar guard.
+    unsigned int seqSeen = 0;
+    CHECK("first row applies",
+          researchRowDecision(seqSeen, 7, false) == RESEARCH_ROW_APPLY);
+    CHECK("guard advanced on first row", seqSeen == 7);
+
+    // Idempotence: applying the SAME row twice breaks nothing - the dup drops.
+    CHECK("same row again drops (idempotent)",
+          researchRowDecision(seqSeen, 7, false) == RESEARCH_ROW_DROP_STALE);
+    CHECK("guard untouched by dup", seqSeen == 7);
+    CHECK("reordered straggler drops",
+          researchRowDecision(seqSeen, 3, false) == RESEARCH_ROW_DROP_STALE);
+
+    // A research that LANDED persists: a fresh resend advances the guard but
+    // never re-runs startResearch.
+    CHECK("landed resend skips re-apply",
+          researchRowDecision(seqSeen, 8, true) == RESEARCH_ROW_SKIP_LANDED);
+    CHECK("guard advanced by landed resend", seqSeen == 8);
+    CHECK("second landed resend still skips",
+          researchRowDecision(seqSeen, 9, true) == RESEARCH_ROW_SKIP_LANDED);
+
+    // A newer row for a sid whose lever has NOT landed yet still applies
+    // (the late-prerequisite retry path).
+    CHECK("not-landed newer row applies",
+          researchRowDecision(seqSeen, 10, false) == RESEARCH_ROW_APPLY);
+}
+
+static void testProdTemplateMatch() {
+    std::printf("== prod template matching es_ES/stringID (ProdTemplateMatch.h) ==\n");
+
+    // Every machine kind exposes a non-empty preference list; kind 1 (and any
+    // unknown kind) falls through to the crafting-bench list.
+    for (int kind = 0; kind < 4; ++kind) {
+        unsigned int n = 0;
+        const char* const* prefs = prodtmpl::prefsForKind(kind, &n);
+        CHECK("kind exposes prefs", prefs != 0 && n > 0);
+    }
+    unsigned int nCraft = 0;
+    const char* const* craft = prodtmpl::prefsForKind(1, &nCraft);
+    CHECK("kind 1 tops at armour crafting bench",
+          nCraft > 0 && std::strcmp(craft[0], "armour crafting bench") == 0);
+
+    // English display names still match (previous behaviour preserved).
+    CHECK("en name matches", prodtmpl::matches("Small Wind Generator", "",
+                                               "small wind generator"));
+
+    // es_ES display names match the Spanish terms (the "no template" fix).
+    CHECK("es name: generador",
+          prodtmpl::matches("Generador eolico pequeno", "", "generador"));
+    CHECK("es name: herreria",
+          prodtmpl::matches("Banco de herreria", "", "herreria"));
+    CHECK("es name: banco de",
+          prodtmpl::matches("Banco de herreria", "", "banco de"));
+    CHECK("es name: almacen",
+          prodtmpl::matches("Almacen general", "", "almacen"));
+    CHECK("es name: investigacion",
+          prodtmpl::matches("Mesa de investigacion", "", "investigaci"));
+
+    // stringID matches when the display name is in ANY other language (the
+    // internal FCS id is language-independent).
+    CHECK("stringID matches over unknown locale",
+          prodtmpl::matches("Windgenerator", "Small Wind Generator",
+                            "small wind generator"));
+
+    // Unrelated text never matches; null name/sid are tolerated.
+    CHECK("unrelated name+sid rejected",
+          !prodtmpl::matches("Rock", "rock", "generator"));
+    CHECK("null name tolerated",
+          prodtmpl::matches(0, "Research Bench", "research bench"));
+    CHECK("null sid tolerated",
+          prodtmpl::matches("Research Bench", 0, "research bench"));
+
+    // The other building finders share the same es_ES/stringID contract (the
+    // "[build] probe-place no template" class: build_sync/latejoin_sync/
+    // save_stage1 on an es_ES host). English terms keep their original order
+    // at the head of each list; Spanish terms follow.
+    unsigned int nFix = 0;
+    const char* const* fix = prodtmpl::fixturePrefs(&nFix);
+    CHECK("fixture list tops at training dummy",
+          nFix > 0 && std::strcmp(fix[0], "training dummy") == 0);
+    unsigned int nDoor = 0, nSeat = 0, nBed = 0, nCage = 0, nPole = 0, nMach = 0;
+    CHECK("all finder lists non-empty",
+          prodtmpl::doorPrefs(&nDoor) && nDoor > 0 &&
+          prodtmpl::seatPrefs(&nSeat) && nSeat > 0 &&
+          prodtmpl::bedPrefs(&nBed) && nBed > 0 &&
+          prodtmpl::cagePrefs(&nCage) && nCage > 0 &&
+          prodtmpl::polePrefs(&nPole) && nPole > 0 &&
+          prodtmpl::machinePrefs(&nMach) && nMach > 0);
+
+    // es_ES display names match the Spanish terms (the observed failure: the
+    // host's training dummy is "Maniquí de Entrenamiento MkI", sid numeric).
+    CHECK("es fixture: maniqu",
+          prodtmpl::matches("Maniqui de Entrenamiento MkI", "898-gamedata.base",
+                            "maniqu"));
+    CHECK("es fixture: entrenamiento",
+          prodtmpl::matches("Maniqui de Entrenamiento MkI", "", "entrenamiento"));
+    CHECK("es door: choza",
+          prodtmpl::matches("Choza pequena", "", "choza"));
+    CHECK("es bed: catre", prodtmpl::matches("Catre", "", "catre"));
+    CHECK("es cage: jaula",
+          prodtmpl::matches("Jaula de prisioneros", "", "jaula"));
+    CHECK("es pole: poste",
+          prodtmpl::matches("Poste de prisioneros", "", "poste"));
+    CHECK("es seat: taburete",
+          prodtmpl::matches("Taburete de bar", "", "taburete"));
+    CHECK("es machine: saco de boxeo",
+          prodtmpl::matches("Saco de boxeo", "", "saco de boxeo"));
+
+    // The dummy/bag task pick works in both languages and rejects machines.
+    CHECK("training fixture: es dummy",
+          prodtmpl::isTrainingFixture("Maniqui de Entrenamiento MkI", ""));
+    CHECK("training fixture: en bag",
+          prodtmpl::isTrainingFixture("Punching Bag", ""));
+    CHECK("training fixture: machine rejected",
+          !prodtmpl::isTrainingFixture("Banco de herreria", ""));
+}
+
+// ---- Captive kind-conflict anchor (JailAnchor.h) ----------------------------
+// Guards the spike-58 fix: a chained+caged prisoner streams CHAINED-only in
+// the lossy batch while a RELIABLE edge vouches the cage (protocol 59's
+// canonical FURNITURE_STATE row under intents). The step must (a) HOLD an
+// edge-vouched cage/bed (no CAGE-BREAK, no re-seat teleport), (b) still
+// RECHAIN a stale/unvouched local attach (the Flashbox case), and (c) stay
+// quiet when the stream is not chained or the copy already is.
+
+static void testJailAnchor() {
+    std::printf("== captive kind-conflict anchor (JailAnchor.h) ==\n");
+
+    // Not a chained stream: never this policy's business (kind 1/2 heals and
+    // the no-furniture drive handle those).
+    CHECK("cage stream -> NONE",    chainAnchorStep(2, 2, 2) == CHAIN_ANCHOR_NONE);
+    CHECK("bed stream -> NONE",     chainAnchorStep(1, 1, 1) == CHAIN_ANCHOR_NONE);
+    CHECK("no stream kind -> NONE", chainAnchorStep(0, 2, 2) == CHAIN_ANCHOR_NONE);
+
+    // Already chained locally: in sync, nothing to heal.
+    CHECK("chained+chained -> NONE",         chainAnchorStep(3, 3, 0) == CHAIN_ANCHOR_NONE);
+    CHECK("chained+chained vouched -> NONE", chainAnchorStep(3, 3, 3) == CHAIN_ANCHOR_NONE);
+
+    // The bug: CHAINED-only continuous bit against an edge-vouched cage/bed.
+    // The anchor wins - never break it over the disagreement.
+    CHECK("vouched cage vs chained -> HOLD", chainAnchorStep(3, 2, 2) == CHAIN_ANCHOR_HOLD);
+    CHECK("vouched bed vs chained -> HOLD",  chainAnchorStep(3, 1, 1) == CHAIN_ANCHOR_HOLD);
+
+    // An UNVOUCHED local cage is the Flashbox stale attach: break + re-chain
+    // (behaviour before the fix is preserved for this case).
+    CHECK("unvouched cage -> RECHAIN",       chainAnchorStep(3, 2, 0) == CHAIN_ANCHOR_RECHAIN);
+    CHECK("unvouched bed -> RECHAIN",        chainAnchorStep(3, 1, 0) == CHAIN_ANCHOR_RECHAIN);
+    // Vouch/local mismatch is no vouch at all (edge moved on, copy did not).
+    CHECK("bed vouch, cage local -> RECHAIN",   chainAnchorStep(3, 2, 1) == CHAIN_ANCHOR_RECHAIN);
+    CHECK("chain vouch, cage local -> RECHAIN", chainAnchorStep(3, 2, 3) == CHAIN_ANCHOR_RECHAIN);
+
+    // No local furniture at all: the plain re-chain heal (lost/late ENTER).
+    CHECK("no furniture -> RECHAIN",              chainAnchorStep(3, 0, 0) == CHAIN_ANCHOR_RECHAIN);
+    CHECK("no furniture, stale vouch -> RECHAIN", chainAnchorStep(3, 0, 2) == CHAIN_ANCHOR_RECHAIN);
+
+    // The canonical path (protocol 59 FURNITURE_STATE) is what stamps the
+    // vouch under intents: an applied STATE row vouches its kind, a release
+    // withdraws it.
+    CHECK("canonical STATE caged vouches 2",
+          furnEdgeVouchFromState(true, 2) == 2);
+    CHECK("canonical STATE bedded vouches 1",
+          furnEdgeVouchFromState(true, 1) == 1);
+    CHECK("canonical STATE release withdraws",
+          furnEdgeVouchFromState(false, 2) == 0);
+
+    // End to end at the decision level: host says chained+caged canonically
+    // (STATE vouch=2), the lossy batch says CHAINED-only (streamKind=3), the
+    // local copy sits in the cage (localKind=2) -> NO cage-break (HOLD).
+    int vouch = furnEdgeVouchFromState(true, 2);
+    CHECK("canonical chained+caged -> no CAGE-BREAK",
+          chainAnchorStep(3, 2, vouch) == CHAIN_ANCHOR_HOLD);
+    // Without the vouch the same tick is the old behaviour (RECHAIN path,
+    // which breaks the unvouched cage first).
+    CHECK("same tick unvouched -> CAGE-BREAK path",
+          chainAnchorStep(3, 2, 0) == CHAIN_ANCHOR_RECHAIN);
+}
+
+// ---- 12. Owner-side carried self-heal debounce (CarriedHeal.h) ------------------
+// Guards the SYNC_GAPS 16b fix: the owner of a carried body reconciles its LOCAL
+// isBeingCarried against the carrier's streamed TASK_CARRY_BODY claim. The step
+// must (a) stay quiet while a live stream claims the carry, (b) arm-then-fire only
+// after a full debounce window with NO claim (a one-batch stream blip must never
+// rip a genuine carry apart - the carryNoSeeTick lesson), and (c) re-arm after
+// firing so a release that failed to take retries a full window later.
+
+static void testCarriedHeal() {
+    std::printf("== owner-side carried heal debounce (CarriedHeal.h) ==\n");
+    const unsigned long DROP = 3000;
+    unsigned long tick = 0;
+
+    // Not carried: nothing to do, anchor stays disarmed.
+    tick = 0;
+    CHECK("not carried -> NONE",
+          carriedHealStep(false, false, 1000, DROP, &tick) == CARRIED_HEAL_NONE);
+    CHECK("not carried -> anchor disarmed", tick == 0);
+
+    // Carried + claimed by a live stream: believed, anchor stays disarmed.
+    tick = 0;
+    CHECK("carried+claimed -> NONE",
+          carriedHealStep(true, true, 1000, DROP, &tick) == CARRIED_HEAL_NONE);
+    CHECK("carried+claimed -> anchor disarmed", tick == 0);
+
+    // First unclaimed tick arms the window but must NOT act yet.
+    tick = 0;
+    CHECK("first unclaimed -> ARM",
+          carriedHealStep(true, false, 1000, DROP, &tick) == CARRIED_HEAL_ARM);
+    CHECK("ARM stamps the anchor", tick == 1000);
+
+    // Inside the window: still quiet (a stream blip shorter than the window).
+    CHECK("inside window -> NONE",
+          carriedHealStep(true, false, 1000 + DROP, DROP, &tick) == CARRIED_HEAL_NONE);
+    CHECK("window boundary is exclusive (== dropMs does not fire)", tick == 1000);
+
+    // A claim arriving mid-window disarms it - no release ever happens.
+    CHECK("claim mid-window -> NONE + disarm",
+          carriedHealStep(true, true, 2500, DROP, &tick) == CARRIED_HEAL_NONE &&
+          tick == 0);
+
+    // Full window with no claim: fire, and re-arm (anchor back to 0).
+    tick = 0;
+    carriedHealStep(true, false, 1000, DROP, &tick);           // arm at t=1000
+    CHECK("window elapsed -> FIRE",
+          carriedHealStep(true, false, 1000 + DROP + 1, DROP, &tick) ==
+          CARRIED_HEAL_FIRE);
+    CHECK("FIRE re-arms (anchor cleared)", tick == 0);
+
+    // Still stuck after a failed release: the NEXT pass arms again, then fires
+    // again a full window later (throttled retry, never a per-tick drop spam).
+    CHECK("post-FIRE re-arms on next pass",
+          carriedHealStep(true, false, 5000, DROP, &tick) == CARRIED_HEAL_ARM);
+    CHECK("post-FIRE retry fires a full window later",
+          carriedHealStep(true, false, 5000 + DROP + 1, DROP, &tick) ==
+          CARRIED_HEAL_FIRE);
+
+    // Body put down locally (drop finally applied): disarmed, back to quiet.
+    carriedHealStep(true, false, 12000, DROP, &tick);          // re-armed
+    CHECK("local drop applied -> NONE + disarm",
+          carriedHealStep(false, false, 12500, DROP, &tick) == CARRIED_HEAL_NONE &&
+          tick == 0);
+}
+
+// Walk-drive deceleration taper (on-stop overshoot/snap-back fix). The taper is
+// the load-bearing pure fraction the drive multiplies lead/catch-up/cap by as the
+// source decelerates; locking its clamp + monotonicity here proves the "converge
+// to the stop, don't overrun" contract without a game launch.
+static void testDriveTaper() {
+    std::printf("\n== walk-drive deceleration taper ==\n");
+    using coop::driveSpeedTaper;
+
+    const float REF = 6.0f; // CATCHUP_REF_SPEED
+
+    // Full strength at/above the reference cruise speed (clamped high).
+    CHECK("at cruise = 1",       driveSpeedTaper(6.0f, REF) == 1.0f);
+    CHECK("above cruise = 1",    driveSpeedTaper(50.0f, REF) == 1.0f);
+    // Zero at a full stop (the whole point: no lead/catch-up push past the mark).
+    CHECK("at stop = 0",         driveSpeedTaper(0.0f, REF) == 0.0f);
+    // Linear in between: half the reference speed -> half strength.
+    CHECK("half speed = 0.5",    driveSpeedTaper(3.0f, REF) == 0.5f);
+    // Negative velocity noise clamps to 0 (never a negative cap/lead).
+    CHECK("negative clamps to 0", driveSpeedTaper(-2.0f, REF) == 0.0f);
+    // Monotonic non-decreasing as speed rises (a faster source never tapers more).
+    CHECK("monotonic 1<2u",      driveSpeedTaper(1.0f, REF) < driveSpeedTaper(2.0f, REF));
+    CHECK("monotonic 2<5u",      driveSpeedTaper(2.0f, REF) < driveSpeedTaper(5.0f, REF));
+    // Defensive: a non-positive reference disables the taper (full strength) so a
+    // mis-tuned constant can never freeze the drive at 0.
+    CHECK("zero ref = full",     driveSpeedTaper(3.0f, 0.0f) == 1.0f);
+    CHECK("neg ref = full",      driveSpeedTaper(3.0f, -1.0f) == 1.0f);
+
+    // The cap formula the drive uses: base * (1 + 1.5*frac) spans 1x (stop) to
+    // 2.5x (cruise) - guard the endpoints so the "2.5x cruise -> 1x stop" intent
+    // can't silently drift if the taper shape ever changes.
+    CHECK("cap 1x at stop",   (1.0f + 1.5f * driveSpeedTaper(0.0f, REF)) == 1.0f);
+    CHECK("cap 2.5x cruise",  (1.0f + 1.5f * driveSpeedTaper(6.0f, REF)) == 2.5f);
+}
+
+// ---- 12. Ephemeral toast visibility clock (ToastTimer.h toastVisible) -----------
+// Guards the peer connect/disconnect on-screen TOAST (2026-07-21): armPeerToast
+// records GetTickCount at the connect/leave edge and coopPanelDrive keeps the
+// EngineUi toast label shown only while toastVisible() is true, then disarms so
+// the label self-hides - the "momentary transition notice" distinct from the
+// persistent status banner. This locks the pure timing: un-armed is never shown,
+// an armed toast shows through the window and hides exactly at TOAST_SHOW_MS, and
+// the unsigned subtraction tolerates a GetTickCount wrap mid-window.
+static void testToastTimer() {
+    std::printf("== ephemeral toast visibility clock (ToastTimer.h) ==\n");
+    using coop::engine::toastVisible;
+    const unsigned long dur = coop::engine::TOAST_SHOW_MS; // 4000
+
+    // Un-armed: never visible, whatever the clock says.
+    CHECK("unarmed never visible",        !toastVisible(false, 0,     999999, dur));
+    CHECK("unarmed never visible (armMs)",!toastVisible(false, 10000, 10000,  dur));
+
+    // Armed: visible from the arming instant, through the window, hidden AT the
+    // boundary (elapsed >= duration) and after.
+    CHECK("armed visible at t0",           toastVisible(true, 10000, 10000, dur));
+    CHECK("armed visible mid-window",      toastVisible(true, 10000, 12000, dur));
+    CHECK("armed visible at 3999 ms",      toastVisible(true, 10000, 13999, dur));
+    CHECK("armed hidden AT window (4000)", !toastVisible(true, 10000, 14000, dur));
+    CHECK("armed hidden past window",      !toastVisible(true, 10000, 20000, dur));
+
+    // GetTickCount wrap: armed 100 ms before the 2^32 rollover, the unsigned delta
+    // still measures true elapsed time across the boundary.
+    const unsigned long nearMax  = 0xFFFFFFFFul - 100; // armed 100 ms before wrap
+    const unsigned long preWrap  = nearMax + 50;       // 50 ms later, no overflow
+    const unsigned long postWrap = 1899UL;             // (nearMax + 2000) mod 2^32
+    const unsigned long postHide = 3999UL;             // (nearMax + 4100) mod 2^32
+    CHECK("wrap: 50 ms still visible",     toastVisible(true, nearMax, preWrap,  dur));
+    CHECK("wrap: 2000 ms still visible",   toastVisible(true, nearMax, postWrap, dur));
+    CHECK("wrap: 4100 ms hidden",         !toastVisible(true, nearMax, postHide, dur));
+
+    // Duration sanity: a few seconds - long enough to read, short enough to feel
+    // momentary and not be mistaken for the persistent banner.
+    CHECK("toast window sane (2-8 s)", dur >= 2000 && dur <= 8000);
+}
+
+// ---- 13. Bounty/crime authority + convergence (Wire.h pure decision logic) ------
+// Locks the protocol-62 H2 witness-local rules WITHOUT a live engine (the engine
+// read/write shims stay behind SEH in EngineCharState.cpp): the HOST is the sole
+// publisher (a join must NEVER push its own bounty state upstream), and the
+// receiver drops stale rows, skips converged rows, and picks the raise/clear
+// lever by the signed amount delta. These are the exact rules publishBounties /
+// applyBounties + applyBountyRow implement.
+static void testBounty() {
+    std::printf("== bounty/crime authority + convergence (Wire.h) ==\n");
+
+    // Value triples: a clean baseline vs a mid-session bounty.
+    BountyVal clean; clean.amount = 0;   clean.crimes = 0;      clean.claimed = 0;
+    BountyVal wanted; wanted.amount = 500; wanted.crimes = 0x20; wanted.claimed = 0;
+
+    // --- Publish gate: HOST authoritative (H2) ---
+    // Host, seeded, the row MOVED (0 -> 500): publish.
+    CHECK("host publishes a bounty that appeared",
+          bountyShouldSend(/*isHost*/1, /*seeded*/1, &clean, &wanted, /*resendDue*/0) == 1);
+    // Host, seeded, unchanged, no resend due: stay silent.
+    CHECK("host silent on an unchanged row",
+          bountyShouldSend(1, 1, &wanted, &wanted, 0) == 0);
+    // Host, seeded, unchanged, but a safety resend is due: publish.
+    CHECK("host resends an unchanged row when due",
+          bountyShouldSend(1, 1, &wanted, &wanted, 1) == 1);
+    // Host, NOT yet seeded (first sight of a shared-save bounty): silent seed.
+    CHECK("host seeds the shared-save baseline silently",
+          bountyShouldSend(1, 0, &clean, &wanted, 0) == 0);
+
+    // --- The discriminator: a JOIN never publishes (unidirectional host->clients) ---
+    // Even with a genuine local movement, a resend due, and a seeded row, a
+    // non-host caller must produce ZERO upstream traffic. This is the test that
+    // fails if the host-only authority is ever broken.
+    CHECK("join never publishes an appeared bounty",
+          bountyShouldSend(/*isHost*/0, 1, &clean, &wanted, 0) == 0);
+    CHECK("join never publishes even with a resend due",
+          bountyShouldSend(0, 1, &wanted, &wanted, 1) == 0);
+    // Join "revert" attempt: it received the host's 500, then its own engine
+    // reads its (forked, still-clean) copy as 0 and would try to stream that
+    // back. It must NOT - the host stays authoritative.
+    CHECK("join revert to local 0 is never sent upstream",
+          bountyShouldSend(0, 1, &wanted, &clean, 1) == 0);
+
+    // --- Receiver apply decision ---
+    int delta = -12345;
+    // Stale row: incoming seq <= the newest already applied -> drop, no write.
+    CHECK("apply drops a stale seq",
+          bountyApplyDecision(/*seqSeen*/7, /*incoming*/5, 500, 0, &delta) == BOUNTY_APPLY_SKIP_STALE);
+    // Fresh seq, local already at the target -> converged, no write (resend/echo).
+    CHECK("apply skips an already-converged row",
+          bountyApplyDecision(3, 9, 500, 500, &delta) == BOUNTY_APPLY_SKIP_CONVERGED);
+    // Fresh seq, raise 0 -> 500: additive lever, delta = +500.
+    delta = 0;
+    CHECK("apply raises with a positive delta",
+          bountyApplyDecision(3, 9, 500, 0, &delta) == BOUNTY_APPLY_ADD);
+    CHECK("apply raise delta is target-current", delta == 500);
+    // Fresh seq, raise 200 -> 500: delta = +300 (additive keeps engine derived state).
+    delta = 0;
+    CHECK("apply partial raise delta",
+          bountyApplyDecision(3, 9, 500, 200, &delta) == BOUNTY_APPLY_ADD);
+    CHECK("apply partial raise delta value", delta == 300);
+    // Fresh seq, target 0 with a live local bounty: clearBounty, not a delta.
+    delta = 999;
+    CHECK("apply clears when target is zero",
+          bountyApplyDecision(3, 9, 0, 500, &delta) == BOUNTY_APPLY_CLEAR);
+    // seqSeen == 0 (first ever row) must NOT be treated as stale.
+    CHECK("apply accepts the first row (seqSeen 0)",
+          bountyApplyDecision(0, 1, 500, 0, &delta) == BOUNTY_APPLY_ADD);
+
+    // --- Tag / identity ---
+    // Merged as protocol 62 with tag 55 (the PR's 42 was already PKT_COMBAT_HIT
+    // on main). The tag must be unique or a receiver dispatches on the wrong
+    // struct.
+    CHECK("PKT_BOUNTY tag is 55",             PKT_BOUNTY == 55);
+    CHECK("PKT_BOUNTY distinct", PKT_BOUNTY != PKT_CAM_HINT &&
+          PKT_BOUNTY != PKT_COMBAT_HIT && PKT_BOUNTY != PKT_INV_SAVE_FENCE &&
+          PKT_BOUNTY != PKT_RESEARCH && PKT_BOUNTY != PKT_DEED);
+}
 
 int main() {
     std::printf("prototest: TokelaCoop wire/hash/interp unit layer (protocol v%u)\n",
@@ -2200,6 +2912,8 @@ int main() {
     testEngineFaults();
     testEngineCaps();
     testChangeGate();
+    testHostIntentPolicy();
+    testDriveTaper();
     testRoundTrips();
     testFraming();
     testSaveCrc();
@@ -2223,6 +2937,15 @@ int main() {
     testInboundLifecycle();
     testFlushWorldStateContract();
     testTeardownOrdering();
+    testBuildOwnershipPolicy();
+    testSaveXfer();
+    testStaleGuard();
+    testResearchUnion();
+    testProdTemplateMatch();
+    testJailAnchor();
+    testCarriedHeal();
+    testToastTimer();
+    testBounty();
     std::printf("\nprototest: %d/%d checks passed%s\n",
                 g_total - g_failed, g_total, g_failed ? " - FAIL" : " - PASS");
     return g_failed;

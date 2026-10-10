@@ -43,7 +43,7 @@ Replicator::Replicator()
       gateSamples_(0), gateAgree_(0), gateLogTick_(0),
       probeRecruit_(false), probedCount_(0),
       aiSuspend_(false), aiLogTick_(0), nextEventId_(1),
-      nextWorldNetId_(1), worldSeeded_(false),
+      nextWorldNetId_(1), worldSeeded_(false), nextNativeTakeId_(0),
       nextDropId_(1), nextPickupId_(1), nextXferId_(1),
       xferScanMs_(0), nextTreatId_(1),
       quietRelapse_(0), crawlPhysRestore_(0),
@@ -67,6 +67,7 @@ Replicator::Replicator()
       attnFlips_(0), attnWinMs_(0), attnBaseSupp_(0), attnBaseCull_(0),
       attnBaseProxy_(0), attnVetoMs_(0), attnVetoRawN_(0), attnVetoMask_(0),
       auditRows_(false), jailProbe_(false), jailObserve_(false),
+      furnitureIntentSeqOut_(1), furnitureStateSeqOut_(1), hostRole_(false),
       speedLastApplied_(-1.0f), speedMyReq_(-1.0f), speedPeerReq_(-1.0f),
       speedCombatCap_(true),
       speedMyCombat_(false), speedPeerCombat_(false), speedLastSet_(-1.0f),
@@ -83,14 +84,16 @@ Replicator::Replicator()
       claimSendMs_(0), claimAssertMs_(0), claimMapMs_(0),
       facSeqOut_(1), facSampleMs_(0), factionSync_(true),
       doorSeqOut_(1), doorSampleMs_(0), doorSync_(true),
-      buildSeqOut_(1), buildSampleMs_(0), buildSync_(true),
+      buildSeqOut_(1), buildIntentSeqOut_(1), buildSampleMs_(0), buildSync_(true),
       bdoorSeqOut_(1), bdoorSampleMs_(0), bdoorSync_(true),
       hungerSync_(true),
-      prodSeqOut_(1), prodSampleMs_(0), prodSync_(true),
+      prodSeqOut_(1), prodSampleMs_(0), prodIntentSeqOut_(1),
+      prodIntentSampleMs_(0), prodSync_(true),
       researchSeqOut_(1), researchSampleMs_(0), researchSync_(true),
       deedSeqOut_(1), deedSampleMs_(0), deedAuditMs_(0), deedSync_(true),
       fixtureSeqOut_(1), fixtureSampleMs_(0), fixtureSync_(true),
-      storeSync_(false), contCensusMs_(0),
+      bountySeqOut_(1), bountySampleMs_(0), bountySync_(true), bountyBaseline_(false),
+      invSaveFencePending_(0), storeSync_(false), contCensusMs_(0),
       timeSync_(true), timeBrake_(true),
       timeSlew_(1.0f), timeSeqOut_(1), timeSeqSeen_(0),
       timeLastSendMs_(0), timeLastLogMs_(0), timeSlewApplied_(-1.0f),
@@ -238,12 +241,18 @@ void Replicator::resetSession() {
     attnVetoMs_ = 0;
     attnVetoRawN_ = 0;
     attnVetoMask_ = 0;
-    furnPeerPend_.clear();
-    ownFurnExit_.clear();
+    furnitureRows_.clear();
+    furnitureHostPend_.clear();
+    furnitureIntentSeqOut_ = 1;
+    furnitureStateSeqOut_ = 1;
+    ownCarriedNoSee_.clear(); // 16b owner-side carry heal: old world's anchors
     // Session maps + change-gate baselines (they describe the OLD world; the
     // reloaded save re-seeds them on first sample).
     ownBuilds_.clear();
     peerBuilds_.clear();
+    buildRemovePending_.clear();
+    buildPlaceIntentSeen_.clear();
+    buildRemoveIntentSeen_.clear();
     mintByLocal_.clear();
     bdoorRows_.clear();
     doorRows_.clear();
@@ -253,12 +262,19 @@ void Replicator::resetSession() {
     facRows_.clear();
     invPub_.clear();
     invRecv_.clear();
+    invSaveFencePending_ = 0;
     ownedContainers_.clear();
     censusContainers_.clear(); // protocol 34: re-censused in the new world
     censusEver_.clear();
     worldTrack_.clear();
     worldProxies_.clear();
-    worldSeeded_ = false; // re-baseline the reloaded world's save-native items
+    worldSeeded_ = false; // re-census the reloaded world's save-native items
+    pendingDrops_.clear(); // unresolved drop edges belong to the old world
+    // Protocol 56: the reloaded world re-mints its natives; stale watches and
+    // received-take dedupe belong to the old world. (nextNativeTakeId_ keeps
+    // counting so a late reliable resend from before the swap can't collide.)
+    nativeWatch_.clear();
+    appliedNativeTakes_.clear();
     weaponCensus_.clear();
     appliedDrops_.clear();
     appliedPickups_.clear();
@@ -332,6 +348,7 @@ void Replicator::resetSession() {
     // Sample-cadence clocks restart.
     facSampleMs_ = doorSampleMs_ = buildSampleMs_ = bdoorSampleMs_ = 0;
     prodSampleMs_ = 0;
+    prodIntentSampleMs_ = 0;
     researchSampleMs_ = 0;
     deedSampleMs_ = 0;
     deedAuditMs_ = 0;

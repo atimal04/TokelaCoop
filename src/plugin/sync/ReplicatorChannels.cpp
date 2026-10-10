@@ -11,6 +11,10 @@
 // PowerShell oracles (see resources/CODE_MAP.md, log-tag index).
 
 #include "ReplicatorUtil.h"
+#include "../core/BuildOwnership.h"
+#include "../../netproto/HostIntent.h"
+#include "../core/StaleGuard.h"
+#include "../core/ResearchUnion.h" // protocol 38 symmetric grow-only union
 
 namespace coop {
 
@@ -389,7 +393,7 @@ void Replicator::publishCombatHits(GameWorld* gw, NetLink& net, u32 ownerId) {
          it != pendingHits_.end(); ++it) {
         const Key&       k  = it->first;
         const PendingHit& ph = it->second;
-        if (ph.flesh <= 0.0f && ph.blood <= 0.0f) continue;
+        if (ph.flesh <= 0.0f && ph.blood <= 0.0f && !ph.knockout) continue;
         CombatHitPacket chp;
         memset(&chp, 0, sizeof(chp));
         chp.type    = (u8)PKT_COMBAT_HIT;
@@ -398,10 +402,13 @@ void Replicator::publishCombatHits(GameWorld* gw, NetLink& net, u32 ownerId) {
         chp.sType = k.t; chp.sContainer = k.c; chp.sContainerSerial = k.cs;
         chp.sIndex = k.i; chp.sSerial = k.s;
         chp.flesh = ph.flesh; chp.blood = ph.blood;
+        chp.flags = ph.knockout ? COMBAT_HIT_KNOCKOUT : 0;
+        chp.koSkill = ph.knockoutSkill;
         net.queueCombatHit(chp);
         char b[160]; _snprintf(b, sizeof(b) - 1,
-            "[combat] HIT SEND id=%u hand=%u,%u flesh=%.1f blood=%.1f",
-            chp.hitId, k.i, k.s, ph.flesh, ph.blood);
+            "[combat] HIT SEND id=%u hand=%u,%u flesh=%.1f blood=%.1f ko=%u skill=%.2f",
+            chp.hitId, k.i, k.s, ph.flesh, ph.blood, ph.knockout ? 1u : 0u,
+            ph.knockoutSkill);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
     pendingHits_.clear();
@@ -428,7 +435,13 @@ void Replicator::applyCombatHits(GameWorld* gw, Inbound& in) {
             continue;
         }
         unsigned int hand[5] = { k.t, k.c, k.cs, k.i, k.s };
-        bool applied = engine::applyReportedDamage(gw, hand, p.flesh, p.blood);
+        bool applied = false;
+        if (p.flesh > 0.0f || p.blood > 0.0f)
+            applied = engine::applyReportedDamage(gw, hand, p.flesh, p.blood);
+        if (p.flags & COMBAT_HIT_KNOCKOUT) {
+            Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+            if (c && engine::applyKnockout(c, p.koSkill)) applied = true;
+        }
         // A wounded world NPC is definitionally combat-scoped: mark it so the NPC
         // vitals stream (publishMedical, Phase B) mirrors the authoritative drop
         // back to the join's cosmetic copy (link 6 - "damage reached the join").
@@ -436,8 +449,9 @@ void Replicator::applyCombatHits(GameWorld* gw, Inbound& in) {
         // never reflect the host-applied wound.
         if (applied && streamNpcs_) medNpc_[k] = nowMs();
         char b[160]; _snprintf(b, sizeof(b) - 1,
-            "[combat] HIT RECV id=%u hand=%u,%u flesh=%.1f blood=%.1f applied=%d",
-            p.hitId, k.i, k.s, p.flesh, p.blood, applied ? 1 : 0);
+            "[combat] HIT RECV id=%u hand=%u,%u flesh=%.1f blood=%.1f ko=%u skill=%.2f applied=%d",
+            p.hitId, k.i, k.s, p.flesh, p.blood,
+            (p.flags & COMBAT_HIT_KNOCKOUT) ? 1u : 0u, p.koSkill, applied ? 1 : 0);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }
@@ -473,6 +487,10 @@ void Replicator::publishStats(GameWorld* gw, NetLink& net, u32 ownerId) {
             pkt.stats[i] = (i < n) ? sr.stats[i] : -1.0f;
         pkt.xp                  = sr.xp;
         pkt.freeAttributePoints = sr.freeAttribPts;
+        {
+            Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+            pkt.age = c ? engine::charAge(c) : -1.0f;
+        }
         net.queueStats(pkt);
         if (changed) { // periodic resends stay silent; changes are the signal
             // str/dex/tough/stealth/athletics cover the scenario + the stats a
@@ -514,6 +532,12 @@ void Replicator::applyStats(GameWorld* gw, Inbound& in) {
         w.xp            = p.xp;
         w.freeAttribPts = p.freeAttributePoints;
         bool ok = engine::writeStats(c, w);
+        // Animal-scale sync (protocol 63): apply the owner's age only when it
+        // has drifted, so a growing squad animal matches size on the peer.
+        if (p.age > 0.0f && p.age < 1.0e6f) {
+            float cur = engine::charAge(c);
+            if (cur < 0.0f || fabs(cur - p.age) > 0.01f) engine::setCharAge(c, p.age);
+        }
         char b[200]; _snprintf(b, sizeof(b) - 1,
             "[stats] RECV hand=%u,%u ok=%d str=%.1f dex=%.1f tough=%.1f stealth=%.1f athl=%.1f xp=%.0f",
             k.i, k.s, ok ? 1 : 0, p.stats[1], p.stats[18], p.stats[21],
@@ -772,8 +796,11 @@ void Replicator::applyFactions(const SyncContext& ctx) {
         const FactionPacket& p = it->pkt;
         if (p.sid[0] == '\0') continue;
         FacRow& fr = facRows_[std::string(p.sid)];
-        if (!sync::gateSeqAccept(fr.seqSeen, p.seq)) continue; // stale/dup row
-        fr.seqSeen = p.seq;
+        // Per-sender stale guard (StaleGuard.h, prototest testStaleGuard):
+        // both clients publish this row with INDEPENDENT seq counters, so the
+        // comparison must be against the newest seq seen FROM THIS SENDER,
+        // not a shared high-water mark.
+        if (!staleRowAccept(fr.seqSeen, p.ownerId, p.seq)) continue;
         float us = -999.0f, them = -999.0f;
         engine::readRelationBySid(gw, p.sid, &us, &them);
         // Updating the baseline FIRST is the echo guard: the local change this
@@ -794,8 +821,11 @@ void Replicator::applyFactions(const SyncContext& ctx) {
 void Replicator::publishDoors(const SyncContext& ctx) {
     GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
     if (!doorSync_) return;
-    const unsigned long SAMPLE_MS = tuning_.doorSampleMs;  // doors move in clicks; 1 Hz is plenty
+    // The Join samples UI intent quickly; the Host keeps the historical state
+    // census cadence. Both paths remain change-gated and idle at zero packets.
+    const unsigned long SAMPLE_MS = ctx.isHost ? tuning_.doorSampleMs : 200;
     const unsigned long RESEND_MS = tuning_.doorResendMs;  // safety resend for rows we ever sent
+    const unsigned long RETRY_MS  = 2000;
     unsigned long now = nowMs();
     if (!sync::gateSampleDue(now, doorSampleMs_, SAMPLE_MS)) return;
     doorSampleMs_ = now;
@@ -825,6 +855,41 @@ void Replicator::publishDoors(const SyncContext& ctx) {
             continue;
         }
         bool changed = (r.open != dr.knownOpen) || (r.locked != dr.knownLocked);
+        if (!ctx.isHost) {
+            bool samePending = dr.pendingSeq != 0 &&
+                               dr.pendingOpen == r.open &&
+                               dr.pendingLocked == r.locked;
+            bool newChoice = dr.pendingSeq == 0 ? changed : !samePending;
+            if (!newChoice && dr.pendingSeq == 0) continue;
+            if (!newChoice &&
+                !hostIntentRetryDue(now, dr.pendingSendMs, RETRY_MS))
+                continue;
+            if (newChoice) {
+                dr.pendingSeq = doorSeqOut_++;
+                dr.pendingOpen = r.open;
+                dr.pendingLocked = r.locked;
+            }
+            DoorIntentPacket intent;
+            memset(&intent, 0, sizeof(intent));
+            intent.type = (u8)PKT_DOOR_INTENT;
+            intent.ownerId = ownerId;
+            intent.seq = dr.pendingSeq;
+            intent.keyKind = 0;
+            for (unsigned int h = 0; h < 5; ++h) intent.key[h] = r.hand[h];
+            intent.open = (u8)(dr.pendingOpen ? 1 : 0);
+            intent.locked = (u8)(dr.pendingLocked ? 1 : 0);
+            dr.pendingSendMs = now;
+            net.queueDoorIntent(intent);
+            char b[184];
+            _snprintf(b, sizeof(b) - 1,
+                      "[door] INTENT SEND hand=%u.%u.%u.%u.%u open=%u "
+                      "locked=%u seq=%u retry=%d",
+                      intent.key[0], intent.key[1], intent.key[2], intent.key[3],
+                      intent.key[4], intent.open, intent.locked, intent.seq,
+                      newChoice ? 0 : 1);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            continue;
+        }
         // Doors seed their baseline silently above, so a never-sent row holds
         // (resendUnsent = false); only a real change or a post-send safety
         // resend crosses. No burst throttle - the 1 Hz sample gate paces it.
@@ -840,6 +905,8 @@ void Replicator::publishDoors(const SyncContext& ctx) {
         for (unsigned int h = 0; h < 5; ++h) pkt.hand[h] = r.hand[h];
         pkt.open    = (u8)(r.open ? 1 : 0);
         pkt.locked  = (u8)(r.locked ? 1 : 0);
+        pkt.ackOwnerId = 0;
+        pkt.ackSeq = 0;
         net.queueDoor(pkt);
         if (changed) { // resends stay silent; the change is the signal
             char b[160];
@@ -863,12 +930,23 @@ void Replicator::applyDoors(const SyncContext& ctx) {
         Key k; k.t = p.hand[0]; k.c = p.hand[1]; k.cs = p.hand[2];
         k.i = p.hand[3]; k.s = p.hand[4];
         DoorRow& dr = doorRows_[k];
-        if (!sync::gateSeqAccept(dr.seqSeen, p.seq)) continue; // stale/dup row
-        dr.seqSeen = p.seq;
-        // Updating the baseline FIRST is the echo guard: the local change this
-        // write causes must not be re-detected as ours next sample.
+        // Per-sender stale guard (StaleGuard.h, prototest testStaleGuard):
+        // the comparison is against the newest seq seen FROM THIS SENDER,
+        // not a shared high-water mark.
+        if (!staleRowAccept(dr.seqSeen, p.ownerId, p.seq)) continue;
+        bool settled = hostIntentAckCovers(ctx.localId, dr.pendingSeq,
+                                           p.ackOwnerId, p.ackSeq);
+        if (settled) {
+            dr.pendingSeq = 0; dr.pendingOpen = dr.pendingLocked = -1;
+            dr.pendingSendMs = 0;
+        }
+        bool hold = dr.pendingSeq != 0;
+        // Always learn the canonical baseline. Until our explicit ack arrives,
+        // keep the optimistic local interaction visible instead of bouncing it
+        // through an older Host row.
         dr.knownOpen = (int)p.open; dr.knownLocked = (int)p.locked;
         dr.seeded = true;
+        if (hold) continue;
         engine::DoorRead cur;
         if (!engine::readDoorByHand(p.hand, &cur))
             continue; // out-of-interest or runtime door - accepted edge
@@ -886,6 +964,105 @@ void Replicator::applyDoors(const SyncContext& ctx) {
     }
 }
 
+void Replicator::applyDoorIntents(const SyncContext& ctx) {
+    std::deque<InboundDoorIntent> got;
+    ctx.in->drainDoorIntents(got);
+    if (got.empty() || !ctx.isHost) return;
+    const unsigned long now = nowMs();
+    for (std::deque<InboundDoorIntent>::iterator it = got.begin();
+         it != got.end(); ++it) {
+        const DoorIntentPacket& p = it->pkt;
+        if (p.seq == 0 || p.ownerId == 0 || p.ownerId == ctx.localId ||
+            p.keyKind > 1)
+            continue;
+        Key k; k.t = p.key[0]; k.c = p.key[1]; k.cs = p.key[2];
+        k.i = p.key[3]; k.s = p.key[4];
+        engine::DoorRead cur;
+        bool resolved = false;
+        if (p.keyKind == 0) {
+            if (!doorSync_) continue;
+            resolved = engine::readDoorByHand(p.key, &cur);
+        } else {
+            if (!buildSync_ || !bdoorSync_ || p.doorIndex >= 4) continue;
+            unsigned int buildHand[5];
+            if (localHandForBuildKey(k, buildHand))
+                resolved = engine::readDoorOfBuilding(buildHand, p.doorIndex, &cur);
+        }
+        if (!resolved) continue; // retry may succeed when the target loads
+
+        bool fresh = false;
+        bool ok = false;
+        engine::DoorRead actual = cur;
+        if (p.keyKind == 0) {
+            DoorRow& row = doorRows_[k];
+            u32& seen = row.intentSeen[p.ownerId];
+            fresh = hostIntentIsNew(seen, p.seq);
+            if (fresh) {
+                seen = p.seq;
+                bool valid = p.open <= 1 && p.locked <= 1 &&
+                             (!p.locked || cur.hasLock);
+                if (valid) {
+                    ok = engine::writeDoorByHand(cur.hand, (int)p.open,
+                                                 cur.hasLock ? (int)p.locked : -1,
+                                                 &actual);
+                    if (!ok && !engine::readDoorByHand(cur.hand, &actual))
+                        actual = cur;
+                }
+            }
+            row.knownOpen = actual.open; row.knownLocked = actual.locked;
+            row.seeded = true; row.lastSendMs = now;
+            DoorPacket state;
+            memset(&state, 0, sizeof(state));
+            state.type = (u8)PKT_DOOR; state.ownerId = ctx.localId;
+            state.seq = doorSeqOut_++;
+            for (unsigned int h = 0; h < 5; ++h) state.hand[h] = actual.hand[h];
+            state.open = (u8)(actual.open ? 1 : 0);
+            state.locked = (u8)(actual.locked ? 1 : 0);
+            state.ackOwnerId = p.ownerId; state.ackSeq = p.seq;
+            ctx.net->queueDoor(state);
+        } else {
+            BdoorRow& row = bdoorRows_[std::make_pair(k, (int)p.doorIndex)];
+            u32& seen = row.intentSeen[p.ownerId];
+            fresh = hostIntentIsNew(seen, p.seq);
+            if (fresh) {
+                seen = p.seq;
+                bool valid = p.open <= 1 && p.locked <= 1 &&
+                             (!p.locked || cur.hasLock);
+                if (valid) {
+                    ok = engine::writeDoorByHand(cur.hand, (int)p.open,
+                                                 cur.hasLock ? (int)p.locked : -1,
+                                                 &actual);
+                    if (!ok && !engine::readDoorByHand(cur.hand, &actual))
+                        actual = cur;
+                }
+            }
+            row.knownOpen = actual.open; row.knownLocked = actual.locked;
+            row.seeded = true; row.lastSendMs = now;
+            BuildDoorPacket state;
+            memset(&state, 0, sizeof(state));
+            state.type = (u8)PKT_BUILD_DOOR; state.ownerId = ctx.localId;
+            state.seq = bdoorSeqOut_++;
+            state.bkey[0] = k.t; state.bkey[1] = k.c; state.bkey[2] = k.cs;
+            state.bkey[3] = k.i; state.bkey[4] = k.s;
+            state.doorIndex = p.doorIndex;
+            state.open = (u8)(actual.open ? 1 : 0);
+            state.locked = (u8)(actual.locked ? 1 : 0);
+            state.ackOwnerId = p.ownerId; state.ackSeq = p.seq;
+            ctx.net->queueBuildDoor(state);
+        }
+        char b[208];
+        _snprintf(b, sizeof(b) - 1,
+                  "[door] INTENT %s kind=%u key=%u.%u.%u.%u.%u idx=%u "
+                  "want=%u/%u actual=%d/%d seq=%u duplicate=%d",
+                  !fresh ? "DUP-ACK" : (ok ? "ACCEPT" : "REJECT"),
+                  (unsigned)p.keyKind,
+                  k.t, k.c, k.cs, k.i, k.s, (unsigned)p.doorIndex,
+                  (unsigned)p.open, (unsigned)p.locked, actual.open,
+                  actual.locked, p.seq, fresh ? 0 : 1);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
 namespace {
 // Protocol 33 amount quantization: the change gate compares hundredths, so a
 // machine mid-production (amount creeping every engine tick) sends at most
@@ -895,6 +1072,57 @@ inline int qProd(float v) {
     return (int)(v * 100.0f + (v >= 0.0f ? 0.5f : -0.5f));
 }
 } // namespace
+
+void Replicator::prodWireKeyForLocal(const Key& local, bool reverseFixture,
+                                     int& keyKind, Key& wire) const {
+    keyKind = 0; wire = local;
+    if (ownBuilds_.find(local) != ownBuilds_.end()) {
+        keyKind = 1;
+        return;
+    }
+    std::map<Key, Key>::const_iterator mint = mintByLocal_.find(local);
+    if (mint != mintByLocal_.end()) {
+        keyKind = 1; wire = mint->second;
+        return;
+    }
+    if (!reverseFixture) return; // host's raw fixture key is canonical
+    // Runtime terrain fixtures (notably mines) are not protocol-27 builds but
+    // still have different hands. fixtureMap_ is wire(host/peer) -> local, so
+    // reverse it for a join-authored intent.
+    for (std::map<Key, FixtureRow>::const_iterator it = fixtureMap_.begin();
+         it != fixtureMap_.end(); ++it) {
+        if (!it->second.resolved) continue;
+        const unsigned int* h = it->second.hand;
+        if (h[0] == local.t && h[1] == local.c && h[2] == local.cs &&
+            h[3] == local.i && h[4] == local.s) {
+            wire = it->first;
+            return;
+        }
+    }
+}
+
+bool Replicator::localHandForProdKey(int keyKind, const Key& wire,
+                                     unsigned int out[5]) const {
+    if (!out) return false;
+    if (keyKind == 0) {
+        if (localHandForFixtureKey(wire, out)) return true;
+        out[0] = wire.t; out[1] = wire.c; out[2] = wire.cs;
+        out[3] = wire.i; out[4] = wire.s;
+        return true;
+    }
+    if (keyKind != 1) return false;
+    std::map<Key, OwnBuild>::const_iterator ob = ownBuilds_.find(wire);
+    if (ob != ownBuilds_.end()) {
+        if (ob->second.removed) return false;
+        memcpy(out, ob->second.hand, sizeof(unsigned int) * 5);
+        return true;
+    }
+    std::map<Key, PeerBuild>::const_iterator pb = peerBuilds_.find(wire);
+    if (pb == peerBuilds_.end() || pb->second.minted != 1 || pb->second.removed)
+        return false;
+    memcpy(out, pb->second.localHand, sizeof(unsigned int) * 5);
+    return true;
+}
 
 void Replicator::publishProd(const SyncContext& ctx) {
     GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
@@ -916,13 +1144,8 @@ void Replicator::publishProd(const SyncContext& ctx) {
         // key (our own placement keys by OUR hand; a minted proxy of the
         // join's placement translates through the reverse map). Everything
         // else is a BAKED machine with a save-stable hand.
-        int keyKind = 0; Key wk = lk;
-        if (ownBuilds_.find(lk) != ownBuilds_.end()) {
-            keyKind = 1;
-        } else {
-            std::map<Key, Key>::iterator mit = mintByLocal_.find(lk);
-            if (mit != mintByLocal_.end()) { keyKind = 1; wk = mit->second; }
-        }
+        int keyKind = 0; Key wk;
+        prodWireKeyForLocal(lk, /*reverseFixture*/false, keyKind, wk);
         ProdRow& pr = prodRows_[std::make_pair(keyKind, wk)];
         int qOut = qProd(r.outAmount);
         int qIn0 = qProd(r.nInputs > 0 ? r.inAmount[0] : -1.0f);
@@ -930,6 +1153,9 @@ void Replicator::publishProd(const SyncContext& ctx) {
         int qGr  = qProd(r.grown), qDi = qProd(r.died);
         int qGs  = qProd(r.growStart), qHv = qProd((float)r.harvested);
         bool changed = !pr.sent ||
+                       pr.knownType != r.outType || pr.knownSid != r.outSid ||
+                       pr.sentAckOwnerId != pr.ackOwnerId ||
+                       pr.sentAckSeq != pr.ackSeq ||
                        r.powerOn != pr.knownPower ||
                        r.productionState != pr.knownState ||
                        qOut != pr.qOut || qIn0 != pr.qIn0 || qIn1 != pr.qIn1 ||
@@ -943,6 +1169,8 @@ void Replicator::publishProd(const SyncContext& ctx) {
         bool first = !pr.sent;
         pr.sent = true; pr.lastSendMs = now;
         pr.knownPower = r.powerOn; pr.knownState = r.productionState;
+        pr.knownType = r.outType; pr.knownSid = r.outSid;
+        pr.haveCanonical = true; pr.canonicalRecipeApplied = true;
         pr.qOut = qOut; pr.qIn0 = qIn0; pr.qIn1 = qIn1;
         pr.qGrown = qGr; pr.qDied = qDi; pr.qGrowStart = qGs; pr.qHarv = qHv;
         ProdPacket pkt;
@@ -957,12 +1185,17 @@ void Replicator::publishProd(const SyncContext& ctx) {
         pkt.powerOn   = (i8)r.powerOn;
         pkt.prodState = (i8)r.productionState;
         pkt.outAmount = r.outAmount;
+        pkt.outType   = r.outType;
         strncpy(pkt.outSid, r.outSid, sizeof(pkt.outSid) - 1);
         pkt.outSid[sizeof(pkt.outSid) - 1] = '\0';
         pkt.inAmount[0] = (r.nInputs > 0) ? r.inAmount[0] : -1.0f;
         pkt.inAmount[1] = (r.nInputs > 1) ? r.inAmount[1] : -1.0f;
         pkt.grown = r.grown; pkt.died = r.died; pkt.growStart = r.growStart;
         pkt.harvested = (float)r.harvested;
+        pkt.ackOwnerId = pr.ackOwnerId;
+        pkt.ackSeq     = pr.ackSeq;
+        pr.sentAckOwnerId = pr.ackOwnerId;
+        pr.sentAckSeq = pr.ackSeq;
         net.queueProd(pkt);
         if (changed) { // resends stay silent; the change is the signal
             char b[256];
@@ -979,6 +1212,116 @@ void Replicator::publishProd(const SyncContext& ctx) {
     }
 }
 
+void Replicator::publishProdIntents(const SyncContext& ctx) {
+    if (!prodSync_ || ctx.isHost) return;
+    const unsigned long SAMPLE_MS = 200; // UI response; change-gated, no idle wire traffic
+    const unsigned long RETRY_MS  = 2000;
+    unsigned long now = nowMs();
+    if (!sync::gateSampleDue(now, prodIntentSampleMs_, SAMPLE_MS)) return;
+    prodIntentSampleMs_ = now;
+
+    const unsigned int MAX_MACH = 48;
+    static engine::ProdRead rows[MAX_MACH];
+    unsigned int n = engine::enumMachinesNear(ctx.gw, 100.0f, rows, MAX_MACH);
+    for (unsigned int i = 0; i < n; ++i) {
+        const engine::ProdRead& r = rows[i];
+        if (!r.outSid[0]) continue; // no exact recipe identity to request
+        Key local; local.t = r.hand[0]; local.c = r.hand[1]; local.cs = r.hand[2];
+        local.i = r.hand[3]; local.s = r.hand[4];
+        int keyKind = 0; Key wire;
+        prodWireKeyForLocal(local, /*reverseFixture*/true, keyKind, wire);
+        ProdRow& pr = prodRows_[std::make_pair(keyKind, wire)];
+        if (!pr.haveCanonical) continue; // never turn first sight into a command
+        if (!pr.canonicalRecipeApplied && pr.pendingSeq == 0)
+            continue; // a failed host-state apply is not a local UI click
+
+        bool sameCanonical = pr.knownType == r.outType && pr.knownSid == r.outSid;
+        bool samePending = pr.pendingSeq != 0 &&
+                           pr.pendingType == r.outType && pr.pendingSid == r.outSid;
+        bool isNewChoice = pr.pendingSeq == 0 ? !sameCanonical : !samePending;
+        if (!isNewChoice && pr.pendingSeq == 0) continue;
+        if (!isNewChoice &&
+            !hostIntentRetryDue(now, pr.pendingSendMs, RETRY_MS))
+            continue;
+
+        if (isNewChoice) {
+            pr.pendingSeq = prodIntentSeqOut_++;
+            pr.pendingType = r.outType;
+            pr.pendingSid = r.outSid;
+        }
+        ProdIntentPacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type = (u8)PKT_PROD_INTENT;
+        pkt.ownerId = ctx.localId;
+        pkt.seq = pr.pendingSeq;
+        pkt.keyKind = (u8)keyKind;
+        pkt.key[0] = wire.t; pkt.key[1] = wire.c; pkt.key[2] = wire.cs;
+        pkt.key[3] = wire.i; pkt.key[4] = wire.s;
+        pkt.recipeType = pr.pendingType;
+        strncpy(pkt.recipeSid, pr.pendingSid.c_str(), sizeof(pkt.recipeSid) - 1);
+        pr.pendingSendMs = now;
+        ctx.net->queueProdIntent(pkt);
+        char b[224];
+        _snprintf(b, sizeof(b) - 1,
+                  "[prod] INTENT SEND key=%u.%u.%u.%u.%u kind=%d recipe='%s' "
+                  "type=%u seq=%u retry=%d",
+                  wire.t, wire.c, wire.cs, wire.i, wire.s, keyKind,
+                  pkt.recipeSid, pkt.recipeType, pkt.seq, isNewChoice ? 0 : 1);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+void Replicator::applyProdIntents(const SyncContext& ctx) {
+    std::deque<InboundProdIntent> got;
+    ctx.in->drainProdIntents(got);
+    if (got.empty() || !prodSync_ || !ctx.isHost) return;
+    for (std::deque<InboundProdIntent>::iterator it = got.begin();
+         it != got.end(); ++it) {
+        const ProdIntentPacket& p = it->pkt;
+        char sid[sizeof(p.recipeSid)];
+        memcpy(sid, p.recipeSid, sizeof(sid)); sid[sizeof(sid) - 1] = '\0';
+        if (p.keyKind > 1 || p.seq == 0 || !sid[0]) continue;
+        Key wire; wire.t = p.key[0]; wire.c = p.key[1]; wire.cs = p.key[2];
+        wire.i = p.key[3]; wire.s = p.key[4];
+        ProdRow& pr = prodRows_[std::make_pair((int)p.keyKind, wire)];
+
+        // A repeated reliable request is a request for the ACK, not a second
+        // mutation. Force the canonical row out again and do nothing else.
+        if (pr.ackOwnerId == p.ownerId &&
+            !hostIntentIsNew(pr.ackSeq, p.seq)) {
+            pr.sentAckOwnerId = 0; pr.sentAckSeq = 0; prodSampleMs_ = 0;
+            continue;
+        }
+        unsigned int hand[5];
+        if (!localHandForProdKey((int)p.keyKind, wire, hand))
+            continue; // defer: the join retries if/when the machine is loaded
+        engine::ProdRead cur;
+        if (!engine::readMachineByHand(hand, &cur) || !cur.complete)
+            continue;
+        bool same = cur.outType == p.recipeType && strcmp(cur.outSid, sid) == 0;
+        bool ok = same;
+        engine::ProdRead after;
+        if (!same)
+            ok = engine::writeMachineRecipeByHand(ctx.gw, hand, sid, p.recipeType,
+                                                   0.0f, /*requireEmpty*/true,
+                                                   &after);
+
+        // Accept and reject are both final verdicts. Echoing the ack beside the
+        // actual state lets the join distinguish "not processed yet" from a
+        // validated rejection and roll back through the normal state path.
+        pr.ackOwnerId = p.ownerId; pr.ackSeq = p.seq;
+        prodSampleMs_ = 0; // ack fields make the verdict publish this tick
+        char b[224];
+        _snprintf(b, sizeof(b) - 1,
+                  "[prod] INTENT %s key=%u.%u.%u.%u.%u kind=%u recipe='%s' "
+                  "type=%u old='%s' amount=%.3f seq=%u",
+                  ok ? "ACCEPT" : "REJECT", wire.t, wire.c, wire.cs, wire.i,
+                  wire.s, (unsigned)p.keyKind, sid, p.recipeType, cur.outSid,
+                  cur.outAmount, p.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
 void Replicator::applyProd(const SyncContext& ctx) {
     Inbound& in = *ctx.in;
     std::deque<InboundProd> got;
@@ -992,31 +1335,23 @@ void Replicator::applyProd(const SyncContext& ctx) {
         ProdRow& pr = prodRows_[std::make_pair((int)p.keyKind, wk)];
         if (!sync::gateSeqAccept(pr.seqSeen, p.seq)) continue; // stale/dup row
         pr.seqSeen = p.seq;
+        char canonicalSid[sizeof(p.outSid)];
+        memcpy(canonicalSid, p.outSid, sizeof(canonicalSid));
+        canonicalSid[sizeof(canonicalSid) - 1] = '\0';
+        bool settled = hostIntentAckCovers(ctx.localId, pr.pendingSeq,
+                                           p.ackOwnerId, p.ackSeq);
+        if (settled) {
+            pr.pendingSeq = 0; pr.pendingType = 0; pr.pendingSid.clear();
+            pr.pendingSendMs = 0;
+        }
+        bool holdRecipe = pr.pendingSeq != 0; // do not bounce an unacked UI click
+        pr.knownType = p.outType; pr.knownSid = canonicalSid;
+        pr.haveCanonical = true;
         // Resolve the wire key to OUR machine's hand: baked hands resolve
         // directly; a placer key is either a building WE placed (our own
         // hand) or one we MINTED for the host's placement (translation map).
         unsigned int hand[5];
-        if (p.keyKind == 0) {
-            // A baked hand resolves directly, but a MINE's does not: it is a
-            // per-client instance for a terrain node, so the host's key names
-            // nothing here and every buffer row for it used to be dropped -
-            // the "mine inventory does not sync" half of the report. Prefer the
-            // protocol-55 pairing, fall back to the raw hand.
-            if (!localHandForFixtureKey(wk, hand))
-                for (unsigned int h = 0; h < 5; ++h) hand[h] = p.key[h];
-        } else {
-            std::map<Key, OwnBuild>::iterator ob = ownBuilds_.find(wk);
-            if (ob != ownBuilds_.end()) {
-                if (ob->second.removed) continue;
-                memcpy(hand, ob->second.hand, sizeof(hand));
-            } else {
-                std::map<Key, PeerBuild>::iterator pb = peerBuilds_.find(wk);
-                if (pb == peerBuilds_.end() || pb->second.minted != 1 ||
-                    pb->second.removed)
-                    continue; // unknown / refused / tombstoned key
-                memcpy(hand, pb->second.localHand, sizeof(hand));
-            }
-        }
+        if (!localHandForProdKey((int)p.keyKind, wk, hand)) continue;
         engine::ProdRead cur;
         if (!engine::readMachineByHand(hand, &cur))
             continue; // out-of-interest / not resolvable here - accepted edge
@@ -1026,8 +1361,26 @@ void Replicator::applyProd(const SyncContext& ctx) {
         int wantPower = -1;
         if (p.powerOn >= 0 && cur.powerOn >= 0 && (int)p.powerOn != cur.powerOn)
             wantPower = (int)p.powerOn;
+        // Recipe identity is part of canonical state in v56. Apply it before
+        // the amount write, except while our own request is still unacknowledged.
+        bool recipeDiff = canonicalSid[0] &&
+                          (cur.outType != p.outType || strcmp(cur.outSid, canonicalSid) != 0);
+        bool needMaterialize = canonicalSid[0] && p.outAmount >= 0.0f &&
+                               cur.outAmount < 0.0f;
+        if (!holdRecipe && (recipeDiff || needMaterialize)) {
+            engine::ProdRead recipeAfter;
+            if (engine::writeMachineRecipeByHand(ctx.gw, hand, canonicalSid,
+                                                  p.outType, p.outAmount,
+                                                  /*requireEmpty*/false,
+                                                  &recipeAfter))
+                cur = recipeAfter;
+        }
+        bool recipeConverged = !canonicalSid[0] ||
+                               (cur.outType == p.outType &&
+                                strcmp(cur.outSid, canonicalSid) == 0);
+        pr.canonicalRecipeApplied = recipeConverged;
         float outWant = -1.0f;
-        if (p.outAmount >= 0.0f &&
+        if (!holdRecipe && recipeConverged && p.outAmount >= 0.0f &&
             qProd(p.outAmount) != qProd(cur.outAmount >= 0.0f ? cur.outAmount : 0.0f))
             outWant = p.outAmount;
         float inWant[2] = { -1.0f, -1.0f };
@@ -1054,9 +1407,9 @@ void Replicator::applyProd(const SyncContext& ctx) {
         // proven materializing lever), then land the exact amount directly
         // (setProductionItem splits stack into inventory; the direct write
         // is what makes the buffer byte-match the host's).
-        if (outWant >= 0.0f && cur.outAmount < 0.0f)
-            engine::writeMachineByHand(hand, -1, outWant, /*useSetItem*/true,
-                                       0, 0, 0);
+        if (outWant >= 0.0f && cur.outAmount < 0.0f && canonicalSid[0])
+            engine::writeMachineRecipeByHand(ctx.gw, hand, canonicalSid, p.outType,
+                                              outWant, /*requireEmpty*/false, 0);
         engine::ProdRead after;
         bool ok = engine::writeMachineByHand(hand, wantPower, outWant,
                                              /*useSetItem*/false,
@@ -1129,9 +1482,10 @@ void Replicator::applyResearch(const SyncContext& ctx) {
         sid[sizeof(sid) - 1] = '\0';
         if (!sid[0]) continue;
         ResearchRow& rr = researchRows_[std::string(sid)];
-        if (!sync::gateSeqAccept(rr.seqSeen, p.seq)) continue; // stale/dup row
-        rr.seqSeen = p.seq;
-        if (rr.applied) continue; // landed earlier; resends are no-ops
+        // Grow-only union (ResearchUnion.h): a stale/dup row drops; a resend
+        // of an already-landed sid advances the guard but never re-applies.
+        if (researchRowDecision(rr.seqSeen, p.seq, rr.applied) != RESEARCH_ROW_APPLY)
+            continue;
         int known = -1, can = -1;
         int rc = engine::researchQueryBySid(gw, sid, &known, &can);
         if (rc != 1) continue; // store/levers not up yet; the resend retries
@@ -1172,6 +1526,17 @@ void Replicator::publishDeeds(const SyncContext& ctx) {
         const engine::DeedRead& r = rows[i];
         Key k; k.t = r.hand[0]; k.c = r.hand[1]; k.cs = r.hand[2];
         k.i = r.hand[3]; k.s = r.hand[4];
+        // Raw deed hands are cross-client identities only for save-resident
+        // buildings.  A protocol-27 placement has a different runtime hand on
+        // each client and its ownership is established when the peer copy is
+        // minted below.  Publishing that local hand as a deed can resolve to
+        // nothing (or, worse, an unrelated runtime object) on the peer.
+        Key buildWire;
+        const bool sessionPlaced = buildKeyForLocalHand(k, buildWire);
+        if (!deedMayPublishRawHand(sessionPlaced)) {
+            deedRows_.erase(k); // also remove a row seeded by older code
+            continue;
+        }
         live.insert(k);
         DeedRow& dr = deedRows_[k];
         bool changed = (dr.knownOwned != 1);
@@ -1287,9 +1652,14 @@ void Replicator::applyDeeds(const SyncContext& ctx) {
         const DeedPacket& p = it->pkt;
         Key k; k.t = p.hand[0]; k.c = p.hand[1]; k.cs = p.hand[2];
         k.i = p.hand[3]; k.s = p.hand[4];
+        // A mixed-version peer may still publish a runtime placed-building
+        // hand through the deed channel.  Protocol 27 owns that identity; do
+        // not let a raw-hand deed collide with a local runtime object.
+        if (ownBuilds_.find(k) != ownBuilds_.end() ||
+            peerBuilds_.find(k) != peerBuilds_.end())
+            continue;
         DeedRow& dr = deedRows_[k];
-        if (!sync::gateSeqAccept(dr.seqSeen, p.seq)) continue; // stale/dup row
-        dr.seqSeen = p.seq;
+        if (!staleRowAccept(dr.seqSeen, p.ownerId, p.seq)) continue; // stale/dup row (this sender)
         int want = p.owned ? 1 : 0;
         if (dr.applied && dr.knownOwned == want) continue; // converged; resend no-op
         engine::DeedRead cur;
@@ -1390,8 +1760,7 @@ void Replicator::applyFixtures(const SyncContext& ctx) {
         Key k; k.t = p.hand[0]; k.c = p.hand[1]; k.cs = p.hand[2];
         k.i = p.hand[3]; k.s = p.hand[4];
         FixtureRow& fr = fixtureMap_[k];
-        if (!sync::gateSeqAccept(fr.seqSeen, p.seq)) continue; // stale/dup row
-        fr.seqSeen = p.seq;
+        if (!staleRowAccept(fr.seqSeen, p.ownerId, p.seq)) continue; // stale/dup row (this sender)
         if (fr.resolved) continue; // identity is permanent; resends are no-ops
 
         // Save-baked machines DO cross by hand, and those rows are the majority
@@ -1511,12 +1880,197 @@ bool Replicator::localHandForBuildKey(const Key& wire, unsigned int out[5]) cons
     return false; // unknown / refused / tombstoned key
 }
 
+bool Replicator::ensurePeerBuildOwnership(GameWorld* gw, const Key& wire,
+                                          PeerBuild& pb) {
+    if (!peerBuildNeedsOwnership(pb.minted, pb.removed,
+                                 pb.ownershipApplied))
+        return pb.ownershipApplied;
+
+    // The native factory was given the local player faction.  Prefer that
+    // result and avoid inserting every placed chair/bench into the separate
+    // property-deed set when the normal creation path already made it owned.
+    engine::DeedRead cur;
+    if (engine::readDeedByHand(gw, pb.localHand, &cur) && cur.owned == 1) {
+        pb.ownershipApplied = true;
+        return true;
+    }
+
+    // Backstop for engine/template variants where the factory sets only part
+    // of the ownership state.  This is idempotent and uses the same proven
+    // state write as protocol 54 without replaying a purchase or charging cats.
+    engine::DeedRead post;
+    bool ok = engine::writeDeedByHand(gw, pb.localHand, /*wantOwned*/1,
+                                      /*ownerSid*/"", &post);
+    pb.ownershipApplied = ok && post.owned == 1;
+
+    char b[224];
+    _snprintf(b, sizeof(b) - 1,
+              "[build] OWNER-CLAIM key=%u.%u.%u.%u.%u "
+              "local=%u.%u.%u.%u.%u ok=%d owned=%d",
+              wire.t, wire.c, wire.cs, wire.i, wire.s,
+              pb.localHand[0], pb.localHand[1], pb.localHand[2],
+              pb.localHand[3], pb.localHand[4], ok ? 1 : 0,
+              ok ? post.owned : -1);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    return pb.ownershipApplied;
+}
+
+void Replicator::publishBounties(const SyncContext& ctx) {
+    GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
+    if (!bountySync_) return;
+    const unsigned long SAMPLE_MS = 1000;  // crimes resolve over seconds; 1 Hz is plenty
+    const unsigned long RESEND_MS = 15000; // safety resend for rows we ever sent
+    unsigned long now = nowMs();
+    if (bountySampleMs_ != 0 && (now - bountySampleMs_) < SAMPLE_MS) return;
+    bountySampleMs_ = now;
+
+    // Snapshot every durable bounty row this engine carries (host-side driven
+    // copies of remote PCs + host-owned PCs - the H2 subject set).
+    const unsigned int MAX_ROWS = 128;
+    static engine::BountyPubRow rows[MAX_ROWS]; // main-thread only
+    unsigned int n = engine::enumBountyRows(gw, rows, MAX_ROWS);
+
+    // Track which (char, faction) keys are live this sample so a row that
+    // VANISHED (host paid off / served the sentence -> clearBounty removed the
+    // map entry, so it no longer enumerates) can stream a one-shot clear.
+    std::set<std::pair<Key, std::string> > seen;
+
+    for (unsigned int i = 0; i < n; ++i) {
+        const engine::BountyPubRow& r = rows[i];
+        Key k; k.t = r.hand[0]; k.c = r.hand[1]; k.cs = r.hand[2];
+        k.i = r.hand[3]; k.s = r.hand[4];
+        std::pair<Key, std::string> key(k, std::string(r.sid));
+        seen.insert(key);
+        BountyRow& br = bountyRows_[key];
+        BountyVal known; known.amount = br.knownAmount;
+        known.crimes = br.knownCrimes; known.claimed = br.knownClaimed;
+        BountyVal cur; cur.amount = r.amount; cur.crimes = r.crimes; cur.claimed = r.claimed;
+        if (!br.seeded) {
+            br.seeded = true;
+            if (!bountyBaseline_) {
+                // FIRST channel sample: a bounty already present at (or near) load
+                // is the SHARED baseline (both clients loaded the same save), so
+                // seed it silently and stream only later movement.
+                br.knownAmount = r.amount; br.knownCrimes = r.crimes; br.knownClaimed = r.claimed;
+                continue;
+            }
+            // The baseline pass already ran, so this key APPEARED mid-session -
+            // a crime just created a bounty row where there was none (0 rows -> 1).
+            // That is exactly the movement H2 must carry, NOT a load-time seed:
+            // treat the implicit baseline as zero and fall through to the send
+            // path. (A row that instead existed at load but only now entered
+            // interest range still converges harmlessly - the receiver's apply is
+            // convergence-first against getActualBounty.)
+            br.knownAmount = 0; br.knownCrimes = 0; br.knownClaimed = 0;
+            known.amount = 0; known.crimes = 0; known.claimed = 0;
+        }
+        int resendDue = (br.lastSendMs != 0 && (now - br.lastSendMs) >= RESEND_MS) ? 1 : 0;
+        // Host-authoritative publish gate (the exact rule prototest locks): the
+        // host streams a seeded row that moved or is due a resend; a join never
+        // reaches here (Plugin.cpp calls this on the host only).
+        if (!bountyShouldSend(/*isHost*/1, /*seeded*/1, &known, &cur, resendDue)) continue;
+        bool changed = (known.amount != cur.amount) || (known.crimes != cur.crimes) ||
+                       (known.claimed != cur.claimed);
+        br.knownAmount = r.amount; br.knownCrimes = r.crimes; br.knownClaimed = r.claimed;
+        br.lastSendMs = now;
+        BountyPacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type    = (u8)PKT_BOUNTY;
+        pkt.ownerId = ownerId;
+        pkt.seq     = bountySeqOut_++;
+        for (unsigned int h = 0; h < 5; ++h) pkt.hand[h] = r.hand[h];
+        strncpy(pkt.sid, r.sid, sizeof(pkt.sid) - 1);
+        pkt.sid[sizeof(pkt.sid) - 1] = '\0';
+        pkt.amount  = r.amount;
+        pkt.crimes  = r.crimes;
+        pkt.claimed = (u8)(r.claimed ? 1 : 0);
+        net.queueBounty(pkt);
+        if (changed) { // resends stay silent; the movement is the signal
+            char b[200];
+            _snprintf(b, sizeof(b) - 1,
+                      "[bounty] SEND hand=%u,%u fac='%s' amount=%d crimes=0x%X claimed=%d seq=%u",
+                      r.hand[3], r.hand[4], r.sid, r.amount, r.crimes, r.claimed, pkt.seq);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+
+    // Disappearance -> clear: a previously-positive seeded row absent from this
+    // sample means the host CLEARED it (paid off / sentence served). Stream one
+    // amount=0 row so the client drops its copy, and reset the baseline to 0 (NOT
+    // erase - if the subject merely went out of interest range and re-appears
+    // still-wanted, the next sample re-detects 0->amount and re-streams it).
+    for (std::map<std::pair<Key, std::string>, BountyRow>::iterator it = bountyRows_.begin();
+         it != bountyRows_.end(); ++it) {
+        BountyRow& br = it->second;
+        if (!br.seeded || br.knownAmount == 0) continue;
+        if (seen.find(it->first) != seen.end()) continue; // still live this sample
+        br.knownAmount = 0; br.knownCrimes = 0; br.knownClaimed = 0;
+        br.lastSendMs = now;
+        const Key& k = it->first.first;
+        BountyPacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type    = (u8)PKT_BOUNTY;
+        pkt.ownerId = ownerId;
+        pkt.seq     = bountySeqOut_++;
+        pkt.hand[0] = k.t; pkt.hand[1] = k.c; pkt.hand[2] = k.cs;
+        pkt.hand[3] = k.i; pkt.hand[4] = k.s;
+        strncpy(pkt.sid, it->first.second.c_str(), sizeof(pkt.sid) - 1);
+        pkt.sid[sizeof(pkt.sid) - 1] = '\0';
+        pkt.amount = 0; pkt.crimes = 0; pkt.claimed = 0;
+        net.queueBounty(pkt);
+        char b[200];
+        _snprintf(b, sizeof(b) - 1,
+                  "[bounty] SEND-CLEAR hand=%u,%u fac='%s' seq=%u",
+                  k.i, k.s, it->first.second.c_str(), pkt.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // The first sample has now captured every load-time bounty row as the shared
+    // baseline. From here on, a newly-seen (char, faction) key is a genuine
+    // mid-session appearance (a fresh crime), streamed from an implicit zero.
+    bountyBaseline_ = true;
+}
+
+void Replicator::applyBounties(const SyncContext& ctx) {
+    GameWorld* gw = ctx.gw; Inbound& in = *ctx.in;
+    std::deque<InboundBounty> got;
+    in.drainBounty(got);
+    if (got.empty()) return;
+    if (!bountySync_) return;
+    for (std::deque<InboundBounty>::iterator it = got.begin(); it != got.end(); ++it) {
+        const BountyPacket& p = it->pkt;
+        if (p.sid[0] == '\0') continue;
+        Key k; k.t = p.hand[0]; k.c = p.hand[1]; k.cs = p.hand[2];
+        k.i = p.hand[3]; k.s = p.hand[4];
+        std::pair<Key, std::string> key(k, std::string(p.sid));
+        BountyRow& br = bountyRows_[key];
+        if (br.seqSeen != 0 && p.seq <= br.seqSeen) continue; // stale row (bountyApplyDecision SKIP_STALE)
+        br.seqSeen = p.seq;
+        // Echo guard: update the baseline BEFORE the write so the mutation this
+        // apply causes is never re-detected as local movement (the client does
+        // not publish, but the guard keeps the row's known state coherent).
+        br.knownAmount = p.amount; br.knownCrimes = p.crimes;
+        br.knownClaimed = p.claimed ? 1 : 0; br.seeded = true;
+        int before = -1, after = -1;
+        bool ok = engine::applyBountyRow(gw, p.hand, p.sid, p.amount, p.crimes,
+                                         p.claimed ? 1 : 0, &before, &after);
+        char b[224];
+        _snprintf(b, sizeof(b) - 1,
+                  "[bounty] RECV hand=%u,%u fac='%s' amount=%d was=%d now=%d crimes=0x%X ok=%d seq=%u",
+                  p.hand[3], p.hand[4], p.sid, p.amount, before, after,
+                  p.crimes, ok ? 1 : 0, p.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
 void Replicator::publishBuilds(const SyncContext& ctx) {
     NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
     if (!buildSync_) return;
+    const unsigned long now = nowMs();
+    const unsigned long INTENT_RETRY_MS = 2000;
 
-    // 1. Local placement edges -> PLACE announcements (drained every tick so
-    // the edge queue never backs up; the detour caps it at 32 anyway).
+    // Local placement edges are optimistic on the Join: its committed preview
+    // supplies the stable session key, while the Host decides whether that key
+    // becomes canonical. Host-local placements are canonical immediately.
     engine::BuildEdge edges[8];
     unsigned int n = engine::drainBuildEdges(edges, 8);
     for (unsigned int i = 0; i < n; ++i) {
@@ -1529,60 +2083,189 @@ void Replicator::publishBuilds(const SyncContext& ctx) {
         BuildPlacePacket pkt;
         memset(&pkt, 0, sizeof(pkt));
         pkt.type    = (u8)PKT_BUILD_PLACE;
-        pkt.ownerId = ownerId;
-        pkt.seq     = buildSeqOut_++;
+        pkt.ownerId = ctx.isHost ? ownerId : 0;
+        pkt.seq     = ctx.isHost ? buildSeqOut_++ : 0;
         for (unsigned int h = 0; h < 5; ++h) pkt.key[h] = e.hand[h];
         strncpy(pkt.sid, e.sid, sizeof(pkt.sid) - 1);
         pkt.sid[sizeof(pkt.sid) - 1] = '\0';
         pkt.x = e.x; pkt.y = e.y; pkt.z = e.z; pkt.yaw = e.yaw;
         pkt.fromUi = (u8)(e.fromUi ? 1 : 0);
+        pkt.accepted = 1;
+        pkt.ackOwnerId = 0; pkt.ackSeq = 0;
         // Protocol 30: retain the announcement so a connect-edge resync can
         // re-send it to a late joiner (the one-shot edge, made repeatable).
         memcpy(&ob.ann, &pkt, sizeof(pkt));
         ob.haveAnn = true;
-        net.queueBuildPlace(pkt);
+        if (ctx.isHost) {
+            net.queueBuildPlace(pkt);
+        } else if (ob.pendingPlaceSeq == 0) {
+            ob.pendingPlaceSeq = buildIntentSeqOut_++;
+            ob.pendingPlaceSendMs = 0; // retry pass below sends immediately
+        }
         char b[224];
         _snprintf(b, sizeof(b) - 1,
-                  "[build] PLACE-SEND key=%u.%u.%u.%u.%u sid='%s' ui=%u "
-                  "pos=%.1f,%.1f,%.1f seq=%u",
+                  ctx.isHost
+                    ? "[build] PLACE-SEND key=%u.%u.%u.%u.%u sid='%s' ui=%u "
+                      "pos=%.1f,%.1f,%.1f seq=%u"
+                    : "[build] PLACE-PENDING key=%u.%u.%u.%u.%u sid='%s' ui=%u "
+                      "pos=%.1f,%.1f,%.1f seq=%u",
                   pkt.key[0], pkt.key[1], pkt.key[2], pkt.key[3], pkt.key[4],
-                  pkt.sid, pkt.fromUi, pkt.x, pkt.y, pkt.z, pkt.seq);
+                  pkt.sid, pkt.fromUi, pkt.x, pkt.y, pkt.z,
+                  ctx.isHost ? pkt.seq : ob.pendingPlaceSeq);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
-    // 1b. Removal edges (protocol 28): the dismantle detour (UI path) and the
-    // programmatic destroy both queue hands here. Only buildings WE placed
-    // stream a REMOVE (placer-authoritative); a dismantle of a baked building
-    // or of a peer's proxy logs at the detour but stays local.
+    // A local dismantle may name our original site OR a minted Host placement.
+    // Translate either one into the stable wire key before authoring state or
+    // intent. Baked buildings remain outside this session-build channel.
     unsigned int rmEdges[8][5];
     unsigned int rn = engine::drainRemoveEdges(rmEdges, 8);
     for (unsigned int i = 0; i < rn; ++i) {
-        Key k; k.t = rmEdges[i][0]; k.c = rmEdges[i][1]; k.cs = rmEdges[i][2];
-        k.i = rmEdges[i][3]; k.s = rmEdges[i][4];
-        std::map<Key, OwnBuild>::iterator f = ownBuilds_.find(k);
-        if (f == ownBuilds_.end() || f->second.removed) continue;
-        f->second.removed = true;
+        Key local; local.t = rmEdges[i][0]; local.c = rmEdges[i][1];
+        local.cs = rmEdges[i][2]; local.i = rmEdges[i][3]; local.s = rmEdges[i][4];
+        Key k = local;
+        std::map<Key, OwnBuild>::iterator own = ownBuilds_.find(k);
+        std::map<Key, PeerBuild>::iterator peer = peerBuilds_.end();
+        if (own == ownBuilds_.end()) {
+            std::map<Key, Key>::iterator rev = mintByLocal_.find(local);
+            if (rev == mintByLocal_.end()) continue;
+            k = rev->second;
+            own = ownBuilds_.find(k);
+            peer = peerBuilds_.find(k);
+        }
+        bool alreadyRemoved = false;
+        if (own != ownBuilds_.end()) {
+            alreadyRemoved = own->second.removed;
+            own->second.removed = true;
+        } else if (peer != peerBuilds_.end()) {
+            alreadyRemoved = peer->second.removed;
+            peer->second.removed = true;
+        } else {
+            continue;
+        }
+        if (alreadyRemoved) continue;
         if (!bdoorSync_) continue; // A/B hatch: edge observed, nothing streams
-        BuildRemovePacket pkt;
-        memset(&pkt, 0, sizeof(pkt));
-        pkt.type    = (u8)PKT_BUILD_REMOVE;
-        pkt.ownerId = ownerId;
-        pkt.seq     = buildSeqOut_++;
-        for (unsigned int h = 0; h < 5; ++h) pkt.key[h] = rmEdges[i][h];
-        net.queueBuildRemove(pkt);
-        char b[160];
-        _snprintf(b, sizeof(b) - 1,
-                  "[build] REMOVE-SEND key=%u.%u.%u.%u.%u seq=%u",
-                  pkt.key[0], pkt.key[1], pkt.key[2], pkt.key[3], pkt.key[4],
-                  pkt.seq);
-        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (ctx.isHost) {
+            BuildRemovePacket pkt;
+            memset(&pkt, 0, sizeof(pkt));
+            pkt.type = (u8)PKT_BUILD_REMOVE; pkt.ownerId = ownerId;
+            pkt.seq = buildSeqOut_++; pkt.accepted = 1;
+            pkt.key[0] = k.t; pkt.key[1] = k.c; pkt.key[2] = k.cs;
+            pkt.key[3] = k.i; pkt.key[4] = k.s;
+            net.queueBuildRemove(pkt);
+            char b[160];
+            _snprintf(b, sizeof(b) - 1,
+                      "[build] REMOVE-SEND key=%u.%u.%u.%u.%u seq=%u",
+                      k.t, k.c, k.cs, k.i, k.s, pkt.seq);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        } else {
+            BuildRemovePending& pending = buildRemovePending_[k];
+            if (pending.seq == 0) pending.seq = buildIntentSeqOut_++;
+            pending.lastSendMs = 0;
+        }
     }
 
-    // 2. Progress rows for buildings WE placed (~1 Hz, change-gated + 10 s
-    // safety resend while incomplete; the final complete row latches).
+    // Join retries are quiet once acknowledged. PLACE and REMOVE use the same
+    // request packet and monotonically increasing per-Join sequence space.
+    if (!ctx.isHost) {
+        for (std::map<Key, OwnBuild>::iterator it = ownBuilds_.begin();
+             it != ownBuilds_.end(); ++it) {
+            OwnBuild& ob = it->second;
+            if (!ob.haveAnn || ob.pendingPlaceSeq == 0 ||
+                !hostIntentRetryDue(now, ob.pendingPlaceSendMs, INTENT_RETRY_MS))
+                continue;
+            BuildIntentPacket p; memset(&p, 0, sizeof(p));
+            p.type = (u8)PKT_BUILD_INTENT; p.ownerId = ownerId;
+            p.seq = ob.pendingPlaceSeq; p.op = (u8)BUILD_INTENT_PLACE;
+            memcpy(p.key, ob.ann.key, sizeof(p.key));
+            strncpy(p.sid, ob.ann.sid, sizeof(p.sid) - 1);
+            p.x = ob.ann.x; p.y = ob.ann.y; p.z = ob.ann.z; p.yaw = ob.ann.yaw;
+            p.fromUi = ob.ann.fromUi;
+            bool retry = ob.pendingPlaceSendMs != 0;
+            ob.pendingPlaceSendMs = now;
+            net.queueBuildIntent(p);
+            char b[176];
+            _snprintf(b, sizeof(b) - 1,
+                      "[build] PLACE-INTENT key=%u.%u.%u.%u.%u seq=%u retry=%d",
+                      p.key[0], p.key[1], p.key[2], p.key[3], p.key[4],
+                      p.seq, retry ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        for (std::map<Key, BuildRemovePending>::iterator it = buildRemovePending_.begin();
+             it != buildRemovePending_.end(); ++it) {
+            BuildRemovePending& pending = it->second;
+            if (pending.seq == 0 ||
+                !hostIntentRetryDue(now, pending.lastSendMs, INTENT_RETRY_MS))
+                continue;
+            BuildIntentPacket p; memset(&p, 0, sizeof(p));
+            p.type = (u8)PKT_BUILD_INTENT; p.ownerId = ownerId;
+            p.seq = pending.seq; p.op = (u8)BUILD_INTENT_REMOVE;
+            p.key[0] = it->first.t; p.key[1] = it->first.c;
+            p.key[2] = it->first.cs; p.key[3] = it->first.i; p.key[4] = it->first.s;
+            bool retry = pending.lastSendMs != 0;
+            pending.lastSendMs = now;
+            net.queueBuildIntent(p);
+            char b[176];
+            _snprintf(b, sizeof(b) - 1,
+                      "[build] REMOVE-INTENT key=%u.%u.%u.%u.%u seq=%u retry=%d",
+                      p.key[0], p.key[1], p.key[2], p.key[3], p.key[4],
+                      p.seq, retry ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        // Placer-authored progress (protocol-27 semantics: progress for a
+        // building the SENDER placed). The intents merge dropped this leg -
+        // the Join ramped its site locally, the Host never learned and its
+        // own 0.0 rows reverted the owner's ramp (build_sync join leg, issue
+        // #81(b)). The Join streams its OWN placements to the Host, which
+        // applies them (applyBuilds) and re-publishes as the canonical
+        // sampler. Same packet and cadence shape as the Host rows below.
+        const unsigned long SAMPLE_MS = tuning_.buildSampleMs;
+        const unsigned long RESEND_MS = tuning_.buildResendMs;
+        if (!sync::gateSampleDue(now, buildSampleMs_, SAMPLE_MS)) return;
+        buildSampleMs_ = now;
+        const float EPS = 0.005f;
+        for (std::map<Key, OwnBuild>::iterator it = ownBuilds_.begin();
+             it != ownBuilds_.end(); ++it) {
+            OwnBuild& ob = it->second;
+            if (!ob.haveAnn || ob.removed || ob.doneSent) continue;
+            engine::BuildRead cur;
+            if (!engine::readBuildingByHand(ob.hand, &cur)) continue;
+            float dp = cur.progress - ob.lastProg;
+            bool changed = (dp > EPS || dp < -EPS) || (cur.complete != ob.lastComplete);
+            if (!sync::gateShouldSend(changed, now, ob.lastSendMs, /*minSendMs*/ 0,
+                                      RESEND_MS, /*resendUnsent*/ false))
+                continue;
+            ob.lastProg = cur.progress; ob.lastComplete = cur.complete;
+            ob.lastSendMs = now;
+            BuildStatePacket pkt;
+            memset(&pkt, 0, sizeof(pkt));
+            pkt.type     = (u8)PKT_BUILD_STATE;
+            pkt.ownerId  = ownerId;
+            pkt.seq      = buildSeqOut_++;
+            pkt.key[0] = it->first.t; pkt.key[1] = it->first.c;
+            pkt.key[2] = it->first.cs; pkt.key[3] = it->first.i;
+            pkt.key[4] = it->first.s;
+            pkt.progress = cur.progress;
+            pkt.complete = (u8)(cur.complete ? 1 : 0);
+            net.queueBuildState(pkt);
+            if (cur.complete) ob.doneSent = true;
+            if (changed) { // resends stay silent; the change is the signal
+                char b[176];
+                _snprintf(b, sizeof(b) - 1,
+                          "[build] STATE-SEND key=%u.%u.%u.%u.%u prog=%.3f complete=%u seq=%u",
+                          pkt.key[0], pkt.key[1], pkt.key[2], pkt.key[3], pkt.key[4],
+                          cur.progress, pkt.complete, pkt.seq);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        return; // the Host re-publishes these rows as the canonical sampler
+    }
+
+    // Host progress rows (~1 Hz, change-gated + 10 s safety resend while
+    // incomplete; the final complete row latches).
     const unsigned long SAMPLE_MS = tuning_.buildSampleMs;
     const unsigned long RESEND_MS = tuning_.buildResendMs;
-    unsigned long now = nowMs();
     if (!sync::gateSampleDue(now, buildSampleMs_, SAMPLE_MS)) return;
     buildSampleMs_ = now;
     const float EPS = 0.005f;
@@ -1608,7 +2291,9 @@ void Replicator::publishBuilds(const SyncContext& ctx) {
         pkt.type     = (u8)PKT_BUILD_STATE;
         pkt.ownerId  = ownerId;
         pkt.seq      = buildSeqOut_++;
-        for (unsigned int h = 0; h < 5; ++h) pkt.key[h] = ob.hand[h];
+        pkt.key[0] = it->first.t; pkt.key[1] = it->first.c;
+        pkt.key[2] = it->first.cs; pkt.key[3] = it->first.i;
+        pkt.key[4] = it->first.s;
         pkt.progress = cur.progress;
         pkt.complete = (u8)(cur.complete ? 1 : 0);
         net.queueBuildState(pkt);
@@ -1624,28 +2309,237 @@ void Replicator::publishBuilds(const SyncContext& ctx) {
     }
 }
 
+static bool validBuildPlaceIntent(const BuildIntentPacket& p) {
+    if (!p.sid[0] || !memchr(p.sid, '\0', sizeof(p.sid)) || p.fromUi > 1)
+        return false;
+    bool haveKey = false;
+    for (unsigned int i = 0; i < 5; ++i) if (p.key[i] != 0) haveKey = true;
+    if (!haveKey) return false;
+    const float POS_LIMIT = 1000000.0f;
+    if (!(p.x >= -POS_LIMIT && p.x <= POS_LIMIT) ||
+        !(p.y >= -POS_LIMIT && p.y <= POS_LIMIT) ||
+        !(p.z >= -POS_LIMIT && p.z <= POS_LIMIT) ||
+        !(p.yaw >= -1000.0f && p.yaw <= 1000.0f))
+        return false; // comparisons reject NaN and infinities too
+    return true;
+}
+
+void Replicator::applyBuildIntents(const SyncContext& ctx) {
+    std::deque<InboundBuildIntent> got;
+    ctx.in->drainBuildIntents(got);
+    if (got.empty() || !ctx.isHost || !buildSync_) return;
+    for (std::deque<InboundBuildIntent>::iterator it = got.begin();
+         it != got.end(); ++it) {
+        const BuildIntentPacket& p = it->pkt;
+        if (p.seq == 0 || p.ownerId == 0 || it->ownerId != p.ownerId ||
+            (p.op != BUILD_INTENT_PLACE && p.op != BUILD_INTENT_REMOVE))
+            continue;
+        Key k; k.t = p.key[0]; k.c = p.key[1]; k.cs = p.key[2];
+        k.i = p.key[3]; k.s = p.key[4];
+        std::pair<u32, Key> requestKey = std::make_pair(p.ownerId, k);
+
+        if (p.op == BUILD_INTENT_PLACE) {
+            u32& seen = buildPlaceIntentSeen_[requestKey];
+            std::map<Key, OwnBuild>::iterator found = ownBuilds_.find(k);
+            bool accepted = found != ownBuilds_.end() && !found->second.removed;
+            int rc = accepted ? 1 : 0;
+            if (hostIntentIsNew(seen, p.seq)) {
+                if (found == ownBuilds_.end() && validBuildPlaceIntent(p)) {
+                    unsigned int localHand[5] = { 0, 0, 0, 0, 0 };
+                    rc = engine::placeBuildingAt(ctx.gw, p.sid, p.x, p.y, p.z,
+                                                 p.yaw, false, localHand);
+                    if (rc == 1) {
+                        OwnBuild& ob = ownBuilds_[k];
+                        memcpy(ob.hand, localHand, sizeof(ob.hand));
+                        memset(&ob.ann, 0, sizeof(ob.ann));
+                        ob.ann.type = (u8)PKT_BUILD_PLACE;
+                        ob.ann.ownerId = ctx.localId;
+                        memcpy(ob.ann.key, p.key, sizeof(ob.ann.key));
+                        strncpy(ob.ann.sid, p.sid, sizeof(ob.ann.sid) - 1);
+                        ob.ann.x = p.x; ob.ann.y = p.y; ob.ann.z = p.z;
+                        ob.ann.yaw = p.yaw; ob.ann.fromUi = p.fromUi;
+                        ob.ann.accepted = 1; ob.haveAnn = true;
+                        // The placer authors this key's progress (protocol-27
+                        // semantics): the Host applies that Join's STATE rows
+                        // instead of reverting them with its own 0.0 samples.
+                        ob.progFromPeer = true; ob.progOwnerId = p.ownerId;
+                        Key local; local.t = localHand[0]; local.c = localHand[1];
+                        local.cs = localHand[2]; local.i = localHand[3];
+                        local.s = localHand[4];
+                        mintByLocal_[local] = k;
+                        found = ownBuilds_.find(k);
+                        accepted = true;
+                    }
+                    // Mint-log parity with the Join-side applyBuilds path (the
+                    // build_sync oracle and the mint-height gate read this
+                    // line; the intents world only logged PLACE-INTENT-APPLY).
+                    char mb[240];
+                    _snprintf(mb, sizeof(mb) - 1,
+                              "[build] MINT key=%u.%u.%u.%u.%u sid='%s' ui=%u rc=%d "
+                              "local=%u.%u.%u.%u.%u",
+                              p.key[0], p.key[1], p.key[2], p.key[3], p.key[4],
+                              p.sid, p.fromUi, rc, localHand[0], localHand[1],
+                              localHand[2], localHand[3], localHand[4]);
+                    mb[sizeof(mb) - 1] = '\0'; coop::logLine(mb);
+                }
+                // A placement rejection is final for this exact request. The
+                // Join removes its optimistic copy instead of retrying forever.
+                seen = p.seq;
+            }
+
+            BuildPlacePacket state;
+            memset(&state, 0, sizeof(state));
+            if (accepted && found != ownBuilds_.end() && found->second.haveAnn)
+                memcpy(&state, &found->second.ann, sizeof(state));
+            else {
+                memcpy(state.key, p.key, sizeof(state.key));
+                strncpy(state.sid, p.sid, sizeof(state.sid) - 1);
+                state.x = p.x; state.y = p.y; state.z = p.z;
+                state.yaw = p.yaw; state.fromUi = p.fromUi;
+            }
+            state.type = (u8)PKT_BUILD_PLACE;
+            state.ownerId = ctx.localId; state.seq = buildSeqOut_++;
+            state.accepted = accepted ? 1 : 0;
+            state.ackOwnerId = p.ownerId; state.ackSeq = seen;
+            ctx.net->queueBuildPlace(state);
+            char b[224];
+            _snprintf(b, sizeof(b) - 1,
+                      "[build] PLACE-INTENT-APPLY key=%u.%u.%u.%u.%u owner=%u "
+                      "req=%u accepted=%d rc=%d ack=%u",
+                      k.t, k.c, k.cs, k.i, k.s, p.ownerId, p.seq,
+                      accepted ? 1 : 0, rc, seen);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            continue;
+        }
+
+        u32& seen = buildRemoveIntentSeen_[requestKey];
+        std::map<Key, OwnBuild>::iterator found = ownBuilds_.find(k);
+        bool accepted = found != ownBuilds_.end() && found->second.removed;
+        bool transientFailure = false;
+        if (hostIntentIsNew(seen, p.seq)) {
+            if (!bdoorSync_ || found == ownBuilds_.end()) {
+                seen = p.seq; // permanent unknown/disabled rejection
+            } else if (found->second.removed) {
+                accepted = true; seen = p.seq;
+            } else {
+                bool ok = engine::destroyBuildingByHand(ctx.gw, found->second.hand);
+                if (ok) {
+                    found->second.removed = true;
+                    accepted = true; seen = p.seq;
+                } else {
+                    transientFailure = true; // ack=0 leaves the same seq pending
+                }
+            }
+        }
+        BuildRemovePacket state;
+        memset(&state, 0, sizeof(state));
+        state.type = (u8)PKT_BUILD_REMOVE; state.ownerId = ctx.localId;
+        state.seq = buildSeqOut_++;
+        state.key[0] = k.t; state.key[1] = k.c; state.key[2] = k.cs;
+        state.key[3] = k.i; state.key[4] = k.s;
+        state.accepted = accepted ? 1 : 0;
+        state.ackOwnerId = p.ownerId;
+        state.ackSeq = transientFailure ? 0 : seen;
+        ctx.net->queueBuildRemove(state);
+        char b[192];
+        _snprintf(b, sizeof(b) - 1,
+                  "[build] REMOVE-INTENT-APPLY key=%u.%u.%u.%u.%u owner=%u "
+                  "req=%u accepted=%d ack=%u",
+                  k.t, k.c, k.cs, k.i, k.s, p.ownerId, p.seq,
+                  accepted ? 1 : 0, state.ackSeq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
 void Replicator::applyBuilds(const SyncContext& ctx) {
     GameWorld* gw = ctx.gw; Inbound& in = *ctx.in;
-    // Announcements first (same-channel ordered-reliable means a STATE row
-    // never precedes its PLACE on the wire; keep that property here too).
-    std::deque<InboundBuildPlace> places;
-    in.drainBuildPlace(places);
-    std::deque<InboundBuildState> states;
-    in.drainBuildState(states);
+    std::deque<InboundBuildPlace> places; in.drainBuildPlace(places);
+    std::deque<InboundBuildState> states; in.drainBuildState(states);
+    std::deque<InboundBuildRemove> removes; in.drainBuildRemove(removes);
     if (!buildSync_) return;
+
+    if (ctx.isHost) {
+        // Placer-authored progress (protocol-27 semantics, restored after the
+        // intents merge): a Join streams the progress of ITS placements; the
+        // Host applies each row to the copy it minted from that Join's intent
+        // and its own sampler then re-publishes it as canonical state. Rows
+        // for keys the Host placed itself (or never minted) are not accepted:
+        // the placer is the only legitimate progress source for its key.
+        for (std::deque<InboundBuildState>::iterator it = states.begin();
+             it != states.end(); ++it) {
+            const BuildStatePacket& p = it->pkt;
+            Key k; k.t = p.key[0]; k.c = p.key[1]; k.cs = p.key[2];
+            k.i = p.key[3]; k.s = p.key[4];
+            std::map<Key, OwnBuild>::iterator own = ownBuilds_.find(k);
+            if (own == ownBuilds_.end() || own->second.removed ||
+                !own->second.progFromPeer || own->second.progOwnerId != it->ownerId)
+                continue;
+            OwnBuild& ob = own->second;
+            if (!sync::gateSeqAccept(ob.seqSeen, p.seq)) continue;
+            ob.seqSeen = p.seq;
+            engine::BuildRead cur;
+            if (engine::readBuildingByHand(ob.hand, &cur)) {
+                float d = cur.progress - p.progress;
+                if (d < 0.005f && d > -0.005f && cur.complete == (int)p.complete)
+                    continue;
+                if (cur.complete) continue;
+            }
+            engine::BuildRead post;
+            bool ok = engine::writeBuildProgressByHand(ob.hand, p.progress,
+                                                       p.complete != 0, &post);
+            char b[208];
+            _snprintf(b, sizeof(b) - 1,
+                      "[build] STATE-RECV key=%u.%u.%u.%u.%u prog=%.3f complete=%u "
+                      "ok=%d localProg=%.3f localComplete=%d seq=%u",
+                      p.key[0], p.key[1], p.key[2], p.key[3], p.key[4],
+                      p.progress, p.complete, ok ? 1 : 0,
+                      post.progress, post.complete, p.seq);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        return; // the Host receives no canonical PLACE/REMOVE rows (intents)
+    }
+
+    // Canonical placement first. If this key is the Join's optimistic local
+    // placement, adopt it in-place; otherwise mint the Host's placement.
     for (std::deque<InboundBuildPlace>::iterator it = places.begin();
          it != places.end(); ++it) {
         const BuildPlacePacket& p = it->pkt;
-        if (p.sid[0] == '\0') continue;
         Key k; k.t = p.key[0]; k.c = p.key[1]; k.cs = p.key[2];
         k.i = p.key[3]; k.s = p.key[4];
-        if (peerBuilds_.find(k) != peerBuilds_.end())
+        std::map<Key, OwnBuild>::iterator own = ownBuilds_.find(k);
+        bool settled = own != ownBuilds_.end() &&
+            hostIntentAckCovers(ctx.localId, own->second.pendingPlaceSeq,
+                                p.ackOwnerId, p.ackSeq);
+        if (!p.accepted) {
+            if (!settled) continue;
+            own->second.pendingPlaceSeq = 0;
+            own->second.pendingPlaceSendMs = 0;
+            if (!own->second.removed) {
+                engine::destroyBuildingByHand(gw, own->second.hand);
+                own->second.removed = true;
+            }
+            coop::logLine("[build] PLACE-REJECT optimistic site removed");
+            continue;
+        }
+        if (own != ownBuilds_.end()) {
+            if (settled) {
+                own->second.pendingPlaceSeq = 0;
+                own->second.pendingPlaceSendMs = 0;
+            }
+            continue; // the local committed preview is already this building
+        }
+        if (!p.sid[0]) continue;
+        std::map<Key, PeerBuild>::iterator existing = peerBuilds_.find(k);
+        if (existing != peerBuilds_.end()) {
+            // A PLACE safety resend is also an ownership retry.  The factory
+            // mint may succeed one tick before the ownership subsystem is
+            // ready; deduping the packet must not leave a permanent orphan.
+            ensurePeerBuildOwnership(gw, k, existing->second);
             continue; // already minted (or mint already refused) - dedupe
+        }
         PeerBuild& pb = peerBuilds_[k];
-        // Mint INCOMPLETE always: the placer's STATE rows drive progress from
-        // here (a real UI placement starts at 0 anyway).
         int rc = engine::placeBuildingAt(gw, p.sid, p.x, p.y, p.z, p.yaw,
-                                         /*completed*/false, pb.localHand);
+                                         false, pb.localHand);
         pb.minted = (rc == 1) ? 1 : 0;
         if (pb.minted) {
             // Reverse translation (protocol 28): the door sampler and the
@@ -1653,42 +2547,48 @@ void Replicator::applyBuilds(const SyncContext& ctx) {
             Key lk; lk.t = pb.localHand[0]; lk.c = pb.localHand[1];
             lk.cs = pb.localHand[2]; lk.i = pb.localHand[3]; lk.s = pb.localHand[4];
             mintByLocal_[lk] = k;
+            ensurePeerBuildOwnership(gw, k, pb);
         }
         char b[240];
         _snprintf(b, sizeof(b) - 1,
                   "[build] MINT key=%u.%u.%u.%u.%u sid='%s' ui=%u rc=%d "
                   "local=%u.%u.%u.%u.%u",
                   p.key[0], p.key[1], p.key[2], p.key[3], p.key[4],
-                  p.sid, p.fromUi, rc,
-                  pb.localHand[0], pb.localHand[1], pb.localHand[2],
-                  pb.localHand[3], pb.localHand[4]);
+                  p.sid, p.fromUi, rc, pb.localHand[0], pb.localHand[1],
+                  pb.localHand[2], pb.localHand[3], pb.localHand[4]);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
+
     for (std::deque<InboundBuildState>::iterator it = states.begin();
          it != states.end(); ++it) {
         const BuildStatePacket& p = it->pkt;
         Key k; k.t = p.key[0]; k.c = p.key[1]; k.cs = p.key[2];
         k.i = p.key[3]; k.s = p.key[4];
-        std::map<Key, PeerBuild>::iterator f = peerBuilds_.find(k);
-        if (f == peerBuilds_.end() || !f->second.minted)
-            continue; // mint refused or key unknown - skip silently
-        PeerBuild& pb = f->second;
-        if (pb.removed) continue; // tombstoned (REMOVE already applied)
-        if (!sync::gateSeqAccept(pb.seqSeen, p.seq)) continue; // stale/dup row
-        pb.seqSeen = p.seq;
+        const unsigned int* localHand = 0; u32* seqSeen = 0;
+        std::map<Key, OwnBuild>::iterator own = ownBuilds_.find(k);
+        if (own != ownBuilds_.end() && !own->second.removed) {
+            localHand = own->second.hand; seqSeen = &own->second.seqSeen;
+        } else {
+            std::map<Key, PeerBuild>::iterator peer = peerBuilds_.find(k);
+            if (peer != peerBuilds_.end() && peer->second.minted && !peer->second.removed) {
+                // Retry before the seq gate: even a duplicate safety row is
+                // useful if the previous ownership write ran before the
+                // engine was ready.
+                ensurePeerBuildOwnership(gw, k, peer->second);
+                localHand = peer->second.localHand; seqSeen = &peer->second.seqSeen;
+            }
+        }
+        if (!localHand || !seqSeen || !sync::gateSeqAccept(*seqSeen, p.seq)) continue;
+        *seqSeen = p.seq;
         engine::BuildRead cur;
-        if (engine::readBuildingByHand(pb.localHand, &cur)) {
+        if (engine::readBuildingByHand(localHand, &cur)) {
             float d = cur.progress - p.progress;
-            bool progClose = (d < 0.005f && d > -0.005f);
-            if (progClose && cur.complete == (int)p.complete)
-                continue; // already converged (resend)
-            if (cur.complete) continue; // completion is latched locally
+            if (d < 0.005f && d > -0.005f && cur.complete == (int)p.complete)
+                continue;
+            if (cur.complete) continue;
         }
         engine::BuildRead post;
-        // The placer's own isComplete drives completion here - see the note on
-        // writeBuildProgressByHand. Inferring it from progress crossing 1.0
-        // finished the peer's copy long before the placer's.
-        bool ok = engine::writeBuildProgressByHand(pb.localHand, p.progress,
+        bool ok = engine::writeBuildProgressByHand(localHand, p.progress,
                                                    p.complete != 0, &post);
         char b[208];
         _snprintf(b, sizeof(b) - 1,
@@ -1700,31 +2600,41 @@ void Replicator::applyBuilds(const SyncContext& ctx) {
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
-    // Removals (protocol 28, placer-authoritative): destroy the mapped proxy
-    // through the engine's own GameWorld::destroy and tombstone the entry so
-    // any late STATE/DOOR rows for the key skip silently. Gated on bdoorSync
-    // (the removal channel ships with the placed-door slice).
-    std::deque<InboundBuildRemove> removes;
-    in.drainBuildRemove(removes);
     if (!bdoorSync_) return;
     for (std::deque<InboundBuildRemove>::iterator it = removes.begin();
          it != removes.end(); ++it) {
         const BuildRemovePacket& p = it->pkt;
         Key k; k.t = p.key[0]; k.c = p.key[1]; k.cs = p.key[2];
         k.i = p.key[3]; k.s = p.key[4];
-        std::map<Key, PeerBuild>::iterator f = peerBuilds_.find(k);
-        if (f == peerBuilds_.end() || !f->second.minted || f->second.removed)
-            continue; // never minted here or already gone - nothing to remove
-        PeerBuild& pb = f->second;
-        pb.removed = true;
-        bool ok = engine::destroyBuildingByHand(gw, pb.localHand);
+        std::map<Key, BuildRemovePending>::iterator pending = buildRemovePending_.find(k);
+        if (pending != buildRemovePending_.end() &&
+            hostIntentAckCovers(ctx.localId, pending->second.seq,
+                                p.ackOwnerId, p.ackSeq))
+            buildRemovePending_.erase(pending);
+        if (!p.accepted) continue;
+
+        unsigned int localHand[5] = { 0, 0, 0, 0, 0 };
+        bool have = false; bool already = false;
+        std::map<Key, OwnBuild>::iterator own = ownBuilds_.find(k);
+        if (own != ownBuilds_.end()) {
+            memcpy(localHand, own->second.hand, sizeof(localHand));
+            already = own->second.removed; own->second.removed = true; have = true;
+        } else {
+            std::map<Key, PeerBuild>::iterator peer = peerBuilds_.find(k);
+            if (peer != peerBuilds_.end() && peer->second.minted) {
+                memcpy(localHand, peer->second.localHand, sizeof(localHand));
+                already = peer->second.removed; peer->second.removed = true; have = true;
+            }
+        }
+        if (!have) continue;
+        bool ok = already || engine::destroyBuildingByHand(gw, localHand);
         char b[192];
         _snprintf(b, sizeof(b) - 1,
                   "[build] REMOVE-RECV key=%u.%u.%u.%u.%u ok=%d "
                   "local=%u.%u.%u.%u.%u seq=%u",
                   p.key[0], p.key[1], p.key[2], p.key[3], p.key[4], ok ? 1 : 0,
-                  pb.localHand[0], pb.localHand[1], pb.localHand[2],
-                  pb.localHand[3], pb.localHand[4], p.seq);
+                  localHand[0], localHand[1], localHand[2], localHand[3],
+                  localHand[4], p.seq);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }
@@ -1749,18 +2659,47 @@ void Replicator::driveSampledChannels(const SyncContext& ctx) {
         ChFn               apply;
         bool               hostAuth; // true = host publishes / join applies
     };
+    // Protocol 58 command path runs before canonical state sampling: the Join
+    // captures its local interaction promptly, while the Host validates queued
+    // intents before it samples/publishes the resulting door state.
+    if (ctx.isHost) {
+        if (doorSync_ || (buildSync_ && bdoorSync_))
+            applyDoorIntents(ctx);
+    } else {
+        if (doorSync_) publishDoors(ctx);
+        if (buildSync_ && bdoorSync_) publishBuildDoors(ctx);
+    }
+    // Requests must land before this tick's Host sample so the resulting
+    // placement/removal and progress state are published in canonical order.
+    if (ctx.isHost && buildSync_) applyBuildIntents(ctx);
     static const Desc kCh[] = {
         { &Replicator::factionSync_,  0,                     &Replicator::publishFactions,   &Replicator::applyFactions,   false },
-        { &Replicator::doorSync_,     0,                     &Replicator::publishDoors,      &Replicator::applyDoors,      false },
+        { &Replicator::doorSync_,     0,                     &Replicator::publishDoors,      &Replicator::applyDoors,      true  },
         { &Replicator::buildSync_,    0,                     &Replicator::publishBuilds,     &Replicator::applyBuilds,     false },
-        { &Replicator::buildSync_,    &Replicator::bdoorSync_, &Replicator::publishBuildDoors, &Replicator::applyBuildDoors, false },
+        { &Replicator::buildSync_,    &Replicator::bdoorSync_, &Replicator::publishBuildDoors, &Replicator::applyBuildDoors, true },
         // Ahead of prod deliberately: prod rows resolve THROUGH the fixture map,
         // so a pairing that arrives this tick is usable by the very next row.
         { &Replicator::fixtureSync_,  0,                     &Replicator::publishFixtures,   &Replicator::applyFixtures,   false },
         { &Replicator::prodSync_,     0,                     &Replicator::publishProd,       &Replicator::applyProd,       true  },
-        { &Replicator::researchSync_, 0,                     &Replicator::publishResearch,   &Replicator::applyResearch,   true  },
-        { &Replicator::deedSync_,     0,                     &Replicator::publishDeeds,      &Replicator::applyDeeds,      false }
+        // Research runs as a SYMMETRIC grow-only union (ResearchUnion.h): both
+        // sides publish their known set AND apply the peer's. Knowing a sid
+        // can never be un-known, so the union converges without arbitration
+        // and a research completed by the JOIN now reaches the host (it was
+        // hostAuth=true, one-directional host->join).
+        { &Replicator::researchSync_, 0,                     &Replicator::publishResearch,   &Replicator::applyResearch,   researchChannelHostAuth() },
+        { &Replicator::deedSync_,     0,                     &Replicator::publishDeeds,      &Replicator::applyDeeds,      false },
+        // Bounty/crime (protocol 62, PR #18): host-authoritative, unidirectional
+        // host->clients (the join NEVER publishes its bounty state) - so hostAuth
+        // = true, exactly like prod. After research/deeds, as the old tick had.
+        { &Replicator::bountySync_,   0,                     &Replicator::publishBounties,   &Replicator::applyBounties,   true  }
     };
+    // Protocol 56 command path brackets the ordinary host-authoritative state
+    // row: join observes its UI choice before an older host row can reconcile it;
+    // host validates queued intents before it samples/publishes canonical state.
+    if (prodSync_) {
+        if (ctx.isHost) applyProdIntents(ctx);
+        else            publishProdIntents(ctx);
+    }
     const int n = (int)(sizeof(kCh) / sizeof(kCh[0]));
     for (int i = 0; i < n; ++i) {
         const Desc& d = kCh[i];
@@ -1795,12 +2734,16 @@ void Replicator::onPeerConnected(NetLink& net, u32 ownerId) {
                 pkt.type    = (u8)PKT_BUILD_REMOVE;
                 pkt.ownerId = ownerId;
                 pkt.seq     = buildSeqOut_++;
-                for (unsigned int h = 0; h < 5; ++h) pkt.key[h] = ob.hand[h];
+                pkt.key[0] = it->first.t; pkt.key[1] = it->first.c;
+                pkt.key[2] = it->first.cs; pkt.key[3] = it->first.i;
+                pkt.key[4] = it->first.s; pkt.accepted = 1;
                 net.queueBuildRemove(pkt);
                 ++nRemove;
             } else {
                 ob.ann.ownerId = ownerId;
                 ob.ann.seq     = buildSeqOut_++;
+                ob.ann.accepted = 1;
+                ob.ann.ackOwnerId = 0; ob.ann.ackSeq = 0;
                 net.queueBuildPlace(ob.ann);
                 // Un-latch the STATE row: the next publishBuilds sample sees
                 // "changed" against the reset baseline and sends one fresh
@@ -1868,8 +2811,9 @@ void Replicator::onPeerConnected(NetLink& net, u32 ownerId) {
 void Replicator::publishBuildDoors(const SyncContext& ctx) {
     NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
     if (!bdoorSync_) return;
-    const unsigned long SAMPLE_MS = tuning_.bdoorSampleMs; // the protocol-26 door cadence
+    const unsigned long SAMPLE_MS = ctx.isHost ? tuning_.bdoorSampleMs : 200;
     const unsigned long RESEND_MS = tuning_.bdoorResendMs; // safety resend for rows ever sent
+    const unsigned long RETRY_MS  = 2000;
     unsigned long now = nowMs();
     if (!sync::gateSampleDue(now, bdoorSampleMs_, SAMPLE_MS)) return;
     bdoorSampleMs_ = now;
@@ -1905,6 +2849,45 @@ void Replicator::publishBuildDoors(const SyncContext& ctx) {
                 }
                 bool changed = (dr.open != row.knownOpen) ||
                                (dr.locked != row.knownLocked);
+                if (!ctx.isHost) {
+                    bool samePending = row.pendingSeq != 0 &&
+                                       row.pendingOpen == dr.open &&
+                                       row.pendingLocked == dr.locked;
+                    bool newChoice = row.pendingSeq == 0 ? changed : !samePending;
+                    if (!newChoice && row.pendingSeq == 0) continue;
+                    if (!newChoice &&
+                        !hostIntentRetryDue(now, row.pendingSendMs, RETRY_MS))
+                        continue;
+                    if (newChoice) {
+                        row.pendingSeq = bdoorSeqOut_++;
+                        row.pendingOpen = dr.open;
+                        row.pendingLocked = dr.locked;
+                    }
+                    DoorIntentPacket intent;
+                    memset(&intent, 0, sizeof(intent));
+                    intent.type = (u8)PKT_DOOR_INTENT;
+                    intent.ownerId = ownerId;
+                    intent.seq = row.pendingSeq;
+                    intent.keyKind = 1;
+                    intent.key[0] = wireKey->t; intent.key[1] = wireKey->c;
+                    intent.key[2] = wireKey->cs; intent.key[3] = wireKey->i;
+                    intent.key[4] = wireKey->s;
+                    intent.doorIndex = (u8)di;
+                    intent.open = (u8)(row.pendingOpen ? 1 : 0);
+                    intent.locked = (u8)(row.pendingLocked ? 1 : 0);
+                    row.pendingSendMs = now;
+                    net.queueDoorIntent(intent);
+                    char b[192];
+                    _snprintf(b, sizeof(b) - 1,
+                              "[bdoor] INTENT SEND key=%u.%u.%u.%u.%u idx=%u "
+                              "open=%u locked=%u seq=%u retry=%d",
+                              intent.key[0], intent.key[1], intent.key[2],
+                              intent.key[3], intent.key[4], intent.doorIndex,
+                              intent.open, intent.locked, intent.seq,
+                              newChoice ? 0 : 1);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    continue;
+                }
                 // Seeded silently above (resendUnsent=false); like protocol-26
                 // doors, only a real toggle or a post-send resend crosses.
                 if (!sync::gateShouldSend(changed, now, row.lastSendMs,
@@ -1924,6 +2907,8 @@ void Replicator::publishBuildDoors(const SyncContext& ctx) {
                 pkt.doorIndex = (u8)di;
                 pkt.open    = (u8)(dr.open ? 1 : 0);
                 pkt.locked  = (u8)(dr.locked ? 1 : 0);
+                pkt.ackOwnerId = 0;
+                pkt.ackSeq = 0;
                 net.queueBuildDoor(pkt);
                 if (changed) { // resends stay silent; the change is the signal
                     char b[176];
@@ -1960,12 +2945,20 @@ void Replicator::applyBuildDoors(const SyncContext& ctx) {
                 localHand = pit->second.localHand;
         }
         BdoorRow& row = bdoorRows_[std::make_pair(k, (int)p.doorIndex)];
-        if (!sync::gateSeqAccept(row.seqSeen, p.seq)) continue; // stale/dup row
-        row.seqSeen = p.seq;
-        // Updating the baseline FIRST is the echo guard: the local change this
-        // write causes must not be re-detected as ours next sample.
+        // Per-sender stale guard (StaleGuard.h, prototest testStaleGuard):
+        // the comparison is against the newest seq seen FROM THIS SENDER,
+        // not a shared high-water mark.
+        if (!staleRowAccept(row.seqSeen, p.ownerId, p.seq)) continue;
+        bool settled = hostIntentAckCovers(ctx.localId, row.pendingSeq,
+                                           p.ackOwnerId, p.ackSeq);
+        if (settled) {
+            row.pendingSeq = 0; row.pendingOpen = row.pendingLocked = -1;
+            row.pendingSendMs = 0;
+        }
+        bool hold = row.pendingSeq != 0;
         row.knownOpen = (int)p.open; row.knownLocked = (int)p.locked;
         row.seeded = true;
+        if (hold) continue;
         if (!localHand) continue; // unknown/tombstoned key - skip silently
         engine::DoorRead cur;
         if (!engine::readDoorOfBuilding(localHand, p.doorIndex, &cur))
@@ -2127,10 +3120,79 @@ void Replicator::publishSquadMoves(GameWorld* gw, NetLink& net, u32 ownerId) {
         pinOwned_.erase(ok);
         pinPeer_.erase(ok);
         // Pin ownership BEFORE the wire (the recruit pattern): every edge
-        // polled from OUR roster is OUR user's action, so the new hand
-        // publishes from this side no matter which rank its container latched
-        // to (an appended tab inherits our ownership through this pin).
-        if (!exited) pinOwned_.insert(nk);
+        // polled from OUR roster is OUR user's action, so by DEFAULT the new
+        // hand publishes from this side no matter which rank its container
+        // latched to (an appended tab inherits our ownership through this pin).
+        //
+        // Author-side control-release (SYNC_GAPS gap 10, 2026-07-17 remaining
+        // edge): a move INTO a tab the PEER owns is the control hand-off in
+        // the opposite direction - the receiver's rekeyPeerBody already
+        // CLAIMS it (the destOwned CONTROL-FLIP), but claiming it here too
+        // kept the author streaming its stationary copy forever, so the new
+        // owner's move orders fought the ghost stream (the walk-gait / slow
+        // drive that only a save+reload re-anchored; recruit_ctl Phase B is
+        // ADVISORY for this reason). Release (pin PEER) instead of claim when
+        // BOTH hold:
+        //   * the destination container maps, in the LATCHED partition, to a
+        //     rank we do NOT own (rekeyPeerBody's destOwned predicate), AND
+        //   * the destination tab already holds a member we do NOT stream
+        //     (allSquad_ minus ownHands_, both refreshed by publishOwned
+        //     earlier this same tick) that is not itself one of this batch's
+        //     post-move hands - positive evidence the tab is genuinely the
+        //     peer's. A tab WE just appended (createSquad: rank outside BOTH
+        //     ownRanks_ sets, sole occupants = this batch's movers) shows no
+        //     such member and still pins owned.
+        // A hand the receive half already classified peer (pinPeer_, stamped
+        // by rekeyPeerBody/insertPeerMember - this edge is the engine's echo
+        // of that insertion, not a user drag) always stays peer. Everything
+        // ambiguous falls back to the legacy claim: that failure mode is the
+        // known reload-to-re-anchor workaround, never an unowned unit.
+        // TOKELACOOP_XFER_RELEASE=0 restores the legacy unconditional claim.
+        if (!exited) {
+            static int xferRel = -1;
+            if (xferRel < 0) { const char* e = getenv("TOKELACOOP_XFER_RELEASE"); xferRel = (e && e[0] == '0') ? 0 : 1; }
+            bool release = pinPeer_.find(nk) != pinPeer_.end(); // receive-half echo stays peer
+            if (!release && xferRel == 1) {
+                std::map<std::pair<u32, u32>, unsigned int>::const_iterator rit =
+                    tabRank_.find(std::make_pair((u32)nk.c, (u32)nk.cs));
+                if (rit != tabRank_.end()) {
+                    bool rankOwned = ownRanks_.empty() ? (rit->second == 0u)
+                                                       : (ownRanks_.count(rit->second) != 0);
+                    if (!rankOwned) {
+                        // Peer-evidence scan: another member already sitting in
+                        // the destination container that we do not stream and
+                        // that is not a sibling mover from this same batch.
+                        for (std::set<Key>::const_iterator sit = allSquad_.begin();
+                             sit != allSquad_.end() && !release; ++sit) {
+                            if (sit->c != nk.c || sit->cs != nk.cs) continue;
+                            if (!(*sit < nk) && !(nk < *sit)) continue; // the mover itself
+                            if (ownHands_.find(*sit) != ownHands_.end()) continue;
+                            bool inBatch = false;
+                            for (unsigned int j = 0; j < n; ++j) {
+                                if (sit->t == edges[j].after[0] &&
+                                    sit->c == edges[j].after[1] &&
+                                    sit->cs == edges[j].after[2] &&
+                                    sit->i == edges[j].after[3] &&
+                                    sit->s == edges[j].after[4]) { inBatch = true; break; }
+                            }
+                            if (inBatch) continue;
+                            release = true;
+                        }
+                    }
+                }
+            }
+            if (release) {
+                pinPeer_.insert(nk);
+                char rl[176];
+                _snprintf(rl, sizeof(rl) - 1,
+                          "[squad] XFER-RELEASE new=%u,%u,%u,%u,%u (dest tab is "
+                          "peer-owned; pin peer, stop streaming)",
+                          nk.t, nk.c, nk.cs, nk.i, nk.s);
+                rl[sizeof(rl) - 1] = '\0'; coop::logLine(rl);
+            } else {
+                pinOwned_.insert(nk);
+            }
+        }
         // ...and if it LEFT, retire the hand so the peer's in-flight tail cannot
         // turn our departed body into a driven one (see exitedOwn_).
         else exitedOwn_[ok] = nowSq;

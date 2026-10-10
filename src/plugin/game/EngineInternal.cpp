@@ -96,6 +96,7 @@ SaveMgrExecFn g_saveMgrExecFn = 0;
 // edge is forwarded to the host as PKT_SAVE_REQ by the Plugin instead.
 std::vector<SaveEdgeRec> g_saveEdges;
 bool g_saveSuppressAll = false;
+bool g_saveBypassEdgeOnce = false;
 SaveMgrSaveNameFn g_saveHookOrig = 0;
 
 void __fastcall saveMgrSave_hook(SaveManager* self, const std::string* name,
@@ -109,19 +110,29 @@ void __fastcall saveMgrSave_hook(SaveManager* self, const std::string* name,
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { nm[0] = '\0'; }
     const bool suppress = g_saveSuppressAll;
+    const bool bypassEdge = g_saveBypassEdgeOnce;
+    g_saveBypassEdgeOnce = false;
     if (!suppress) g_saveHookOrig(self, name, autosave);
     __try {
-        SaveEdgeRec r;
-        memset(&r, 0, sizeof(r));
-        strncpy(r.name, nm, sizeof(r.name) - 1);
-        r.autosave   = autosave ? 1 : 0;
-        r.suppressed = suppress ? 1 : 0;
-        if (g_saveEdges.size() < 8) g_saveEdges.push_back(r);
-        char b[144];
-        _snprintf(b, sizeof(b) - 1,
-                  "[save] LOCAL-SAVE name='%s' autosave=%d suppressed=%d",
-                  r.name, r.autosave, r.suppressed);
-        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (!bypassEdge) {
+            SaveEdgeRec r;
+            memset(&r, 0, sizeof(r));
+            strncpy(r.name, nm, sizeof(r.name) - 1);
+            r.autosave   = autosave ? 1 : 0;
+            r.suppressed = suppress ? 1 : 0;
+            if (g_saveEdges.size() < 8) g_saveEdges.push_back(r);
+            char b[144];
+            _snprintf(b, sizeof(b) - 1,
+                      "[save] LOCAL-SAVE name='%s' autosave=%d suppressed=%d",
+                      r.name, r.autosave, r.suppressed);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        } else {
+            char b[128];
+            _snprintf(b, sizeof(b) - 1,
+                      "[save] FENCED-RESAVE name='%s' autosave=%d",
+                      nm, autosave ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
@@ -1249,6 +1260,21 @@ struct ReportedDmg { float flesh; float blood; ReportedDmg() : flesh(0.0f), bloo
 std::map<Character*, ReportedDmg> g_reportedDmg;
 std::set<Character*>              g_reportAttackers;
 bool                              g_combatReport = false;
+std::map<Character*, float>       g_reportedKnockouts;
+bool                              g_suppressKnockoutReport = false;
+
+MedFloatFn g_knockoutOrig = 0;
+void __fastcall knockout_hook(MedicalSystem* self, float skill) {
+    Character* victim = 0;
+    if (g_combatReport && !g_suppressKnockoutReport) {
+        for (std::set<Character*>::iterator it = g_damageGuarded.begin();
+             it != g_damageGuarded.end(); ++it) {
+            if (&(*it)->medical == self) { victim = *it; break; }
+        }
+    }
+    g_knockoutOrig(self, skill);
+    if (victim) g_reportedKnockouts[victim] = skill;
+}
 
 // Host side of the same report. The friend's squad copies the host drives replay
 // the friend's fight, so their swings also landed NATIVELY on the host's real
@@ -1376,6 +1402,9 @@ RelGetFn         g_relGetFn       = 0; // protocol 24 relation read
 RelSetFn         g_relSetFn       = 0; // protocol 24 relation write
 RelBoolFn        g_relIsEnemyFn   = 0; // protocol 24 derived hostility flag
 RelBoolFn        g_relIsAllyFn    = 0; // protocol 24 derived alliance flag
+BountyAddFn      g_bountyAddFn    = 0; // protocol 62 bounty raise lever
+BountyClearFn    g_bountyClearFn  = 0; // protocol 62 bounty clear lever
+BountyGetFn      g_bountyGetFn    = 0; // protocol 62 bounty read lever
 
 // The faction's GameData stringID - the save-stable cross-client identity
 // (protocol 21 already round-trips it for proxy spawns). "" when unreadable.
@@ -1771,6 +1800,14 @@ void resolve() {
     g_relSetFn     = (RelSetFn)KenshiLib::GetRealAddress(&FactionRelations::setRelation);
     g_relIsEnemyFn = (RelBoolFn)KenshiLib::GetRealAddress(&FactionRelations::isEnemy);
     g_relIsAllyFn  = (RelBoolFn)KenshiLib::GetRealAddress(&FactionRelations::isAlly);
+    // Bounty/crime write levers (protocol 62 groundwork; non-fatal: unresolved
+    // -> applyBountyRow no-ops and the channel logs the gap on first apply).
+    g_bountyAddFn   = (BountyAddFn)KenshiLib::GetRealAddress(&BountyManager::unfairAddToBounty);
+    g_bountyClearFn = (BountyClearFn)KenshiLib::GetRealAddress(&BountyManager::clearBounty);
+    g_bountyGetFn   = (BountyGetFn)KenshiLib::GetRealAddress(&BountyManager::getActualBounty);
+    if (!g_bountyAddFn || !g_bountyClearFn || !g_bountyGetFn)
+        coop::logErrLine("engine: could not resolve bounty write levers (bounty sync off)");
+
     // Honest pose oracle reads (non-fatal).
     g_getBip01Fn   = (GetBip01Fn)KenshiLib::GetRealAddress(&Character::getPositionBip01);
     g_getBoneWorldFn = (GetBoneWorldPosFn)KenshiLib::GetRealAddress(&Character::getBoneWorldPosition);
@@ -2114,6 +2151,9 @@ bool installSaveHook() {
 
 void setSaveSuppress(bool on) { g_saveSuppressAll = on; }
 
+void setSaveEdgeBypassOnce() { g_saveBypassEdgeOnce = true; }
+void clearSaveEdgeBypass() { g_saveBypassEdgeOnce = false; }
+
 unsigned int drainSaveEdges(SaveEdge* out, unsigned int maxOut) {
     unsigned int n = 0;
     for (unsigned int i = 0; i < g_saveEdges.size() && n < maxOut; ++i, ++n) {
@@ -2182,6 +2222,13 @@ bool installDamageGuardHook() {
     if (!addr) return false;
     return KenshiLib::AddHook(addr, (void*)&hitByMelee_hook,
                               (void**)&g_hitByMeleeOrig) == KenshiLib::SUCCESS;
+}
+
+bool installKnockoutReportHook() {
+    intptr_t addr = KenshiLib::GetRealAddress(&MedicalSystem::knockout);
+    if (!addr) return false;
+    return KenshiLib::AddHook(addr, (void*)&knockout_hook,
+                              (void**)&g_knockoutOrig) == KenshiLib::SUCCESS;
 }
 
 bool installShopHook() {
@@ -2444,7 +2491,10 @@ void damageGuardStats(unsigned long* outGuarded, unsigned long* outPassed) {
 
 void setCombatReport(bool on) {
     g_combatReport = on;
-    if (!on) g_reportedDmg.clear();
+    if (!on) {
+        g_reportedDmg.clear();
+        g_reportedKnockouts.clear();
+    }
 }
 void clearReportAttackers()          { g_reportAttackers.clear(); }
 void addReportAttacker(Character* c)  { if (c) g_reportAttackers.insert(c); }
@@ -2458,6 +2508,14 @@ bool takeReportedDamage(Character* c, float* outFlesh, float* outBlood) {
     if (outFlesh) *outFlesh = it->second.flesh;
     if (outBlood) *outBlood = it->second.blood;
     g_reportedDmg.erase(it);
+    return true;
+}
+
+bool takeReportedKnockout(Character* c, float* outSkill) {
+    std::map<Character*, float>::iterator it = g_reportedKnockouts.find(c);
+    if (it == g_reportedKnockouts.end()) return false;
+    if (outSkill) *outSkill = it->second;
+    g_reportedKnockouts.erase(it);
     return true;
 }
 

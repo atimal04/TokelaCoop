@@ -16,7 +16,7 @@
   Exit code 0 = done, 1 = something could not be changed (Kenshi still open?).
 
 .EXAMPLE
-  powershell -ExecutionPolicy Bypass -File scripts\migrate_install.ps1 -KenshiDir "C:\Program Files (x86)\Steam\steamapps\common\Kenshi"
+  powershell -ExecutionPolicy Bypass -File scripts\migrate_install.ps1 -KenshiDir "<your Kenshi folder>"
 #>
 [CmdletBinding()]
 param([Parameter(Mandatory = $true)][string]$KenshiDir)

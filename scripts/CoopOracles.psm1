@@ -20,6 +20,14 @@
 # clocks disagree. Logs without CLOCKSYNC lines get offset 0 (the legacy
 # same-machine behaviour).
 
+# Culture: every log the plugin writes formats numbers with '.' (C++ printf),
+# and every oracle here parses those numbers back with [double] casts. Under a
+# comma-decimal locale (es-ES, de-DE, ...) both the casts and any -f formatting
+# in fixtures silently misread "109.00", so the whole library pins the calling
+# thread to InvariantCulture at import: one place, every parse/format below is
+# covered, and live-run analysis gets the same guarantee.
+[System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::InvariantCulture
+
 # ---- Gate result infrastructure ---------------------------------------------
 
 $script:Gates = New-Object System.Collections.ArrayList
@@ -155,6 +163,7 @@ function Invoke-OneOracle {
         "save_probe"     { return (Test-SaveProbe      -HostFile $HostLog -JoinFile $JoinLog) }
         "load_probe"     { return (Test-LoadProbe      -HostFile $HostLog -JoinFile $JoinLog) }
         "save_sync"      { return (Test-SaveSync       -HostFile $HostLog -JoinFile $JoinLog) }
+        "save_squadmeta" { return (Test-SaveSquadMeta  -HostFile $HostLog -JoinFile $JoinLog) }
         "save_resume"    { return (Test-SaveResume     -HostFile $HostLog -JoinFile $JoinLog) }
         "load_sync"      { return (Test-LoadSync       -HostFile $HostLog -JoinFile $JoinLog) }
         "money_persist"  { return (Test-MoneyPersist   -HostFile $HostLog -JoinFile $JoinLog) }
@@ -166,6 +175,7 @@ function Invoke-OneOracle {
         "research_sync"  { return (Test-ResearchSync   -HostFile $HostLog -JoinFile $JoinLog) }
         "store_probe"    { return (Test-StoreProbe     -HostFile $HostLog -JoinFile $JoinLog) }
         "store_sync"     { return (Test-StoreSync      -HostFile $HostLog -JoinFile $JoinLog) }
+        "store_join_add" { return (Test-StoreJoinAdd   -HostFile $HostLog -JoinFile $JoinLog) }
         "squad_probe"    { return (Test-SquadProbe     -HostFile $HostLog -JoinFile $JoinLog) }
         "squad_sync"     { return (Test-SquadSync      -HostFile $HostLog -JoinFile $JoinLog) }
         "spawn_sync"    { return (Test-SpawnSync       -HostFile $HostLog -JoinFile $JoinLog -Tol $Tolerance) }
@@ -191,6 +201,7 @@ function Invoke-OneOracle {
         "assault_travel" { return (Test-AssaultTravel  -HostFile $HostLog -JoinFile $JoinLog) }
         "assault_mint"  { return (Test-AssaultTravel  -HostFile $HostLog -JoinFile $JoinLog -GateName 'assault_mint' -RequireMint) }
         "mint_aggro"    { return (Test-MintAggro      -HostFile $HostLog -JoinFile $JoinLog) }
+        "npc_aggro"     { return (Test-NpcAggro       -HostFile $HostLog -JoinFile $JoinLog) }
         "proxy_drift"   { return (Test-ProxyDrift     -JoinFile $JoinLog) }
         "pc_assault"    { return (Test-PcAssault       -HostFile $HostLog -JoinFile $JoinLog) }
         "player_ko"     { return (Test-PlayerKo        -HostFile $HostLog -JoinFile $JoinLog) }
@@ -243,6 +254,7 @@ function Invoke-OneOracle {
         "world_item_burst" { return (Test-WorldItemBurst -HostFile $HostLog -JoinFile $JoinLog) }
         "world_item_stale" { return (Test-WorldItemStale -HostFile $HostLog -JoinFile $JoinLog) }
         "nested_bag"    { return (Test-NestedBag       -HostFile $HostLog -JoinFile $JoinLog) }
+        "rejoin_bag"    { return (Test-RejoinBag       -HostFile $HostLog -JoinFile $JoinLog) }
         "dump_all"      { return (Test-DumpAll         -HostFile $HostLog -JoinFile $JoinLog) }
         "no_phantom_pickups" { return (Test-NoPhantomPickups -HostFile $HostLog -JoinFile $JoinLog) }
         "weapon_loot"   { return (Test-WeaponLoot      -HostFile $HostLog -JoinFile $JoinLog) }

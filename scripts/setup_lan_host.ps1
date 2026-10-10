@@ -40,6 +40,7 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot  = Split-Path -Parent $scriptDir
 
 Import-Module (Join-Path $scriptDir "CoopOracles.psm1") -Force
+Import-Module (Join-Path $scriptDir "CoopHarness.psm1") -Force
 
 # ---- Config -------------------------------------------------------------------
 $cfgPath = Join-Path $scriptDir "lan.config.json"
