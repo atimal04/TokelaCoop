@@ -11,9 +11,9 @@ la descripción del `.mod`. No hay que cambiar nunca los StringIds `N-KenshiCoop
 `.mod`: las partidas guardadas los usan. Si un Kenshi tiene cargada a la vez la DLL antigua `KenshiCoop.dll`,
 TokelaCoop no se activa y avisa.
 
-> **Estado (2026-09-25):**
+> **Estado (2026-10-10):**
 > - Compilación verificada en CI (`windows-2022`): `prototest`, `tunneltest`, DLL Harness y Release, y kit con instalador.
->   Releases publicadas: `v0.52` y `v0.53` (con el nombre KenshiCoop).
+>   Releases publicadas: `v0.52` y `v0.53` (con el nombre KenshiCoop) y `v0.54` (TokelaCoop, 2026-10-10, protocolo 57).
 > - **Verificado en el juego** (PC del autor del fork, Kenshi de Steam con RE_Kenshi):
 >   - v0.54 (2026-09-25): carga como `TokelaCoop.dll` desde `mods\TokelaCoop`, migración con `deploy.cmd` de las dos
 >     instalaciones, banner/F2 con "TokelaCoop v0.54" (gris con sombra cuando el co-op está apagado), inicios
@@ -61,7 +61,7 @@ TokelaCoop no se activa y avisa.
 
 Flujo de trabajo:
 - una rama por cambio, PR y fusión cuando el CI está en verde;
-- las releases se publican con una etiqueta `vX.YY` (última: `v0.53`), que tiene que coincidir con
+- las releases se publican con una etiqueta `vX.YY` (última: `v0.54`), que tiene que coincidir con
   `TOKELACOOP_VERSION` de `src/netproto/Version.h` (el CI rechaza la etiqueta si no);
 - el dueño prefiere español y una UX muy sencilla.
 
