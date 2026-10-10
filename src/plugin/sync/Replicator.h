@@ -1954,7 +1954,11 @@ private:
     // empty snapshot).
     struct StealthPub {
         u32 hash; unsigned long lastSendMs; bool active;
-        StealthPub() : hash(0), lastSendMs(0), active(false) {}
+        // Empty snapshots still to send after the sneak ended: the channel is
+        // unreliable, and one lost "clear" left the friend's detection arrows up
+        // for good (sneak_detect over a lossy link).
+        unsigned int clearLeft;
+        StealthPub() : hash(0), lastSendMs(0), active(false), clearLeft(0) {}
     };
     std::map<Key, StealthPub> stealthPub_;
 
@@ -2697,6 +2701,12 @@ private:
     // pointer rather than by stream key deliberately: re-key migrations move keys
     // between bodies, but "did we create this" is a property of the body.
     std::set<Character*> mintedBodies_;
+    // Keys whose proxyByKey_ binding came from a friend's squad move or recruit
+    // (rekeyPeerBody): the only bodies resolvePeerChar may reach through the
+    // binding. Adopted townspeople are bound too (a town NPC changes hands when a
+    // fight starts), and feeding them medical, carry and furniture events they
+    // never got before made them jump during battles.
+    std::set<Key> peerSquadKeys_;
 
     // Destroy 'c' only if we minted it, and say whether we did. An adopted body is
     // left standing and merely unbound - the local engine owns it again, and its

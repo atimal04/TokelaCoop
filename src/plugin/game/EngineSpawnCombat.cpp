@@ -504,6 +504,29 @@ RootObject* findFurnitureNear(GameWorld* gw, int kind) {
                 if (gd && ciContains(gd->name.c_str(), prefs[k])) return o;
             }
         }
+        // The names above are the English ones: a Kenshi running in another
+        // language (Spanish here: "Cama ...", "Jaula ...") never
+        // matched them, so every bed/cage scenario failed on that install. Try
+        // the Spanish names, then the furniture's own function, which is the same
+        // in every language (a pole is a cage to the engine, so it comes last).
+        const char* bedEs[]  = { "cama", "saco de dormir" };
+        const char* cageEs[] = { "jaula" };
+        const char* poleEs[] = { "poste", "grillete" };
+        const char** es = (kind == 4) ? poleEs : ((kind == 2) ? cageEs : bedEs);
+        const unsigned int nes = (kind == 4) ? 2u : ((kind == 2) ? 1u : 2u);
+        for (unsigned int k = 0; k < nes; ++k) {
+            for (unsigned int i = 0; i < total; ++i) {
+                RootObject* o = g_npcQuery[i];
+                if (!o) continue;
+                GameData* gd = o->getGameData();
+                if (gd && ciContains(gd->name.c_str(), es[k])) return o;
+            }
+        }
+        const BuildingFunction want = (kind == 1) ? BF_BED : BF_CAGE;
+        for (unsigned int i = 0; i < total; ++i) {
+            RootObject* o = g_npcQuery[i];
+            if (o && static_cast<Building*>(o)->specialFunction == want) return o;
+        }
         return 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 0;

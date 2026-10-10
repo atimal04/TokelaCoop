@@ -19,8 +19,12 @@ TokelaCoop no se activa y avisa.
 >     instalaciones, banner/F2 con "TokelaCoop v0.54" (gris con sombra cuando el co-op está apagado), inicios
 >     renombrados, partidas de `fixtures/saves` (listan "KenshiCoop") sin avisos y el aviso de doble carga;
 >   - cada jugador solo controla sus personajes (`own_guard` PASS, `own_guard_off` como control negativo) y las
->     escuadras nuevas del join siguen siendo suyas tras guardar y cargar (`squad_persist` y `squad_persist_off`)
->     (2026-09-25; los arreglos de la revisión posteriores, y la regresión completa, están pendientes de pasar en el juego);
+>     escuadras nuevas del join siguen siendo suyas tras guardar y cargar (`squad_persist` y `squad_persist_off`);
+>   - regresión completa de la v0.54 (2026-10-10, `regress.ps1 -Tier full`, 125 ejecuciones): todo pasa salvo
+>     `npc_carry` (ya fallaba en septiembre: ningún NPC recoge el cuerpo) y algunas inestables que pasan al
+>     reintentar (`combat_battle`, `combat_order`, `limb_loss`, `pc_assault`, `rejoin_items`, `mine_pose`).
+>     Las pruebas de camas/jaulas/postes fallaban porque el Kenshi del host está en español: `findFurnitureNear`
+>     busca también nombres en español y por `specialFunction` (BF_BED/BF_CAGE);
 >   - el plugin carga;
 >   - el panel F2 abre en el menú principal, detecta el idioma (español) y colorea el estado (v0.53);
 >   - el botón de invitar aparece y lista amigos (v0.52);

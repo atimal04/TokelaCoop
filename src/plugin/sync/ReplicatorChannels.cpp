@@ -2171,12 +2171,20 @@ void Replicator::publishStealth(GameWorld* gw, NetLink& net, u32 ownerId) {
         if (!engine::readStealth(c, &sr) || !sr.valid) continue;
         bool active = sr.sneaking && sr.nSeers > 0;
         std::map<Key, StealthPub>::iterator pit = stealthPub_.find(k);
-        if (!active && (pit == stealthPub_.end() || !pit->second.active)) {
-            // Quiet body and the last snapshot already said so (or we never
+        if (!active && (pit == stealthPub_.end() ||
+                        (!pit->second.active && pit->second.clearLeft == 0))) {
+            // Quiet body and the last snapshots already said so (or we never
             // sent one) - nothing to author.
             continue;
         }
         StealthPub& sp = stealthPub_[k];
+        // The "clear" repeats: two more empty snapshots, 500 ms apart.
+        if (!active && !sp.active) {
+            if ((now - sp.lastSendMs) < 500) continue;
+            --sp.clearLeft;
+        } else if (!active) {
+            sp.clearLeft = 2;
+        }
         // Fingerprint the visible map (entries + coarse progress) so an
         // unchanged stare-down doesn't re-send every 250 ms.
         u32 h = 2166136261u;
