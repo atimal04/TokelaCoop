@@ -25,6 +25,7 @@
 #include "Interp.h"
 #include "../../netproto/Wire.h"
 #include "../core/Inbound.h"
+#include "../core/TabLedger.h"   // squad-tab owners kept with the save
 #include "../net/NetLink.h"
 #include "SyncContext.h" // Phase 6: per-tick channel call environment
 #include "SyncTuning.h"  // Phase 6d: owned per-channel send-cadence tunables
@@ -94,6 +95,25 @@ public:
     // Own-characters-only control is on this tick (Config ownGuard + a friend
     // connected). Plugin.cpp sets it before the publish half.
     void setOwnGuardActive(bool on) { ownGuardActive_ = on; }
+    // Squad-tab owners that outlive a reload or a reconnect (core/TabLedger.h).
+    // Plugin.cpp loads them from the save when a world loads (after clearing),
+    // and the host writes them back into every save. Kept across resetSession,
+    // so a reconnect in the same world keeps each squad with its owner.
+    void setTabLedgerOn(bool on) { tabLedgerOn_ = on; }
+    void setTabLedger(const TabLedger& l) { tabLedger_ = l; }
+    const TabLedger& tabLedger() const { return tabLedger_; }
+    void clearTabLedger() { tabLedger_.clear(); }
+    // Decisions are recorded only while the friend is connected: alone, every
+    // tab is ours whatever the rank says, and a guess made then must not decide
+    // the next co-op session. Plugin.cpp sets it on the presence edges.
+    void setLedgerRecording(bool on) { ledgerRecord_ = on; }
+    // The friend has just connected: forget this session's tab owners and our
+    // own move pins, so both games seed every tab the same way (the save's
+    // ledger, else the rank rule). Alone, the host decided its new squads as its
+    // own, while the join seeds the pushed save from scratch - without this both
+    // could own the squad the host split off for the friend before connecting.
+    // No world changes, so the roster baseline and the drive maps stay.
+    void reseedTabsForPeer();
     // Who owns a squad tab: 1 ours, 2 the friend's, 0 not decided yet (a tab
     // this tick created, or squad sync off).
     int tabOwnerClass(u32 container, u32 containerSerial) const {
@@ -1934,7 +1954,11 @@ private:
     // empty snapshot).
     struct StealthPub {
         u32 hash; unsigned long lastSendMs; bool active;
-        StealthPub() : hash(0), lastSendMs(0), active(false) {}
+        // Empty snapshots still to send after the sneak ended: the channel is
+        // unreliable, and one lost "clear" left the friend's detection arrows up
+        // for good (sneak_detect over a lossy link).
+        unsigned int clearLeft;
+        StealthPub() : hash(0), lastSendMs(0), active(false), clearLeft(0) {}
     };
     std::map<Key, StealthPub> stealthPub_;
 
@@ -2205,10 +2229,22 @@ private:
     // our hand for one fixture and the peer's for another cannot bite.
     void handForContainerKey(const Key& k, unsigned int out[5]) const {
         if (ownedContainers_.count(k) == 0 && ownHands_.count(k) == 0 &&
-            localHandForFixtureKey(k, out))
+            (localHandForFixtureKey(k, out) || localHandForPeerChar(k, out)))
             return;
         out[0] = k.t; out[1] = k.c; out[2] = k.cs; out[3] = k.i; out[4] = k.s;
     }
+    // A peer's character by the hand the peer streams it under. Our copy of a
+    // body the peer moved into another squad (or recruited into a squad this game
+    // does not have) sits in a squad WE numbered, so its local hand differs and
+    // the plain hand lookup misses it; rekeyPeerBody bound it in proxyByKey_,
+    // which the drive already uses. Without this, stats, medical, limb, carry,
+    // furniture and inventory updates for that character were dropped here, and
+    // the host's next save kept its stale copy (loot lost or duplicated after a
+    // reload). Minted NPC proxies are left out: those channels never served them.
+    Character* resolvePeerChar(const Key& k) const;
+    // The local hand of that body (object order), for engine calls that take a
+    // hand. False when the key is not such a body.
+    bool localHandForPeerChar(const Key& k, unsigned int out[5]) const;
     // Protocol 23 recruitment sync state.
     bool recruitSync_;
     // Ownership PINS (protocols 23 + 35): per-hand overrides layered on the
@@ -2268,6 +2304,20 @@ private:
     // in the same millisecond it sent the move event.
     std::map<std::pair<u32, u32>, unsigned long> tabSeenMs_;
     enum { TAB_CLAIM_WAIT_MS = 5000 };
+    // Every tab owner decided or loaded (host/join roles, not "ours"): seeds the
+    // next session in this world and is what the host saves. NOT cleared by
+    // resetSession - only by a world load (see clearTabLedger).
+    TabLedger tabLedger_;
+    bool      tabLedgerOn_;
+    bool      ledgerRecord_;
+    // A squad the peer created mid-session has a runtime container number of
+    // its own in each game. When its first member arrives here we make a new
+    // squad for it (insertPeerMember) and pair the two numbers, so its later
+    // members join that same squad. Save-stable after the next save + load.
+    std::map<std::pair<u32, u32>, std::pair<u32, u32> > peerTabLocal_;
+    // Character serial -> the peer squad it was split off for, until the move's
+    // echo edge shows the new local container.
+    std::map<u32, std::pair<u32, u32> > pendingPeerTab_;
     // Own-characters-only control (Config ownGuard, with a friend connected):
     // a roster edge on one of the friend's characters is never claimed or
     // published (see publishSquadMoves).
@@ -2651,6 +2701,12 @@ private:
     // pointer rather than by stream key deliberately: re-key migrations move keys
     // between bodies, but "did we create this" is a property of the body.
     std::set<Character*> mintedBodies_;
+    // Keys whose proxyByKey_ binding came from a friend's squad move or recruit
+    // (rekeyPeerBody): the only bodies resolvePeerChar may reach through the
+    // binding. Adopted townspeople are bound too (a town NPC changes hands when a
+    // fight starts), and feeding them medical, carry and furniture events they
+    // never got before made them jump during battles.
+    std::set<Key> peerSquadKeys_;
 
     // Destroy 'c' only if we minted it, and say whether we did. An adopted body is
     // left standing and merely unbound - the local engine owns it again, and its

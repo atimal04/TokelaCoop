@@ -2111,6 +2111,31 @@
             Advisory = @()
             Tier = 'probe'; WanVariant = $false
         }
+        # squad_persist: a squad the JOIN made keeps its owner across a save + reload
+        # (v0.54, TokelaCoop_squads.txt). The join recruits a bar NPC and splits it
+        # into a new squad (its first squad keeps its character, so the new one
+        # ranks third after the reload, where the rank rule would hand it to the
+        # host); the host mirrors it, saves 'coopresume' and loads it. Gate: both
+        # sides seed that squad from the saved owners - the join's. Save 'sync':
+        # the bar has recruitable NPCs. squad_persist_off turns the saved owners
+        # off and must see the host get the squad (the negative control).
+        squad_persist = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            Seconds = 200; KillGraceSec = 170   # the scenario's 130 s fallback starts at peer-ready (~30 s in)
+            PrimaryGate = 'squad_persist'
+            Gating   = @('squad_persist', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+        squad_persist_off = @{
+            DiagEnv = @{ TOKELACOOP_TAB_LEDGER = '0' }
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            Seconds = 200; KillGraceSec = 170
+            PrimaryGate = 'squad_persist_off'
+            Gating   = @('squad_persist_off')
+            Advisory = @()
+            Tier = 'probe'; WanVariant = $false
+        }
         # Protocol-37 VALIDATION of the transfer-intent channel (xferSync ON): the
         # same three cross-owner drags trade_probe baselined, now expected CLEAN -
         # TAKE lands + the removal propagates (no dupe), GIVE arrives on the owner

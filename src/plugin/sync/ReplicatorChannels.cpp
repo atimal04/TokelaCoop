@@ -235,8 +235,7 @@ void Replicator::applyMedical(GameWorld* gw, Inbound& in, NetLink& net, u32 owne
         Key k; k.t = p.sType; k.c = p.sContainer; k.cs = p.sContainerSerial;
         k.i = p.sIndex; k.s = p.sSerial;
         if (ownHands_.find(k) != ownHands_.end()) continue; // never write our own truth
-        unsigned int hand[5] = { k.t, k.c, k.cs, k.i, k.s };
-        Character* c = engine::resolveCharByHand(hand[3], hand[4], hand[0], hand[1], hand[2]);
+        Character* c = resolvePeerChar(k);
         if (!c) continue;
         engine::MedicalRead w;
         memset(&w, 0, sizeof(w));
@@ -316,9 +315,11 @@ void Replicator::applyMedical(GameWorld* gw, Inbound& in, NetLink& net, u32 owne
         MedRecv&   r = it->second;
         if (!r.have || (now - r.lastFwdMs) < FWD_THROTTLE_MS) continue;
         if (ownHands_.find(k) != ownHands_.end()) continue;
-        unsigned int hand[5] = { k.t, k.c, k.cs, k.i, k.s };
+        // The same body step 1 wrote (a friend's character we hold under our own
+        // hand included), or our bandage would be undone and never forwarded.
+        Character* tc = resolvePeerChar(k);
         engine::MedicalRead mr;
-        if (!engine::readMedicalByHand(hand, &mr) || !mr.valid) continue;
+        if (!tc || !engine::readMedical(tc, &mr) || !mr.valid) continue;
         TreatmentPacket tp;
         memset(&tp, 0, sizeof(tp));
         bool rise = false;
@@ -501,7 +502,7 @@ void Replicator::applyStats(GameWorld* gw, Inbound& in) {
         Key k; k.t = p.sType; k.c = p.sContainer; k.cs = p.sContainerSerial;
         k.i = p.sIndex; k.s = p.sSerial;
         if (ownHands_.find(k) != ownHands_.end()) continue; // never write our own truth
-        Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+        Character* c = resolvePeerChar(k);
         if (!c) continue;
         engine::StatsRead w;
         memset(&w, 0, sizeof(w));
@@ -2052,6 +2053,31 @@ void Replicator::publishSquadMoves(GameWorld* gw, NetLink& net, u32 ownerId) {
                     edges[i].after[0], edges[i].after[1], edges[i].after[2],
                     edges[i].after[3], edges[i].after[4]);
                 eb[sizeof(eb) - 1] = '\0'; coop::logLine(eb);
+                // A squad we made for a squad of the peer's (insertPeerMember):
+                // the body now shows its local container - pair the two, and
+                // keep the new hand the peer's.
+                std::map<u32, std::pair<u32, u32> >::iterator pp = pendingPeerTab_.find(serial);
+                if (pp == pendingPeerTab_.end()) pp = pendingPeerTab_.find(edges[i].after[4]);
+                const bool moved = (edges[i].after[0] | edges[i].after[1] | edges[i].after[2] |
+                                    edges[i].after[3] | edges[i].after[4]) != 0;
+                if (pp != pendingPeerTab_.end() && moved) {
+                    peerTabLocal_[pp->second] = std::make_pair((u32)edges[i].after[1], (u32)edges[i].after[2]);
+                    Key nk2; nk2.t = edges[i].after[0]; nk2.c = edges[i].after[1];
+                    nk2.cs = edges[i].after[2]; nk2.i = edges[i].after[3]; nk2.s = edges[i].after[4];
+                    pinOwned_.erase(nk2);
+                    pinPeer_.insert(nk2);
+                    char pb[160]; _snprintf(pb, sizeof(pb) - 1,
+                        "[squad] PEER-TAB peer=%u,%u -> local=%u,%u (a new squad for the friend's)",
+                        pp->second.first, pp->second.second, edges[i].after[1], edges[i].after[2]);
+                    pb[sizeof(pb) - 1] = '\0'; coop::logLine(pb);
+                    // insertPeerMember may have filed it under two serials.
+                    const std::pair<u32, u32> done = pp->second;
+                    for (std::map<u32, std::pair<u32, u32> >::iterator q = pendingPeerTab_.begin();
+                         q != pendingPeerTab_.end(); ) {
+                        if (q->second == done) pendingPeerTab_.erase(q++);
+                        else ++q;
+                    }
+                }
                 continue;
             }
         }
@@ -2082,8 +2108,10 @@ void Replicator::publishSquadMoves(GameWorld* gw, NetLink& net, u32 ownerId) {
                     // The drive resolves the friend's key by hand first, and the
                     // body no longer answers to it here: bind it by pointer, as
                     // rekeyPeerBody does.
-                    if (cf != canonicalOf_.end() && (cf->second < nk || nk < cf->second))
+                    if (cf != canonicalOf_.end() && (cf->second < nk || nk < cf->second)) {
                         proxyByKey_[cf->second] = ec;
+                        peerSquadKeys_.insert(cf->second);
+                    }
                 }
                 char hb[192]; _snprintf(hb, sizeof(hb) - 1,
                     "[own] SQUAD-HOLD friend's character old=%u,%u,%u,%u,%u "
@@ -2139,18 +2167,26 @@ void Replicator::publishStealth(GameWorld* gw, NetLink& net, u32 ownerId) {
     for (std::map<Key, Driven>::iterator it = targets_.begin(); it != targets_.end(); ++it) {
         const Key& k = it->first;
         if (ownHands_.find(k) != ownHands_.end()) continue;
-        Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+        Character* c = resolvePeerChar(k);
         if (!c) continue;
         engine::StealthRead sr;
         if (!engine::readStealth(c, &sr) || !sr.valid) continue;
         bool active = sr.sneaking && sr.nSeers > 0;
         std::map<Key, StealthPub>::iterator pit = stealthPub_.find(k);
-        if (!active && (pit == stealthPub_.end() || !pit->second.active)) {
-            // Quiet body and the last snapshot already said so (or we never
+        if (!active && (pit == stealthPub_.end() ||
+                        (!pit->second.active && pit->second.clearLeft == 0))) {
+            // Quiet body and the last snapshots already said so (or we never
             // sent one) - nothing to author.
             continue;
         }
         StealthPub& sp = stealthPub_[k];
+        // The "clear" repeats: two more empty snapshots, 500 ms apart.
+        if (!active && !sp.active) {
+            if ((now - sp.lastSendMs) < 500) continue;
+            --sp.clearLeft;
+        } else if (!active) {
+            sp.clearLeft = 2;
+        }
         // Fingerprint the visible map (entries + coarse progress) so an
         // unchanged stare-down doesn't re-send every 250 ms.
         u32 h = 2166136261u;
@@ -2167,7 +2203,9 @@ void Replicator::publishStealth(GameWorld* gw, NetLink& net, u32 ownerId) {
         }
         // else: falling edge - send ONE empty snapshot immediately (clears the
         // owner's stale arrows), then go quiet.
-        sp.hash = h; sp.lastSendMs = now; sp.active = active;
+        // A clear sends no seers, so it must not stamp their fingerprint: a
+        // sneak that resumes under the same stares would be held back 2 s.
+        sp.hash = active ? h : 0u; sp.lastSendMs = now; sp.active = active;
         StealthPacket pkt;
         memset(&pkt, 0, sizeof(pkt));
         pkt.type    = (u8)PKT_STEALTH;

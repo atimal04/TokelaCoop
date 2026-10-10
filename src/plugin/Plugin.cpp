@@ -280,19 +280,108 @@ void sessionResetForUi() {
     g_modsLine.clear();
     g_modsWarn = false;
     g_peerModsCfg.clear();
+    g_repl.setLedgerRecording(false);
     if (g_lastGw) g_repl.clearPeerReplicationState(g_lastGw);
     else          g_repl.resetSession();
     g_inbound.flushWorldState();
     g_net.bumpSessionEpoch(); // v44: fence off any in-flight prior-session batch
 }
 
+// ---- Squad-tab owners kept with the save (core/TabLedger.h) -----------------
+
+// An autosave's later writes. Kenshi saves an autosave by copying the current
+// save folder - its TokelaCoop_squads.txt included - over our edge write, within
+// a fraction of a second, and autosaves are not watched for quiescence: so the
+// owners go in again at +1.5 s, +4 s and +8 s (an unchanged file is not touched).
+std::string  g_ledgerRewriteName;
+DWORD        g_ledgerRewriteTick = 0;
+unsigned int g_ledgerRewriteStep = 0;
+
+void writeTabLedgerToSave(const std::string& name, const char* when);
+
+// A late write still pending goes in NOW, with this world's owners: before a
+// world load replaces them (written afterwards it would put the next world's
+// owners into this world's autosave), and when Kenshi closes.
+void flushPendingLedgerWrite(const char* why) {
+    if (g_ledgerRewriteTick == 0) return;
+    g_ledgerRewriteTick = 0;
+    g_ledgerRewriteStep = 0;
+    writeTabLedgerToSave(g_ledgerRewriteName, why);
+}
+
+// The loaded world's owners, read from <save>\TokelaCoop_squads.txt. Replaces
+// whatever the previous world left: called on every world load (gameplay start,
+// and the reload edge below) before the new session seeds its tabs. A save
+// without the file (made before v0.54, or a test fixture) keeps the rank rule.
+void loadTabLedgerFromSave(const char* when) {
+    flushPendingLedgerWrite("before-load");
+    g_repl.clearTabLedger();
+    if (!g_cfg.tabLedger) return;
+    char cur[128]; cur[0] = '\0';
+    coop::engine::saveInfo(cur, sizeof(cur), 0, 0);
+    if (!cur[0]) { coopLog("[squads] ledger: no current save name; rank rule only"); return; }
+    const std::string path = coop::savexfer::saveFolderFor(cur) + "\\" + coop::tabLedgerFileName();
+    std::string text;
+    FILE* f = fopen(path.c_str(), "rb");
+    if (f) {
+        char buf[4096];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), f)) > 0 && text.size() < 256 * 1024) text.append(buf, n);
+        fclose(f);
+    }
+    coop::TabLedger ledger;
+    const unsigned int rows = f ? coop::parseTabLedger(text, &ledger) : 0;
+    g_repl.setTabLedger(ledger);
+    char b[224];
+    _snprintf(b, sizeof(b) - 1, "[squads] ledger %s save='%s' rows=%u%s", when, cur, rows,
+              f ? "" : " (no file: rank rule only)");
+    b[sizeof(b) - 1] = '\0'; coopLog(b);
+}
+
+// HOST: write the owners into the save folder 'name'. At the save edge and again
+// once the folder has settled (a save may still be writing files when its edge
+// arrives), so the file is there when the folder is fingerprinted and streamed
+// to the join. An empty ledger never overwrites a file that has rows.
+void writeTabLedgerToSave(const std::string& name, const char* when) {
+    if (!g_cfg.isHost || !g_cfg.tabLedger || name.empty()) return;
+    const coop::TabLedger& ledger = g_repl.tabLedger();
+    if (ledger.empty()) return;
+    const std::string folder = coop::savexfer::saveFolderFor(name);
+    if (GetFileAttributesA(folder.c_str()) == INVALID_FILE_ATTRIBUTES) return;   // not written yet
+    const std::string path = folder + "\\" + coop::tabLedgerFileName();
+    const std::string text = coop::formatTabLedger(ledger);
+    // Same content already there: leave the file alone (the folder may be
+    // being fingerprinted or streamed right now).
+    {
+        std::string old;
+        FILE* r = fopen(path.c_str(), "rb");
+        if (r) {
+            char buf[4096];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof(buf), r)) > 0 && old.size() <= text.size()) old.append(buf, n);
+            fclose(r);
+            if (old == text) return;
+        }
+    }
+    FILE* f = fopen(path.c_str(), "wb");
+    bool ok = f && fwrite(text.data(), 1, text.size(), f) == text.size();
+    if (f && fclose(f) != 0) ok = false;   // the buffered write happens in fclose
+    char b[224];
+    _snprintf(b, sizeof(b) - 1, "[squads] ledger written (%s) save='%s' rows=%u ok=%d",
+              when, name.c_str(), (unsigned)ledger.size(), ok ? 1 : 0);
+    b[sizeof(b) - 1] = '\0';
+    if (ok) coopLog(b); else coopErr(b);
+}
+
 // World-reload session reset (protocol 32): the old world is gone - every
 // pointer cache and session map describes it. Peer presence and the suppression
 // levers survive (the connection never dropped). Both roles run this on their
 // OWN reload edge, and the synchronous-swap backstop reuses it, so the reset
-// order (repl maps, then inbound queues) is defined in exactly one place.
+// order (repl maps, then inbound queues) is defined in exactly one place. The
+// new world's squad-tab owners come from its save.
 void sessionResetForWorldReload() {
     g_repl.resetSession();
+    loadTabLedgerFromSave("reload");
     g_inbound.flushWorldState();
     g_net.bumpSessionEpoch(); // v44: post-reload batches supersede the old session
     coopLog("[load] inbound world-state queues flushed");
@@ -476,6 +565,10 @@ void processNetEvents(GameWorld* gw) {
         b[sizeof(b) - 1] = '\0';
         coopLog(b);
         g_peerId = it->id;
+        // Both games seed the squad-tab owners afresh for this session (see
+        // reseedTabsForPeer), and from now on those decisions are kept.
+        g_repl.reseedTabsForPeer();
+        g_repl.setLedgerRecording(true);
         // Connect-edge resync (protocol 30): re-announce placed buildings and
         // force an immediate resend pass across all change-gated channels, so
         // a late joiner / reconnector converges now instead of waiting out
@@ -511,6 +604,7 @@ void processNetEvents(GameWorld* gw) {
         g_modsLine.clear();
         g_modsWarn = false;
         g_peerModsCfg.clear();
+        g_repl.setLedgerRecording(false);
         // Coordinated save: disconnected = solo again; local saves must work.
         if (!g_cfg.isHost && g_cfg.saveSync) {
             coop::engine::setSaveSuppress(false);
@@ -586,11 +680,37 @@ void pumpSaveReceive() {
 // drives a coordinated save). Received BEGIN/FILE/DONE stage + verify +
 // commit the host's folder; the ACK reports the outcome.
 void driveSaveSync() {
+    // An autosave's later squad-owner writes (see g_ledgerRewriteTick).
+    if (g_ledgerRewriteTick != 0 && (long)(GetTickCount() - g_ledgerRewriteTick) >= 0) {
+        static const DWORD kNextMs[] = { 2500, 4000 };   // +1.5 s -> +4 s -> +8 s
+        writeTabLedgerToSave(g_ledgerRewriteName, "late");
+        if (g_ledgerRewriteStep < 2) {
+            g_ledgerRewriteTick = GetTickCount() + kNextMs[g_ledgerRewriteStep];
+            if (g_ledgerRewriteTick == 0) g_ledgerRewriteTick = 1;
+            ++g_ledgerRewriteStep;
+        } else {
+            g_ledgerRewriteTick = 0;
+            g_ledgerRewriteStep = 0;
+        }
+    }
     // Local save edges from the detour (max 8 queued per tick).
     coop::engine::SaveEdge edges[8];
     unsigned int nEdges = coop::engine::drainSaveEdges(edges, 8);
     for (unsigned int i = 0; i < nEdges; ++i) {
         std::string name = edges[i].name[0] ? edges[i].name : "coopresume";
+        if (g_cfg.isHost && !edges[i].suppressed) {
+            // Every save carries the squad-tab owners. A streamed save writes
+            // them again when its folder settles (below), before anything is
+            // fingerprinted or sent; an autosave gets a late second write.
+            writeTabLedgerToSave(name, "save");
+            if (edges[i].autosave) {
+                if (name != g_ledgerRewriteName) flushPendingLedgerWrite("late");
+                g_ledgerRewriteName = name;
+                g_ledgerRewriteTick = GetTickCount() + 1500;
+                if (g_ledgerRewriteTick == 0) g_ledgerRewriteTick = 1;
+                g_ledgerRewriteStep = 0;
+            }
+        }
         if (g_cfg.isHost) {
             // An AUTOSAVE is not streamed. It came every few minutes as the
             // whole save folder (real saves are 30+ MB), and over a home uplink
@@ -652,6 +772,9 @@ void driveSaveSync() {
                           rc == 1 ? "settled" : "timeout", g_savePending.c_str(),
                           files, bytes, waited);
                 b[sizeof(b) - 1] = '\0'; coopLog(b);
+                // The squad-tab owners go in now that the save has stopped
+                // writing, so the fingerprint and the stream both include them.
+                writeTabLedgerToSave(g_savePending, "settled");
                 if (g_bootstrapArmed && g_savePending == g_bootstrapName) {
                     // Connect-push: announce the freshly-baked save with a
                     // LOAD_GO instead of a blind stream. The join loads it
@@ -1903,6 +2026,9 @@ void mainLoop_hook(GameWorld* gw, float dt) {
         g_gameStarted   = true;
         g_gameStartTick = GetTickCount();
         coopLog("TokelaCoop: gameplay started");
+        // The squad-tab owners saved with this world, before its first census
+        // seeds the tabs (tickReplicatePublish runs later this tick).
+        loadTabLedgerFromSave("load");
         // Coordinated load (protocol 32): the title-screen auto-load fired the
         // load detour BEFORE gameplay - discard its queued edge here, or the
         // first driveLoadSync tick (g_gameStarted now true) would mistake it
@@ -2686,6 +2812,7 @@ void installEngineDetours() {
     // is the A/B escape hatch (squad_probe forces it off to keep the unsynced
     // baseline measurable).
     g_repl.setSquadSync(g_cfg.squadSync);
+    g_repl.setTabLedgerOn(g_cfg.tabLedger);
     g_repl.setFactionSync(g_cfg.factionSync);
     g_repl.setTimeSync(g_cfg.timeSync);
     g_repl.setTimeBrake(g_cfg.timeBrake);
@@ -2843,6 +2970,8 @@ int detachReKenshiFocusListenersSeh() {
 }
 
 void __cdecl crtExit_hook(int code) {
+    // An autosave made just before quitting still gets its squad owners.
+    flushPendingLedgerWrite("exit");
     coop::engine::coopUiShutdown();
     int n = detachReKenshiFocusListenersSeh();
     if (n != 0) {

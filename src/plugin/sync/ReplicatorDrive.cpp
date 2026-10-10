@@ -1246,15 +1246,23 @@ void Replicator::applyTargets(GameWorld* gw) {
                 d.carryNoSeeTick = 0;
                 engine::CarryRead lcr;
                 bool haveCr = engine::readCarry(c, &lcr);
+                // The carried body by OUR hand: one of the friend's characters
+                // may sit here under a hand of ours (moved into a squad we
+                // numbered), and the attach reads back that local hand.
+                unsigned int ch[5] = { out.sType, out.sContainer,
+                                       out.sContainerSerial,
+                                       out.sIndex, out.sSerial };
+                {
+                    Key sk; sk.t = out.sType; sk.c = out.sContainer;
+                    sk.cs = out.sContainerSerial; sk.i = out.sIndex; sk.s = out.sSerial;
+                    localHandForPeerChar(sk, ch);
+                }
                 bool carryingRight = haveCr && lcr.carrying &&
-                                     lcr.carried[3] == out.sIndex &&
-                                     lcr.carried[4] == out.sSerial;
+                                     lcr.carried[3] == ch[3] &&
+                                     lcr.carried[4] == ch[4];
                 if (haveCr && !carryingRight &&
                     (now - d.carryHealTick) >= CARRY_HEAL_MS) {
                     d.carryHealTick = now;
-                    unsigned int ch[5] = { out.sType, out.sContainer,
-                                           out.sContainerSerial,
-                                           out.sIndex, out.sSerial };
                     bool ok = engine::applyPickup(gw, c, ch);
                     char b[160]; _snprintf(b, sizeof(b) - 1,
                         "[carry] HEAL PICKUP carrier=%u,%u carried=%u,%u ok=%d",
