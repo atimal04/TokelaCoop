@@ -567,13 +567,17 @@ bool enterFurnitureNearPos(GameWorld* gw, Character* occupant, int kind,
         const char* cagePrefs[] = { "prisoner cage", "cage" };
         const char** prefs = (kind == 2) ? cagePrefs : bedPrefs;
         const unsigned int nprefs = (kind == 2) ? 2u : 3u;
+        // The furniture's own function first: the names are the English ones,
+        // and a Kenshi in another language (Spanish: "Cama ...", "Jaula ...")
+        // never matched them, so a bed or cage was never re-entered here.
+        const BuildingFunction want = (kind == 2) ? BF_CAGE : BF_BED;
         float bestD2 = 1e18f;
         for (unsigned int i = 0; i < total; ++i) {
             RootObject* o = g_npcQuery[i];
             if (!o) continue;
             GameData* gd = o->getGameData();
             if (!gd) continue;
-            bool match = false;
+            bool match = static_cast<Building*>(o)->specialFunction == want;
             for (unsigned int k = 0; k < nprefs && !match; ++k)
                 if (ciContains(gd->name.c_str(), prefs[k])) match = true;
             if (!match) continue;
