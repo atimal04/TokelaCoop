@@ -497,6 +497,9 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
     // without it.)
     const unsigned long PENDING_DROP_MS   = 5000;
     const float         PENDING_DROP_DIST = 2.5f;
+    // A template-less pending drop (announceSeveredDrop) matches the first new row
+    // near the amputated body: a severed limb can land a few metres away.
+    const float         SEVER_DROP_DIST   = 6.0f;
 
     // Gear (itemType WEAPON/ARMOUR) rides the W2 conservation drop/pickup channel
     // (the real shared-save object is relocated bag<->ground on each client), so the
@@ -615,8 +618,10 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
                 for (size_t p = 0; p < pendingDrops_.size(); ++p) {
                     const PendingDrop& pd = pendingDrops_[p];
                     float dx = raw[i].x - pd.x, dy = raw[i].y - pd.y, dz = raw[i].z - pd.z;
-                    if (strcmp(pd.stringID, raw[i].stringID) == 0 &&
-                        dx*dx + dy*dy + dz*dz <= PENDING_DROP_DIST * PENDING_DROP_DIST) {
+                    const bool  wild = pd.stringID[0] == '\0'; // announced severed limb
+                    const float lim  = wild ? SEVER_DROP_DIST : PENDING_DROP_DIST;
+                    if ((wild || strcmp(pd.stringID, raw[i].stringID) == 0) &&
+                        dx*dx + dy*dy + dz*dz <= lim * lim) {
                         pendingDrops_.erase(pendingDrops_.begin() + p);
                         isDrop = true; break;
                     }
@@ -2295,6 +2300,20 @@ void Replicator::releaseXferLatch(const Key& k, const XKey& key, int delta) {
     le->second.delta += delta;
     if (le->second.delta == 0) lt->second.erase(le);
     if (lt->second.empty()) xferLatch_.erase(lt);
+}
+
+void Replicator::announceSeveredDrop(const unsigned int hand[5]) {
+    if (!isHostRole() || pendingDrops_.size() >= 32) return;
+    Key k; k.t = hand[0]; k.c = hand[1]; k.cs = hand[2]; k.i = hand[3]; k.s = hand[4];
+    Character* c = resolvePeerChar(k);   // plain hand first, then a moved peer body
+    float x = 0, y = 0, z = 0;
+    if (!c || !engine::readPos(c, &x, &y, &z)) return;
+    PendingDrop pd; memset(&pd, 0, sizeof(pd));   // stringID "" = any template
+    pd.x = x; pd.y = y; pd.z = z; pd.ms = nowMs();
+    pendingDrops_.push_back(pd);
+    char b[160]; _snprintf(b, sizeof(b) - 1,
+        "[wi] SEVER-ANNOUNCE hand=%u,%u pos=%.2f,%.2f,%.2f", k.i, k.s, x, y, z);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
 }
 
 

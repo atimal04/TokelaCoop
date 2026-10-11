@@ -1651,6 +1651,11 @@ private:
     // track; anything else the scan finds unannounced is a save-native.
     struct PendingDrop { char stringID[48]; float x, y, z; unsigned long ms; };
     std::vector<PendingDrop>   pendingDrops_;
+    // HOST: an amputation just put a severed limb on the ground WITHOUT
+    // Inventory::dropItem, so nothing announced it and the scan would baseline
+    // it as a save-native (never streamed - the limb_loss regression of the
+    // protocol-65 merge). Leave a template-less pending drop at the body.
+    void announceSeveredDrop(const unsigned int hand[5]);
 
     // Phase W2 conservation-drop state.
     // weaponCensus_: per OWNED character hand, the last-tick set of WEAPON copies it held,
