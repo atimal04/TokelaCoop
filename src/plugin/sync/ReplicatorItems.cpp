@@ -2317,11 +2317,15 @@ void Replicator::announceSeveredDrop(const unsigned int hand[5]) {
     // amputation on the next medical sample - a scan in between already
     // baselined it as a save-native. Promote such a young baseline near the body.
     const unsigned long now = nowMs();
+    float nearD2 = -1.0f; unsigned long nearAge = 0; u32 nearNet = 0; int young = 0;
     for (std::map<Key, WorldTrack>::iterator it = worldTrack_.begin(); it != worldTrack_.end(); ++it) {
         WorldTrack& t = it->second;
         if (!t.baseline || now - t.bornMs > 3000) continue;
         float dx = t.x - x, dy = t.y - y, dz = t.z - z;
-        if (dx*dx + dy*dy + dz*dz > 36.0f) continue;     // 6 m
+        float d2 = dx*dx + dy*dy + dz*dz;
+        ++young;
+        if (nearD2 < 0 || d2 < nearD2) { nearD2 = d2; nearAge = now - t.bornMs; nearNet = t.netId; }
+        if (d2 > 36.0f) continue;     // 6 m
         t.baseline = false;
         char pb[160]; _snprintf(pb, sizeof(pb) - 1,
             "[wi] SEVER-PROMOTE netId=%u sid='%s' age=%lums", t.netId, t.stringID, now - t.bornMs);
@@ -2329,8 +2333,10 @@ void Replicator::announceSeveredDrop(const unsigned int hand[5]) {
         return;   // the limb is already tracked: no pending drop needed
     }
     pendingDrops_.push_back(pd);
-    char b[160]; _snprintf(b, sizeof(b) - 1,
-        "[wi] SEVER-ANNOUNCE hand=%u,%u pos=%.2f,%.2f,%.2f", k.i, k.s, x, y, z);
+    char b[224]; _snprintf(b, sizeof(b) - 1,
+        "[wi] SEVER-ANNOUNCE hand=%u,%u pos=%.2f,%.2f,%.2f youngBaselines=%d nearest=%.1fm age=%lums netId=%u tracks=%u",
+        k.i, k.s, x, y, z, young, nearD2 < 0 ? -1.0f : (float)sqrt((double)nearD2), nearAge, nearNet,
+        (unsigned)worldTrack_.size());
     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
 }
 
