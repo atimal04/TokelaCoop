@@ -96,6 +96,7 @@ public:
     // Own-characters-only control is on this tick (Config ownGuard + a friend
     // connected). Plugin.cpp sets it before the publish half.
     void setOwnGuardActive(bool on) { ownGuardActive_ = on; }
+    bool updateInventoryUiDefer();
     // Squad-tab owners that outlive a reload or a reconnect (core/TabLedger.h).
     // Plugin.cpp loads them from the save when a world loads (after clearing),
     // and the host writes them back into every save. Kept across resetSession,
@@ -896,6 +897,8 @@ public:
     void logSmoothSummary();
 
 private:
+    bool inventoryUiDeferred_;
+    unsigned long inventoryUiOpenMs_;
     struct Key {
         u32 t, c, cs, i, s;
         bool operator<(const Key& o) const {

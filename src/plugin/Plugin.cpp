@@ -1741,6 +1741,7 @@ static coop::SyncContext replCtx(GameWorld* gw) {
 // tick so apply targets are current. worldLive is sampled ONCE pre-engine by the
 // caller (see the comment there); every channel is gated by its own Config knob.
 void tickReplicatePublish(GameWorld* gw, bool worldLive) {
+    g_repl.updateInventoryUiDefer();
     if (worldLive) {
         g_repl.ingest(g_inbound);
         // Phase 4a: drain received container-contents snapshots into the per-container
@@ -2026,6 +2027,7 @@ void tickScenarioStart(GameWorld* gw) {
 void trackMove(GameWorld* gw);   // TOKELACOOP_TRACK_MOVE route recorder (below)
 
 void tickReplicateApply(GameWorld* gw, bool worldLive) {
+    g_repl.updateInventoryUiDefer();
     if (worldLive && coop::engine::gameplayLive(gw)) {
         g_repl.applyTargets(gw);
         // Phase W2: relocate our own copy of any DROPPED weapon to the ground BEFORE the

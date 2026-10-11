@@ -244,6 +244,47 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
     }
 }
 
+bool Replicator::updateInventoryUiDefer() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* e = getenv("TOKELACOOP_UI_DEFER");
+        enabled = (e && e[0] == '0') ? 0 : 1;
+    }
+    if (!enabled) { inventoryUiDeferred_ = false; return false; }
+    const bool open = engine::inventoryUiOpen();
+    const unsigned long now = nowMs();
+    if (open && !inventoryUiDeferred_) {
+        inventoryUiDeferred_ = true;
+        inventoryUiOpenMs_ = now;
+        coop::logLine("[inv] UI-OPEN defer co-op inventory ops");
+    } else if (!open && inventoryUiDeferred_) {
+        const unsigned long paused = now - inventoryUiOpenMs_;
+        for (std::map<Key, std::map<XKey, XferPend> >::iterator a = xferPend_.begin(); a != xferPend_.end(); ++a)
+            for (std::map<XKey, XferPend>::iterator b = a->second.begin(); b != a->second.end(); ++b) b->second.sinceMs += paused;
+        for (std::map<Key, std::map<XKey, XferLatch> >::iterator a = xferLatch_.begin(); a != xferLatch_.end(); ++a)
+            for (std::map<XKey, XferLatch>::iterator b = a->second.begin(); b != a->second.end(); ++b) b->second.deadlineMs += paused;
+        for (std::map<Key, unsigned long>::iterator a = xferDefer_.begin(); a != xferDefer_.end(); ++a) a->second += paused;
+        for (std::map<Key, unsigned long>::iterator a = xferLastSeen_.begin(); a != xferLastSeen_.end(); ++a) a->second += paused;
+        for (std::vector<PendingDrop>::iterator a = pendingDrops_.begin(); a != pendingDrops_.end(); ++a) a->ms += paused;
+        for (std::map<std::pair<Key, std::string>, unsigned long>::iterator a = wdSuppress_.begin(); a != wdSuppress_.end(); ++a) a->second += paused;
+        for (std::map<u32, XferOut>::iterator a = xferOut_.begin(); a != xferOut_.end(); ++a) a->second.sentMs += paused;
+        for (std::deque<PendingPickup>::iterator a = pendingPickups_.begin(); a != pendingPickups_.end(); ++a) a->sinceMs += paused;
+        for (std::map<std::string, std::deque<GroundWeapon> >::iterator a = groundedWeapons_.begin(); a != groundedWeapons_.end(); ++a)
+            for (std::deque<GroundWeapon>::iterator b = a->second.begin(); b != a->second.end(); ++b) {
+                if (b->pendingSinceMs) b->pendingSinceMs += paused;
+                if (b->firstDeadMs) b->firstDeadMs += paused;
+                if (!b->everLive && b->createdMs) b->createdMs += paused;
+            }
+        for (std::map<Key, WCensus>::iterator a = weaponCensus_.begin(); a != weaponCensus_.end(); ++a)
+            for (std::map<std::string, unsigned long>::iterator b = a->second.retryArmMs.begin(); b != a->second.retryArmMs.end(); ++b) b->second += paused;
+        char msg[112]; _snprintf(msg, sizeof(msg) - 1, "[inv] UI-CLOSED resume (deferred %ums)", (unsigned)paused);
+        msg[sizeof(msg) - 1] = '\0'; coop::logLine(msg);
+        inventoryUiDeferred_ = false;
+        inventoryUiOpenMs_ = 0;
+    }
+    return inventoryUiDeferred_;
+}
+
 void Replicator::applyInventories(GameWorld* gw) {
     if (invRecv_.empty()) return;
     for (std::map<Key, InvRecv>::iterator it = invRecv_.begin(); it != invRecv_.end(); ++it) {
@@ -854,6 +895,7 @@ void Replicator::sendNativeTaken(NetLink& net, u32 ownerId, const unsigned int i
 }
 
 void Replicator::applyNativeTakes(GameWorld* gw, Inbound& in) {
+    if (inventoryUiDeferred_) return;
     std::deque<InboundNativeTaken> got;
     in.drainNativeTaken(got);
     if (got.empty()) return;
@@ -888,6 +930,7 @@ void Replicator::applyNativeTakes(GameWorld* gw, Inbound& in) {
 }
 
 void Replicator::applyWorldItems(GameWorld* gw, Inbound& in) {
+    if (inventoryUiDeferred_) return;
     std::deque<InboundWorldItems>  items;
     std::deque<InboundWorldRemove> rems;
     in.drainWorldItems(items);
@@ -981,6 +1024,7 @@ void Replicator::applyWorldItems(GameWorld* gw, Inbound& in) {
 }
 
 void Replicator::applyWorldClaims(GameWorld* gw, Inbound& in, u32 localId) {
+    if (inventoryUiDeferred_) return;
     std::deque<InboundWorldClaim> got;
     in.drainWorldClaim(got);
     if (got.empty()) return;
@@ -1312,6 +1356,7 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
 }
 
 void Replicator::applyWeaponDrops(GameWorld* gw, Inbound& in) {
+    if (inventoryUiDeferred_) return;
     std::deque<InboundWorldDrop> got;
     in.drainWorldDrops(got);
     if (got.empty()) return;
@@ -1520,6 +1565,7 @@ RootObject* resolveGroundGear(const unsigned int hand[5], void* cached) {
 } // namespace
 
 void Replicator::retryPendingPickups(GameWorld* gw) {
+    if (inventoryUiDeferred_) return;
     if (pendingPickups_.empty()) return;
     unsigned long now = nowMs();
     for (std::deque<PendingPickup>::iterator it = pendingPickups_.begin();
@@ -1570,6 +1616,7 @@ void Replicator::retryPendingPickups(GameWorld* gw) {
 }
 
 void Replicator::reconcileGroundGear(GameWorld* gw) {
+    if (inventoryUiDeferred_) return;
     // Ordered FIRST and outside the groundedWeapons_ guard below: a parked pickup exists
     // precisely because there is no track for it, so gating it on a non-empty track map would
     // never retry the case it was written for.
@@ -1666,6 +1713,7 @@ void Replicator::reconcileGroundGear(GameWorld* gw) {
 }
 
 void Replicator::applyWeaponPickups(GameWorld* gw, Inbound& in) {
+    if (inventoryUiDeferred_) return;
     std::deque<InboundWorldPickup> got;
     in.drainWorldPickups(got);
     if (got.empty()) return;
@@ -1882,6 +1930,7 @@ bool Replicator::wdPendingDrop(const Key& k) const {
 
 void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 ownerId,
                                           bool allowTransfers) {
+    if (inventoryUiDeferred_) return;
     const unsigned long XFER_SCAN_MS   = 400;   // detector cadence
     const unsigned long XFER_SETTLE_MS = 600;   // a diff must persist (mid-drag cursor hold)
     const unsigned long XFER_PEND_MS   = 6000;  // unpaired diff folds back into the baseline
@@ -2138,6 +2187,7 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
 }
 
 void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 localId) {
+    if (inventoryUiDeferred_) return;
     std::deque<InboundInvXfer> got;
     in.drainInvXfers(got);
     if (got.empty()) return;
@@ -2259,6 +2309,7 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
 
 void Replicator::applyStoreAdds(GameWorld* gw, Inbound& in, NetLink& net,
                                 u32 localId, bool isHost) {
+    if (inventoryUiDeferred_) return;
     std::deque<InboundStoreAdd> got;
     in.drainStoreAdds(got);
     static int storeAddOn = -1;
@@ -2312,6 +2363,7 @@ void Replicator::applyStoreAdds(GameWorld* gw, Inbound& in, NetLink& net,
 }
 
 void Replicator::applyXferAcks(GameWorld* gw, Inbound& in, u32 localId) {
+    if (inventoryUiDeferred_) return;
     std::deque<InboundInvXferAck> got;
     in.drainInvXferAcks(got);
     unsigned long now = nowMs();
