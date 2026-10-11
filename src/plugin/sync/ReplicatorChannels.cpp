@@ -3147,10 +3147,14 @@ void Replicator::publishSquadMoves(GameWorld* gw, NetLink& net, u32 ownerId) {
         // of that insertion, not a user drag) always stays peer. Everything
         // ambiguous falls back to the legacy claim: that failure mode is the
         // known reload-to-re-anchor workaround, never an unowned unit.
-        // TOKELACOOP_XFER_RELEASE=0 restores the legacy unconditional claim.
+        // OFF by default since the protocol-65 merge: under TokelaCoop's squad-owner
+        // model (tab ledger + own-guard) a body you drag into the friend's tab stays
+        // YOURS (pinOwned_), so releasing it here made the own-guard refuse your
+        // next move of your own character (SQUAD-HOLD) - squad_sync's join/L0 leg.
+        // TOKELACOOP_XFER_RELEASE=1 opts back into KenshiDuo's release.
         if (!exited) {
             static int xferRel = -1;
-            if (xferRel < 0) { const char* e = getenv("TOKELACOOP_XFER_RELEASE"); xferRel = (e && e[0] == '0') ? 0 : 1; }
+            if (xferRel < 0) { const char* e = getenv("TOKELACOOP_XFER_RELEASE"); xferRel = (e && e[0] == '1') ? 1 : 0; }
             bool release = pinPeer_.find(nk) != pinPeer_.end(); // receive-half echo stays peer
             if (!release && xferRel == 1) {
                 std::map<std::pair<u32, u32>, unsigned int>::const_iterator rit =
