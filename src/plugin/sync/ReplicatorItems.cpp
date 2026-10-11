@@ -500,7 +500,7 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
     const float         PENDING_DROP_DIST = 2.5f;
     // A template-less pending drop (announceSeveredDrop) matches the first new row
     // near the amputated body: a severed limb can land a few metres away.
-    const float         SEVER_DROP_DIST   = 6.0f;
+    const float         SEVER_DROP_DIST   = 15.0f; // measured: the limb lands ~12.5 m from the body
 
     // Gear (itemType WEAPON/ARMOUR) rides the W2 conservation drop/pickup channel
     // (the real shared-save object is relocated bag<->ground on each client), so the
@@ -2326,7 +2326,7 @@ void Replicator::announceSeveredDrop(const unsigned int hand[5]) {
         float d2 = dx*dx + dy*dy + dz*dz;
         ++young;
         if (nearD2 < 0 || d2 < nearD2) { nearD2 = d2; nearAge = now - t.bornMs; nearNet = t.netId; }
-        if (d2 > 36.0f) continue;     // 6 m
+        if (d2 > 225.0f) continue;    // 15 m (limb measured 12.5 m away)
         t.baseline = false;
         char pb[160]; _snprintf(pb, sizeof(pb) - 1,
             "[wi] SEVER-PROMOTE netId=%u sid='%s' age=%lums", t.netId, t.stringID, now - t.bornMs);
