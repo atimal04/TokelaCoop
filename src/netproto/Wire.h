@@ -86,7 +86,7 @@ enum PacketType {
     PKT_BUILD_INTENT     = 53,// RELIABLE join -> host place/remove request (protocol 60); BuildIntentPacket
     PKT_INV_SAVE_FENCE   = 54,// RELIABLE pre-save inventory checkpoint marker (protocol 61); InvSaveFencePacket
     PKT_BOUNTY           = 55,// RELIABLE host-authoritative bounty/crime row (protocol 62, PR #18; tag 42 was taken by PKT_COMBAT_HIT); BountyPacket
-    PKT_MODLIST          = 56 // RELIABLE active-mod list, both directions on connect (TokelaCoop protocol 56, retagged 49->56 in the protocol-65 merge); ModListPacket
+    PKT_MODLIST          = 56 // RELIABLE active-mod list, both directions on connect (added in TokelaCoop protocol 56 on wire tag 49; wire tag 56 since the protocol-65 merge); ModListPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state

@@ -322,6 +322,7 @@ void sessionResetForUi() {
     coop::engine::setSaveSuppress(false);
     g_peerPresent = false;
     g_peerId = 0;
+    g_toastArmed = false;   // a stale connect/leave toast must not outlive the session
     g_modsLine.clear();
     g_modsWarn = false;
     g_peerModsCfg.clear();
