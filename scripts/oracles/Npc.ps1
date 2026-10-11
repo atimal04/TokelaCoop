@@ -1123,54 +1123,49 @@ function Test-CagePeer {
     $subj = ($mk.Matches[0].Groups[1].Value + ',' + $mk.Matches[0].Groups[2].Value)
     $bad = @(); $m = @{}
 
-    # Author-side markers: the host's put landed, the join's out landed.
-    $pk = Select-String -Path $HostFile -Pattern 'SCENARIO FURNACT host put hand=[\d,]+ kind=2 ok=1' -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $pk) { $bad += "host put never landed (no ok=1 marker)" }
-    $ok2 = Select-String -Path $JoinFile -Pattern 'SCENARIO FURNACT join out hand=[\d,]+ kind=2 ok=1' -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $ok2) { $bad += "join out never landed (no ok=1 marker)" }
+    # Evidence metrics are now occupancy based: authored means host census
+    # observed the successful local put; applied means join census converged.
+    $authored = $false; $applied = $false
+    $put = Select-String -Path $HostFile -Pattern 'SCENARIO FURNACT host put hand=[\d,]+ kind=2 ok=1' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $out = Select-String -Path $JoinFile -Pattern 'SCENARIO FURNACT join out hand=[\d,]+ kind=2 ok=1' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $put) { $bad += "host put never landed (no ok=1 marker)" }
+    if ($null -eq $out) { $bad += "join out never landed (no ok=1 marker)" }
+    $Tp = Get-MarkerTimeMs -File $HostFile -Pattern 'SCENARIO FURNACT host put '
+    $Td = Get-MarkerTimeMs -File $JoinFile -Pattern 'SCENARIO FURNACT join out '
+    $J = Get-FurnSeries -File $JoinFile -HandIS $subj
+    $H = Get-FurnSeries -File $HostFile -HandIS $subj
+    $hIn = @($H | Where-Object { $null -ne $Tp -and $_.t -ge $Tp -and ($null -eq $Td -or $_.t -le $Td) -and $_.in -eq 2 })
+    if ($hIn.Count -gt 0) { $authored = $true } else { $bad += "host census never read L1 in cage (in=2) after put" }
+    $jIn = @($J | Where-Object { $null -ne $Tp -and $_.t -ge $Tp -and $null -ne $Td -and $_.t -le $Td -and $_.in -eq 2 })
+    if ($jIn.Count -gt 0) {
+        $applied = $true
+        $enterLat = [int]($jIn[0].t - $Tp)
+        $m["EnterLatMs"] = $enterLat
+        if ($enterLat -gt $MaxLatencyMs) { $bad += "enter latency ${enterLat}ms > $MaxLatencyMs" }
+    } else { $bad += "join census never converged to L1 cage occupancy before its exit" }
 
-    # 1. Third-party authorship on the host.
-    $authored = (Select-String -Path $HostFile -Pattern ('\[furn\] SEND PEER-ENTER id=\d+ occ=' + [regex]::Escape($subj)) -Quiet)
-    if (-not $authored) { $bad += "host never authored SEND PEER-ENTER for L1" }
-    # 2. Own-body apply on the join.
-    $applied = (Select-String -Path $JoinFile -Pattern ('\[furn\] RECV ENTER id=\d+ occ=' + [regex]::Escape($subj) + ' .*ok=1') -Quiet)
-    if (-not $applied) { $bad += "join never applied the enter to its own body" }
-
-    if ($bad.Count -eq 0) {
-        $Tp = Get-MarkerTimeMs -File $HostFile -Pattern 'SCENARIO FURNACT host put '
-        $Td = Get-MarkerTimeMs -File $JoinFile -Pattern 'SCENARIO FURNACT join out '
-        $J = Get-FurnSeries -File $JoinFile -HandIS $subj
-        $H = Get-FurnSeries -File $HostFile -HandIS $subj
-        # 3. Occupancy on the JOIN (its own body entered the cage).
-        $jIn = @($J | Where-Object { $_.t -ge $Tp -and $_.t -le $Td -and $_.in -eq 2 })
-        if ($jIn.Count -lt 1) {
-            $bad += "join's own body never read in=2"
-        } else {
-            $enterLat = [int]($jIn[0].t - $Tp)
-            $m["EnterLatMs"] = $enterLat
-            if ($enterLat -gt $MaxLatencyMs) { $bad += "enter latency ${enterLat}ms > $MaxLatencyMs" }
+    # Sustained occupancy must not be displaced on either census during hold.
+    $healExit = (Select-String -Path $HostFile -Pattern ('\[furn\] HEAL EXIT occ=' + [regex]::Escape($subj)) -Quiet)
+    if ($healExit) { $bad += "host self-heal EJECTED the body (HEAL EXIT fired)" }
+    if ($null -ne $Td -and $jIn.Count -gt 0) {
+        $zeros = 0; $maxZeros = 0
+        foreach ($s in @($H | Where-Object { $_.t -ge $jIn[0].t -and $_.t -le ($Td - 1000) })) {
+            if ($s.in -eq 0) { $zeros++; if ($zeros -gt $maxZeros) { $maxZeros = $zeros } } else { $zeros = 0 }
         }
-        # 4. No eject on the HOST: no self-heal exit for L1, and once its copy
-        # entered, no in=0 dwell inside the hold window (2 consecutive samples
-        # = ~1 s, well under the old 3 s eject-repark cycle's visibility).
-        $healExit = (Select-String -Path $HostFile -Pattern ('\[furn\] HEAL EXIT occ=' + [regex]::Escape($subj)) -Quiet)
-        if ($healExit) { $bad += "host self-heal EJECTED the body (HEAL EXIT fired)" }
-        $hIn = @($H | Where-Object { $_.t -ge $Tp -and $_.t -le $Td -and $_.in -eq 2 })
-        if ($hIn.Count -ge 1) {
-            $zeros = 0; $maxZeros = 0
-            foreach ($s in @($H | Where-Object { $_.t -ge $jIn[0].t -and $_.t -le ($Td - 1000) })) {
-                if ($s.in -eq 0) { $zeros++; if ($zeros -gt $maxZeros) { $maxZeros = $zeros } }
-                else { $zeros = 0 }
-            }
-            $m["HostZeroDwell"] = $maxZeros
-            if ($maxZeros -ge 4) { $bad += "host copy left the cage mid-hold ($maxZeros consecutive in=0 samples)" }
-        } else {
-            $bad += "host copy never read in=2 (put never took?)"
-        }
-        # 5. Exit clean: both final samples read in=0.
-        if ($J.Count -ge 1 -and $J[$J.Count-1].in -ne 0) { $bad += "join's final sample still occupied (in=$($J[$J.Count-1].in))" }
-        if ($H.Count -ge 1 -and $H[$H.Count-1].in -ne 0) { $bad += "host's final sample still occupied (in=$($H[$H.Count-1].in))" }
+        $m["HostZeroDwell"] = $maxZeros
+        if ($maxZeros -ge 4) { $bad += "host copy left the cage mid-hold ($maxZeros consecutive in=0 samples)" }
+        $jHold = @($J | Where-Object { $_.t -ge $jIn[0].t -and $_.t -le ($Td - 1000) -and $_.in -eq 2 })
+        if ($jHold.Count -lt 2) { $bad += "join census did not sustain cage occupancy through hold" }
+        $hHold = @($H | Where-Object { $_.t -ge $jIn[0].t -and $_.t -le ($Td - 1000) -and $_.in -eq 2 })
+        if ($hHold.Count -lt 2) { $bad += "host census did not sustain cage occupancy through hold" }
     }
+    # The join's scripted exit must be clean, and both clients must observe it.
+    $jAfter = @($J | Where-Object { $null -ne $Td -and $_.t -ge $Td })
+    $hAfter = @($H | Where-Object { $null -ne $Td -and $_.t -ge $Td })
+    if ($jAfter.Count -eq 0 -or $jAfter[0].in -ne 0) { $bad += "join exit did not produce a clean in=0 census" }
+    if ($hAfter.Count -eq 0 -or $hAfter[0].in -ne 0) { $bad += "join exit did not converge to host in=0 census" }
+    if ($J.Count -ge 1 -and $J[$J.Count-1].in -ne 0) { $bad += "join's final sample still occupied (in=$($J[$J.Count-1].in))" }
+    if ($H.Count -ge 1 -and $H[$H.Count-1].in -ne 0) { $bad += "host's final sample still occupied (in=$($H[$H.Count-1].in))" }
 
     $v = if ($bad.Count -eq 0) { "PASS" } else { "FAIL" }
     $detail = $bad -join "; "
