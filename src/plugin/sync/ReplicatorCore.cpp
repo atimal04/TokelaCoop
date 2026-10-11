@@ -16,7 +16,8 @@
 namespace coop {
 
 Replicator::Replicator()
-    : catchupK_(CATCHUP_K), snapDist_(SNAP_DIST), snapSeconds_(SNAP_SECONDS),
+    : inventoryUiDeferred_(false), inventoryUiOpenMs_(0),
+      catchupK_(CATCHUP_K), snapDist_(SNAP_DIST), snapSeconds_(SNAP_SECONDS),
       combatSoftDist_(COMBAT_SOFT_DIST), combatSnapDist_(COMBAT_SNAP_DIST),
       combatBigSnapDist_(COMBAT_BIG_SNAP_DIST), combatSlideMax_(COMBAT_SLIDE_MAX),
       combatConvergeMs_(COMBAT_CONVERGE_MS),
