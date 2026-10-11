@@ -1974,18 +1974,39 @@ function Test-BdoorSync {
         $key = $p.Matches[0].Groups[5].Value
         $want = [int]$w.Matches[0].Groups[3].Value
         $wt   = [long]$w.Matches[0].Groups[7].Value
-        # 2a. the peer applied a bdoor row for the placer key
-        $recvRx = "\[bdoor\] RECV key=$([regex]::Escape($key)) idx=0 open=$want locked=\d was=-?\d/-?\d ok=1"
-        $recv = Select-String -Path $peerFile -Pattern $recvRx -ErrorAction SilentlyContinue | Select-Object -Last 1
-        if ($null -eq $recv) { $why += "$side door toggle never applied on peer (no [bdoor] RECV ok=1 for key=$key)"; continue }
-        # 2b. the peer's census shows the proxy door at the toggled state
-        $local = Get-MintLocalHand -PeerFile $peerFile -PlacerKey $key
-        if ($null -eq $local) { $why += "$side shack key=$key never minted on peer"; continue }
-        $seen = 0
-        foreach ($dh in @($peerDoors.Keys | Where-Object { $peerDoors[$_][0].bhand -eq $local })) {
-            $seen += @($peerDoors[$dh] | Where-Object { $_.t -ge ($wt - 500) -and $_.open -eq $want }).Count
+        # Host-authored toggles retain the legacy bdoor receive proof. A
+        # join-authored toggle uses KenshiDuo's host-canonical door intent;
+        # require acceptance there and state convergence in both censuses.
+        if ($side -eq 'join') {
+            $intentRx = "\[door\] INTENT ACCEPT kind=\d+ key=$([regex]::Escape($key)) idx=0 want=$want/\d+ actual=$want/\d+ seq=\d+ duplicate=\d+"
+            $intent = Select-String -Path $HostFile -Pattern $intentRx -ErrorAction SilentlyContinue | Select-Object -Last 1
+            if ($null -eq $intent) { $why += "join door toggle was not accepted by host (no applied [door] INTENT ACCEPT for key=$key)"; continue }
+            $converged = $true
+            $hostLocal = Get-MintLocalHand -PeerFile $HostFile -PlacerKey $key
+            if ($null -eq $hostLocal) { $why += "join shack key=$key never minted on host"; continue }
+            foreach ($pair in @(@('host', $hDoors, $hostLocal), @('join', $jDoors, $key))) {
+                $seen = 0
+                foreach ($dh in @($pair[1].Keys | Where-Object { $pair[1][$_][0].bhand -eq $pair[2] })) {
+                    $seen += @($pair[1][$dh] | Where-Object { $_.t -ge ($wt - 500) -and $_.t -le ($wt + 12000) -and $_.open -eq $want }).Count
+                }
+                if ($seen -eq 0) { $why += "join toggle accepted but $($pair[0]) census never showed key=$key open=$want within 12000ms"; $converged = $false }
+            }
+            if (-not $converged) { continue }
+            $seen = 1
+        } else {
+            # 2a. the peer applied a bdoor row for the placer key
+            $recvRx = "\[bdoor\] RECV key=$([regex]::Escape($key)) idx=0 open=$want locked=\d was=-?\d/-?\d ok=1"
+            $recv = Select-String -Path $peerFile -Pattern $recvRx -ErrorAction SilentlyContinue | Select-Object -Last 1
+            if ($null -eq $recv) { $why += "$side door toggle never applied on peer (no [bdoor] RECV ok=1 for key=$key)"; continue }
+            # 2b. the peer's census shows the proxy door at the toggled state
+            $local = Get-MintLocalHand -PeerFile $peerFile -PlacerKey $key
+            if ($null -eq $local) { $why += "$side shack key=$key never minted on peer"; continue }
+            $seen = 0
+            foreach ($dh in @($peerDoors.Keys | Where-Object { $peerDoors[$_][0].bhand -eq $local })) {
+                $seen += @($peerDoors[$dh] | Where-Object { $_.t -ge ($wt - 500) -and $_.open -eq $want }).Count
+            }
+            if ($seen -eq 0) { $why += "$side toggle applied but peer census never showed proxy door open=$want"; continue }
         }
-        if ($seen -eq 0) { $why += "$side toggle applied but peer census never showed proxy door open=$want"; continue }
         $crossed++
         Write-Host "    FINDING: $side door toggle want=$want CROSSED (peer applied + $seen census samples)"
     }
