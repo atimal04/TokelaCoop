@@ -40,7 +40,7 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
     // hash + settle + safety-resend gate below. The census set is replaced
     // wholesale each pass (containers leaving interest stop being captured;
     // their invPub_ baseline survives for the return).
-    if (storeSync_) {
+    if (storeSync_ && isHostRole()) {
         unsigned long cnow = nowMs();
         if (contCensusMs_ == 0 || (cnow - contCensusMs_) >= 1000) {
             contCensusMs_ = cnow;
@@ -197,6 +197,8 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
             }
         }
         u8 sflags = trunc ? INV_FLAG_TRUNCATED : (u8)0;
+        if (storeSync_ && isHostRole() && censusContainers_.count(*it) != 0)
+            sflags |= INV_FLAG_STORE;
         net.queueInvSnapshot(ownerId, keyKind, wireKey, items, n, sflags);
         pub.hash = hash; pub.lastSendMs = now; pub.lastSentN = n; pub.lastSentUnits = units;
         if (fenceSend) {
@@ -1878,7 +1880,8 @@ bool Replicator::wdPendingDrop(const Key& k) const {
     return false;
 }
 
-void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 ownerId) {
+void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 ownerId,
+                                          bool allowTransfers) {
     const unsigned long XFER_SCAN_MS   = 400;   // detector cadence
     const unsigned long XFER_SETTLE_MS = 600;   // a diff must persist (mid-drag cursor hold)
     const unsigned long XFER_PEND_MS   = 6000;  // unpaired diff folds back into the baseline
@@ -1888,6 +1891,8 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
     xferScanMs_ = now;
     static int dumpX = -1;
     if (dumpX < 0) { const char* e = getenv("TOKELACOOP_INV_DUMP"); dumpX = (e && e[0] == '1') ? 1 : 0; }
+    static int storeAddOn = -1;
+    if (storeAddOn < 0) { const char* e = getenv("TOKELACOOP_STORE_ADD"); storeAddOn = (e && e[0] == '0') ? 0 : 1; }
 
     // Tracked set: every container we author + every peer container we have received a
     // snapshot for. Both ends of any drag a player can perform live in this union.
@@ -1954,6 +1959,52 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
                 pend[*ky] = p;
             } else if (pe->second.delta != delta) {
                 pe->second.delta = delta; pe->second.sinceMs = now;
+            } else if (!isHostRole() && storeSync_ && storeAddOn && delta > 0 &&
+                       peerStoreContainers_.count(k) != 0 &&
+                       now - pe->second.sinceMs >= XFER_SETTLE_MS) {
+                // A settled gain in a host-censused store has no source loss:
+                // represent the operation explicitly instead of folding it into
+                // the baseline and letting the next host snapshot erase it.
+                bool pairedLoss = false;
+                for (std::map<Key, std::map<XKey, XferPend> >::iterator li = xferPend_.begin();
+                     li != xferPend_.end(); ++li) {
+                    std::map<XKey, XferPend>::iterator lp = li->second.find(*ky);
+                    if ((li->first < k || k < li->first) && lp != li->second.end() && lp->second.delta < 0) {
+                        pairedLoss = true; break;
+                    }
+                }
+                if (!pairedLoss) {
+                    StoreAddPacket pkt; memset(&pkt, 0, sizeof(pkt));
+                    pkt.type = (u8)PKT_STORE_ADD; pkt.ownerId = ownerId;
+                    pkt.requestId = nextStoreAddId_++;
+                    pkt.itemType = ky->second;
+                    pkt.quantity = (u16)((delta > 999) ? 999 : delta);
+                    strncpy(pkt.stringID, ky->first.c_str(), sizeof(pkt.stringID) - 1);
+                    int keyKind = 0; Key wire = k;
+                    prodWireKeyForLocal(k, false, keyKind, wire);
+                    pkt.keyKind = (u8)keyKind;
+                    pkt.key[0] = wire.t; pkt.key[1] = wire.c; pkt.key[2] = wire.cs;
+                    pkt.key[3] = wire.i; pkt.key[4] = wire.s;
+                    unsigned int hand[5]; handForContainerKey(k, hand);
+                    unsigned int n = engine::captureContainerContents(gw, hand, items, 64, 0);
+                    for (unsigned int q = 0; q < n; ++q) {
+                        if (items[q].itemType != ky->second || strcmp(items[q].stringID, ky->first.c_str()) != 0) continue;
+                        pkt.quality = items[q].quality; pkt.level = items[q].level;
+                        strncpy(pkt.manufacturer, items[q].manufacturer, sizeof(pkt.manufacturer) - 1);
+                        strncpy(pkt.material, items[q].material, sizeof(pkt.material) - 1);
+                        break;
+                    }
+                    net.queueStoreAdd(pkt);
+                    XferLatch& latch = xferLatch_[k][*ky];
+                    latch.delta += (int)pkt.quantity; latch.deadlineMs = now + 2500;
+                    base[*ky] += (int)pkt.quantity;
+                    pend.erase(*ky);
+                    char b[220]; _snprintf(b, sizeof(b) - 1,
+                        "[store] ADD-INTENT SEND id=%u hand=%u,%u,%u,%u,%u sid='%s' type=%u qty=%u",
+                        pkt.requestId, k.t, k.c, k.cs, k.i, k.s, pkt.stringID,
+                        pkt.itemType, (unsigned)pkt.quantity);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
             } else if (now - pe->second.sinceMs >= XFER_PEND_MS) {
                 // Never paired: fold into the baseline and stop watching.
                 if (cv != ci->second.end()) base[*ky] = cv->second; else base.erase(*ky);
@@ -1965,6 +2016,10 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
             }
         }
     }
+
+    // Store additions share this scan/baseline, but remain independently
+    // usable when the cross-owner drag channel is disabled.
+    if (!allowTransfers) return;
 
     // PAIR pass (core/XferPair.h): every settled LOSS of an item key in one container
     // is matched with the settled GAINS of that key in other containers - a completed
@@ -2199,6 +2254,60 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
             p.xferId, p.ownerId, p.stringID, p.itemType, (unsigned)p.quantity,
             moved, fab, (unsigned)ack.verdict);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+void Replicator::applyStoreAdds(GameWorld* gw, Inbound& in, NetLink& net,
+                                u32 localId, bool isHost) {
+    std::deque<InboundStoreAdd> got;
+    in.drainStoreAdds(got);
+    static int storeAddOn = -1;
+    if (storeAddOn < 0) { const char* e = getenv("TOKELACOOP_STORE_ADD"); storeAddOn = (e && e[0] == '0') ? 0 : 1; }
+    for (std::deque<InboundStoreAdd>::iterator it = got.begin(); it != got.end(); ++it) {
+        const StoreAddPacket& p = it->pkt;
+        char sidLog[sizeof(p.stringID) + 1];
+        memcpy(sidLog, p.stringID, sizeof(p.stringID)); sidLog[sizeof(p.stringID)] = '\0';
+        const char* why = 0;
+        int applied = 0;
+        Key key; key.t = p.key[0]; key.c = p.key[1]; key.cs = p.key[2];
+        key.i = p.key[3]; key.s = p.key[4];
+        unsigned int hand[5] = { 0, 0, 0, 0, 0 };
+        if (!storeAddOn || !storeSync_) why = "disabled";
+        else if (!isHost) why = "not-host";
+        else if (p.ownerId == 0 || it->ownerId != p.ownerId || p.ownerId == localId) why = "sender";
+        else if (p.requestId == 0) why = "request-id";
+        else if (p.keyKind > 1 || !localHandForProdKey((int)p.keyKind, key, hand)) why = "key";
+        else {
+            Key local; local.t = hand[0]; local.c = hand[1]; local.cs = hand[2];
+            local.i = hand[3]; local.s = hand[4];
+            if (censusContainers_.count(local) == 0) why = "not-store";
+            else if (p.quantity < 1 || p.quantity > 999) why = "quantity";
+            else if (!memchr(p.stringID, '\0', sizeof(p.stringID)) || !p.stringID[0] ||
+                     !memchr(p.manufacturer, '\0', sizeof(p.manufacturer)) ||
+                     !memchr(p.material, '\0', sizeof(p.material))) why = "template";
+            else if (p.quality > 10000 || (p.level > 254 && p.level != GRADE_NA)) why = "quality-grade";
+            else if (appliedStoreAdds_.count(std::make_pair(p.ownerId, p.requestId)) != 0) why = "duplicate";
+            else if (engine::resolveObjectByHand(hand) == 0) why = "unresolved";
+            else {
+                appliedStoreAdds_.insert(std::make_pair(p.ownerId, p.requestId));
+                if (appliedStoreAdds_.size() > 4096) appliedStoreAdds_.erase(appliedStoreAdds_.begin());
+                applied = engine::addItemsToContainerBySid(gw, hand, p.stringID, p.itemType,
+                    (int)p.quantity, (int)p.quality, p.manufacturer, p.material, p.level);
+                if (applied < 0) applied = 0;
+                if (applied == 0) why = "template-or-capacity";
+                else xferBaseShift(local, XKey(std::string(p.stringID), p.itemType), applied);
+            }
+        }
+        char b[256];
+        if (why) _snprintf(b, sizeof(b) - 1,
+            "[store] ADD-INTENT REFUSE id=%u from=%u reason=%s sid='%s' qty=%u",
+            p.requestId, it->ownerId, why, sidLog, (unsigned)p.quantity);
+        else _snprintf(b, sizeof(b) - 1,
+            "[store] ADD-INTENT APPLY id=%u from=%u hand=%u,%u,%u,%u,%u sid='%s' qty=%u applied=%d",
+            p.requestId, it->ownerId, hand[0], hand[1], hand[2], hand[3], hand[4],
+            sidLog, (unsigned)p.quantity, applied);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        (void)net; // Host snapshot publication is the canonical response.
     }
 }
 

@@ -25,9 +25,10 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
+// 66 = reliable join-to-host storage add intents.
 // 65 = merge of TokelaCoop v0.54 (57) and KenshiDuo (64): both older lines are
 // refused at handshake instead of playing with different packet tags.
-const u16 PROTOCOL_VERSION = 65;
+const u16 PROTOCOL_VERSION = 66;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -86,7 +87,8 @@ enum PacketType {
     PKT_BUILD_INTENT     = 53,// RELIABLE join -> host place/remove request (protocol 60); BuildIntentPacket
     PKT_INV_SAVE_FENCE   = 54,// RELIABLE pre-save inventory checkpoint marker (protocol 61); InvSaveFencePacket
     PKT_BOUNTY           = 55,// RELIABLE host-authoritative bounty/crime row (protocol 62, PR #18; tag 42 was taken by PKT_COMBAT_HIT); BountyPacket
-    PKT_MODLIST          = 56 // RELIABLE active-mod list, both directions on connect (added in TokelaCoop protocol 56 on wire tag 49; wire tag 56 since the protocol-65 merge); ModListPacket
+    PKT_MODLIST          = 56, // RELIABLE active-mod list, both directions on connect (added in TokelaCoop protocol 56 on wire tag 49; wire tag 56 since the protocol-65 merge); ModListPacket
+    PKT_STORE_ADD        = 57  // RELIABLE join -> host add into a registered store container; StoreAddPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -601,8 +603,28 @@ struct InvSnapshotHeader {
     u8  count;   // number of InvItemEntry that follow
 };
 
+// Protocol 66: a Join-side creation/addition into a host-censused store. The
+// destination uses protocol-34 identity (raw baked hand or placer key). The
+// request ID is monotonic per sender; ENet delivers this on the reliable
+// ordered channel. Weapon provenance is included for the existing factory.
+struct StoreAddPacket {
+    u8  type;       // = PKT_STORE_ADD
+    u32 ownerId;    // requesting player; receiver also checks the ENet sender
+    u32 requestId;  // monotonic per session
+    u8  keyKind;    // 0 = raw hand, 1 = protocol-34 placer key
+    u32 key[5];
+    char stringID[96];
+    u32 itemType;
+    u16 quantity;
+    u16 quality;    // condition*100 / quality bucket, as InvItemEntry
+    u8  level;      // craft grade; 255 means not applicable
+    char manufacturer[48];
+    char material[48];
+};
+
 // InvSnapshotHeader::flags bits.
 const u8 INV_FLAG_TRUNCATED = 0x01;
+const u8 INV_FLAG_STORE     = 0x02; // Protocol 66: host census container (not a character inventory).
 
 // A full snapshot ([header][InvItemEntry*count]) can now exceed one datagram (each entry
 // carries two 48-byte template ids), but inv snapshots ride the RELIABLE channel, which

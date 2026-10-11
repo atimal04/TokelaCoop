@@ -1796,8 +1796,8 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
         // blockXfer is on, making this (and applyTransfers below) a no-op. The
         // xferLatch_/xferDefer_ reconcile-race machinery then stays dormant (never
         // populated). TOKELACOOP_BLOCK_XFER=0 restores this replicate-the-trade path.
-        if (g_cfg.xferSync)
-            g_repl.detectAndPublishTransfers(gw, g_net, g_net.localId());
+        if (g_cfg.xferSync || g_cfg.storeSync)
+            g_repl.detectAndPublishTransfers(gw, g_net, g_net.localId(), g_cfg.xferSync);
         // Phase W1 (bidirectional): BOTH clients stream the free ground items they
         // author in their interest sphere - owner-scoped netId spaces, peer items
         // filtered by the proxy echo guard - so a join-side drop of materials/food
@@ -2054,6 +2054,8 @@ void tickReplicateApply(GameWorld* gw, bool worldLive) {
             // more while still defending a move that was refused.
             g_repl.applyXferAcks(gw, g_inbound, g_net.localId());
         }
+        if (g_cfg.storeSync)
+            g_repl.applyStoreAdds(gw, g_inbound, g_net, g_net.localId(), g_cfg.isHost);
         // Phase 4a: reconcile any peer-owned container we received a fresh snapshot
         // for (the join applies the host's container; the host skips its own).
         g_repl.applyInventories(gw);
@@ -3095,10 +3097,10 @@ void installEngineDetours() {
     g_repl.setBountySync(g_cfg.bountySync);
     // Protocol 34: the HOST authors every storage/machine container near the
     // interest centers (the ~1 Hz census inside publishInventories); the join
-    // reconciles via the translated key. Host-only flag - the join must never
-    // census-author (host-authoritative world containers). Layered on invSync
-    // (publishInventories is the carrier and is gated on it below).
-    g_repl.setStoreSync(g_cfg.storeSync && g_cfg.isHost);
+    // reconciles via the translated key. Enabled on both peers: only the host
+    // performs the census and authors these snapshots; the join uses their store
+    // marker to detect add intents. Layered on invSync below.
+    g_repl.setStoreSync(g_cfg.storeSync);
     if (g_cfg.recruitSync) {
         if (coop::engine::installRecruitHook())
             coopLog("[recruit] recruit detour installed; recruitment sync ON");
