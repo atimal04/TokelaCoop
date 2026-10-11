@@ -361,7 +361,9 @@ public:
     // census drop/pickup reading of the same count edges. Own<->own moves and
     // unpaired diffs are folded into the baseline (own snapshots already carry
     // them; a lone loss is a drop/consume, not a trade).
-    void detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 ownerId);
+    void detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 ownerId,
+                                   bool allowTransfers = true);
+    void applyStoreAdds(GameWorld* gw, Inbound& in, NetLink& net, u32 localId, bool isHost);
 
     // AFTER engine (protocol 37): drain received transfer intents and relocate the
     // REAL Item* between our own copies of the two containers (conservation - no
@@ -1567,10 +1569,11 @@ private:
     struct InvPub { u32 hash; unsigned long lastSendMs; u32 pendingHash; unsigned long pendingSince; unsigned int lastSentN; unsigned int lastSentUnits; };
     // truncated (protocol 46): the author's container did not fit in INV_ITEMS_MAX, so
     // `items` is an INCOMPLETE description - reconcile additive-only, never delete.
-    struct InvRecv { u32 ownerId; std::vector<InvItemEntry> items; bool dirty; bool truncated; };
+    struct InvRecv { u32 ownerId; std::vector<InvItemEntry> items; bool dirty; bool truncated; bool store; };
     std::set<Key>          ownedContainers_;
     std::map<Key, InvPub>  invPub_;
     std::map<Key, InvRecv> invRecv_;
+    std::set<Key> peerStoreContainers_;
     u32                    invSaveFencePending_;
     // Protocol 34: the host's ~1 Hz container census result (LOCAL hands of
     // complete STORAGE/machine-class buildings in the interest spheres).
@@ -1803,6 +1806,8 @@ private:
     // (otherwise the reconcile undoes the drag and the rebase erases the evidence).
     std::map<Key, unsigned long>              xferDefer_;
     u32                                       nextXferId_;
+    u32                                       nextStoreAddId_;
+    std::set<std::pair<u32, u32> >            appliedStoreAdds_;
     std::set<std::pair<u32, u32> >            appliedXfers_;
     // Protocol 50: intents we authored and are still waiting on a verdict for,
     // keyed by our own xferId. Holds exactly what the verdict has to undo - the
@@ -1846,7 +1851,7 @@ private:
     // and then, and ownership flipping with it split drags in two.
     bool xferAuthored(const Key& k) const {
         return ownedContainers_.count(k) != 0 || ownHands_.count(k) != 0 ||
-               (storeSync_ && censusEver_.count(k) != 0);
+               (storeSync_ && isHostRole() && censusEver_.count(k) != 0);
     }
     // When the detector last captured each container (a container coming back after
     // a gap is re-seeded: what changed while it was out of reach is not a drag).

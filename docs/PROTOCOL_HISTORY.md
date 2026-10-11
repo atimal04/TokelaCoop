@@ -19,9 +19,9 @@ so parallel integration lines do not collide.
 | 64 | PR #36 (jbaxter91): join assassination knockout report via a `MedicalSystem::knockout` detour (`COMBAT_HIT_KNOCKOUT` flag + `koSkill` field on `CombatHitPacket`, size 37→42; no new tags). Number 64 was reserved for PR #35, which merged empty (nested backpack sync already covered upstream), so 64 passes to #36. |
 
 | 65 | **Merge (atimal04/TokelaCoop):** TokelaCoop v0.54 line (its own 56 = active-mod list `PKT_MODLIST`, 57 = v0.54 own-characters guard + squad-owner ledger) merged with this KenshiDuo line (56-64). The two lines both used tag 49, so `PKT_MODLIST` moves to tag **56**; every KenshiDuo tag keeps its number. 65 refuses both parents (57 and 64) at handshake. |
+| 66 | Join-to-host storage add intent (`PKT_STORE_ADD` = 57) for settled additions to host-censused containers; host validates and adds the requested quantity, and its protocol-34 snapshot publishes the result. Census snapshots carry `INV_FLAG_STORE` so joins can distinguish stores from ordinary host inventories. |
 
 ## Planned (reserved, not yet merged)
 
 | Version | Change |
 |---|---|
-| 66 | Reserved (next change after the merge). |
