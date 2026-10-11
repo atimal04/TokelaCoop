@@ -57,6 +57,23 @@ void netErr(const char* msg) {
     coop::logErrLine(buf);
 }
 
+// WAN link tuning (#83/#86: LAN connects fine, intercontinental Steam/VPN
+// joins sit in an empty world). ENet caps reliable data in flight at
+// packetThrottle/32 * windowSize (64 KB) per RTT, and its throttle decays on
+// every RTT spike above the variance - jitter and retransmits drive it to a
+// single MTU per RTT, i.e. ~4 KB/s at 300 ms, so a 20 MB save bootstrap takes
+// over an hour. Pin the throttle at its limit (deceleration 0) and stretch the
+// peer timeout so a long transfer is not dropped mid-stream.
+// TOKELACOOP_WAN_TUNE=0 restores ENet defaults.
+static void tuneWanPeer(ENetPeer* peer) {
+    if (!peer) return;
+    const char* e = getenv("TOKELACOOP_WAN_TUNE");
+    if (e && e[0] == '0') { netLog("wan tune OFF (ENet default throttle/timeout)"); return; }
+    enet_peer_throttle_configure(peer, ENET_PEER_PACKET_THROTTLE_INTERVAL, 2, 0);
+    enet_peer_timeout(peer, 64, 15000, 60000);
+    netLog("wan tune: throttle pinned (decel 0), timeout 15-60 s");
+}
+
 // Cross-thread UI-error channel backing store (see NetLink.h). The buffer holds
 // the latest player-facing connection-reject reason; the NET thread writes it and
 // the MAIN thread reads it. Wrapped in a global object whose constructor runs at
@@ -597,6 +614,7 @@ void NetLink::threadLoop() {
         while (enet_host_service(enetHost_, &ev, TICK_MS) > 0) {
             switch (ev.type) {
                 case ENET_EVENT_TYPE_CONNECT: {
+                    tuneWanPeer(ev.peer);
                     if (isHost_) {
                         // Wait for the client's HELLO before assigning an id, so
                         // a version mismatch is rejected before we admit it. A
