@@ -1656,6 +1656,116 @@ private:
     unsigned int  vic_[5];
 };
 
+// shared_fight_parity: both clients use the baked sync-save crowd and issue
+// ordinary attack orders from their own squad. Successful order calls are the
+// attempt denominator (there is no engine swing-attempt counter); captured hits
+// come from the existing join damage-guard / PKT_COMBAT_HIT capture path.
+class SharedFightParityScenario : public TimedScenario {
+public:
+    SharedFightParityScenario()
+        : TimedScenario("shared_fight_parity", 0), haveOwn_(false),
+          lastSampleMs_(0), lastOrderMs_(0), attacks_(0), hitBase_(0) {
+        ownHand_[0] = ownHand_[1] = ownHand_[2] = ownHand_[3] = ownHand_[4] = 0;
+    }
+    virtual void onStart(const ScenarioContext& ctx) {
+        hitBase_ = (!ctx.isHost && ctx.combatHitCaptureCount)
+            ? ctx.combatHitCaptureCount() : 0;
+    }
+    virtual bool onTick(const ScenarioContext& ctx) {
+        EntityState squad[32];
+        unsigned int nSquad = engine::captureSquad(ctx.gw, false, squad, 32);
+        const unsigned int rank = ctx.isHost ? 0u : 1u;
+        int leader = tabLeaderIdx(squad, nSquad, rank);
+        if (leader >= 0) {
+            handFromEntity(squad[leader], ownHand_);
+            haveOwn_ = true;
+        }
+        if (haveOwn_ && ctx.elapsedMs >= 5000 &&
+            (lastOrderMs_ == 0 || ctx.elapsedMs - lastOrderMs_ >= 2500)) {
+            unsigned int victim[5];
+            if (engine::pickCombatVictim(ctx.gw, ownHand_, 0, victim, 0)) {
+                lastOrderMs_ = ctx.elapsedMs;
+                // Count successful attack orders issued by this client's own squad.
+                // Kenshi exposes no per-character swing-attempt counter here.
+                for (unsigned int i = 0; i < nSquad; ++i) {
+                    unsigned int attacker[5];
+                    handFromEntity(squad[i], attacker);
+                    if (engine::orderAttackByHand(ctx.gw, attacker, victim) && !ctx.isHost)
+                        ++attacks_;
+                }
+            }
+        }
+        if (lastSampleMs_ == 0 || ctx.elapsedMs - lastSampleMs_ >= 500) {
+            lastSampleMs_ = ctx.elapsedMs;
+            if (haveOwn_) logParitySample(ctx);
+            if (!ctx.isHost) {
+                unsigned int hits = ctx.combatHitCaptureCount
+                    ? ctx.combatHitCaptureCount() - hitBase_ : 0;
+                char b[112];
+                _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO PARITY JOIN attacks=%lu hits=%u",
+                    attacks_, hits);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        if (ctx.elapsedMs >= 45000) {
+            passed_ = haveOwn_;
+            return true;
+        }
+        return false;
+    }
+private:
+    void logParitySample(const ScenarioContext& ctx) {
+        Character* own = engine::resolveCharByHand(ownHand_[0], ownHand_[1],
+            ownHand_[2], ownHand_[3], ownHand_[4]);
+        if (!own) return;
+        float lx, ly, lz;
+        if (!engine::readPos(own, &lx, &ly, &lz)) return;
+        EntityState npcs[128];
+        unsigned int n = engine::captureNpcs(ctx.gw, npcs, 128);
+        unsigned int keys[128][2];
+        unsigned int used = 0;
+        for (unsigned int i = 0; i < n; ++i) {
+            float dx = npcs[i].x - lx, dy = npcs[i].y - ly, dz = npcs[i].z - lz;
+            if (dx * dx + dy * dy + dz * dz > 22500.0f) continue;
+            unsigned int local[5], canon[5];
+            handFromEntity(npcs[i], local);
+            for (int k = 0; k < 5; ++k) canon[k] = local[k];
+            float distance = 0.0f;
+            // Translate exact local proxy/re-key identities to census wire hands.
+            if (ctx.canonicalNpcHand) ctx.canonicalNpcHand(local, canon);
+            bool duplicate = false;
+            for (unsigned int j = 0; j < used; ++j)
+                if (keys[j][0] == canon[0] && keys[j][1] == canon[1]) duplicate = true;
+            if (!duplicate && used < 128) { keys[used][0] = canon[0]; keys[used][1] = canon[1]; ++used; }
+        }
+        for (unsigned int i = 0; i < used; ++i)
+            for (unsigned int j = i + 1; j < used; ++j)
+                if (keys[j][0] < keys[i][0] || (keys[j][0] == keys[i][0] && keys[j][1] < keys[i][1])) {
+                    unsigned int a = keys[i][0], b = keys[i][1];
+                    keys[i][0] = keys[j][0]; keys[i][1] = keys[j][1];
+                    keys[j][0] = a; keys[j][1] = b;
+                }
+        char hands[3200]; unsigned int at = 0;
+        hands[0] = '\0';
+        for (unsigned int i = 0; i < used; ++i) {
+            int wrote = _snprintf(hands + at, sizeof(hands) - at,
+                "%s%u,%u", i ? ";" : "", keys[i][0], keys[i][1]);
+            if (wrote < 0 || (unsigned int)wrote >= sizeof(hands) - at) break;
+            at += (unsigned int)wrote;
+        }
+        char line[3400];
+        _snprintf(line, sizeof(line) - 1,
+            "SCENARIO PARITY %s t=%lu npcs=%u hands=%s",
+            ctx.isHost ? "HOST" : "JOIN", ctx.elapsedMs, used, hands);
+        line[sizeof(line) - 1] = '\0'; coop::logLine(line);
+    }
+    bool haveOwn_;
+    unsigned long lastSampleMs_, lastOrderMs_;
+    unsigned long attacks_;
+    unsigned int hitBase_, ownHand_[5];
+};
+
 // assault_travel (2026-08-05 free-play report: "an enemy was attacking my
 // character on the join client, but not the host", hit after travelling a long
 // distance). assault_town already proves a join-picked fight crosses while both
@@ -2205,6 +2315,7 @@ Scenario* makeCombatScenario(const std::string& name) {
     if (name == "combat_battle") return new CombatBattleScenario();
     if (name == "combat_win")    return new CombatWinScenario();
     if (name == "pc_assault")   return new PcAssaultScenario();
+    if (name == "shared_fight_parity") return new SharedFightParityScenario();
     return 0;
 }
 

@@ -415,6 +415,8 @@ public:
 
     // Enable join-dealt damage reporting (join only; see publishCombatHits).
     void setReportCombat(bool v) { reportCombat_ = v; }
+    unsigned int combatHitCaptureCount() const { return combatHitCaptureCount_; }
+    bool canonicalNpcHand(const unsigned int localHand[5], unsigned int canonicalHand[5]) const;
 
     // AFTER publishOwned (protocol 17, both clients): stream each OWNED
     // player-squad member's CharStats (attributes/skills/xp) on the RELIABLE
@@ -2086,6 +2088,7 @@ private:
     bool                 reportCombat_;
     std::map<Key, PendingHit> pendingHits_;
     unsigned int         nextHitId_;
+    unsigned int         combatHitCaptureCount_;
 
     // Carried-body sync (protocol 18): master enable (TOKELACOOP_CARRY_SYNC).
     bool                 carrySync_;

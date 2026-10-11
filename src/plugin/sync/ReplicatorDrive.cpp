@@ -414,6 +414,7 @@ void Replicator::applyTargets(GameWorld* gw) {
             float koSkill = 1.0f;
             bool knockout = engine::takeReportedKnockout(c, &koSkill);
             if (!isSquad && ((haveDamage && (rf > 0.0f || rb > 0.0f)) || knockout)) {
+                ++combatHitCaptureCount_;
                 PendingHit& ph = pendingHits_[it->first];
                 ph.flesh += rf; ph.blood += rb;
                 if (knockout) {

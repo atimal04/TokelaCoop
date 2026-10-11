@@ -37,6 +37,10 @@ struct ScenarioContext {
     bool        (*pickMintedProxy)(const unsigned int refHand[5],
                                    unsigned int outLocal[5],
                                    unsigned int outCanon[5], float* outDist);
+    // JOIN-only cumulative successful damage captures drained for PKT_COMBAT_HIT.
+    unsigned int (*combatHitCaptureCount)();
+    bool        (*canonicalNpcHand)(const unsigned int localHand[5],
+                                    unsigned int canonicalHand[5]);
 };
 
 class Scenario {

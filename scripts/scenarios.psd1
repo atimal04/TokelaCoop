@@ -2109,6 +2109,15 @@
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'full'; WanVariant = $false
         }
+        # Shared, sustained fight coverage: canonical NPC identity parity plus
+        # join captured-hit rate during the 40 s window after warm-up.
+        shared_fight_parity = @{
+            Save = 'sync'; Setup = ''; Tolerance = 20.0
+            PrimaryGate = 'shared_fight_parity'
+            Gating   = @('shared_fight_parity', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march', 'existence_parity')
+            Tier = 'full'; WanVariant = $false
+        }
 
         # ---- inventory ---------------------------------------------------------------
         inv_order = @{
