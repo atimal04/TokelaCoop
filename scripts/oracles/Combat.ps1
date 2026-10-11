@@ -1574,3 +1574,77 @@ function Test-PcAssault {
     Write-Host ("  PC-ASSAULT PASS - atk=$atk hit-hand=$hitHand cap=$capAll host-orders=$ordOk hostview-fight=$fight; join-dealt authoritative damage flesh=$($m.hitFlesh)/blood=$($m.hitBlood) (x$hitCount reports) streamed to join drop=$($m.joinDrop) (end-gap $($m.endGap)); cohesion joinOnlyFrac=$joinOnlyFrac (finding)")
     return (Add-GateResult -Name "pc_assault" -Status PASS -Metrics $m)
 }
+
+# Shared fight identity and join damage capture gate. Times are aligned into the
+# host clock frame before pairing; each missing canonical hand gets a 3 s lease.
+function Test-SharedFightParity {
+    param([string]$HostFile, [string]$JoinFile)
+    $samplePat = 'SCENARIO PARITY (HOST|JOIN) t=(\d+) npcs=(\d+) hands=([^\]]*)'
+    $samples = @{ HOST = (New-Object System.Collections.ArrayList); JOIN = (New-Object System.Collections.ArrayList) }
+    foreach ($side in @(@{ name='HOST'; file=$HostFile }, @{ name='JOIN'; file=$JoinFile })) {
+        $offset = Get-LogClockOffsetMs -File $side.file
+        foreach ($m in (Select-String -Path $side.file -Pattern $samplePat -ErrorAction SilentlyContinue)) {
+            $g = $m.Matches[0].Groups
+            if ([int]$g[2].Value -lt 5000) { continue }
+            if ($m.Line -notmatch '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\]') { continue }
+            $stamp = Convert-StampToMs -Groups $Matches -OffsetMs $offset
+            $hands = @()
+            if ($g[4].Value -ne '') { $hands = @($g[4].Value.Split(';') | Where-Object { $_ -ne '' }) }
+            [void]$samples[$side.name].Add(@{ t=$stamp; elapsed=[int]$g[2].Value; count=[int]$g[3].Value; hands=$hands })
+        }
+    }
+    $paired = New-Object System.Collections.ArrayList
+    $usedJoin = @{}
+    foreach ($h in $samples.HOST) {
+        $best = $null; $bestDelta = [int]::MaxValue
+        foreach ($j in $samples.JOIN) {
+            if ($usedJoin.ContainsKey([string]$j.t)) { continue }
+            $delta = [math]::Abs($h.t - $j.t)
+            if ($delta -lt $bestDelta) { $best = $j; $bestDelta = $delta }
+        }
+        if ($null -ne $best -and $bestDelta -le 750) {
+            $usedJoin[[string]$best.t] = $true
+            [void]$paired.Add(@{ t=[math]::Max($h.t,$best.t); h=$h; j=$best })
+        }
+    }
+    $badDiff = 0; $maxCountDiff = 0; $missingSince = @{}; $worstMs = 0; $worstHand = ''
+    foreach ($p in $paired) {
+        $hs = @{}; foreach ($x in $p.h.hands) { $hs[$x] = $true }
+        $js = @{}; foreach ($x in $p.j.hands) { $js[$x] = $true }
+        $countDiff = [math]::Abs($p.h.count - $p.j.count)
+        if ($countDiff -gt $maxCountDiff) { $maxCountDiff = $countDiff }
+        if ($countDiff -gt 1) { $badDiff++ }
+        $all = @($hs.Keys) + @($js.Keys) | Sort-Object -Unique
+        foreach ($hand in $all) {
+            $absent = (-not $hs.ContainsKey($hand)) -or (-not $js.ContainsKey($hand))
+            if ($absent) {
+                if (-not $missingSince.ContainsKey($hand)) { $missingSince[$hand] = $p.t }
+                $gap = $p.t - $missingSince[$hand]
+                if ($gap -gt $worstMs) { $worstMs = $gap; $worstHand = $hand }
+            } elseif ($missingSince.ContainsKey($hand)) { [void]$missingSince.Remove($hand) }
+        }
+    }
+    foreach ($hand in @($missingSince.Keys)) {
+        $gap = $paired[$paired.Count - 1].t - $missingSince[$hand]
+        if ($gap -gt $worstMs) { $worstMs = $gap; $worstHand = $hand }
+    }
+    $attackRows = @(Select-String -Path $JoinFile -Pattern 'SCENARIO PARITY JOIN attacks=(\d+) hits=(\d+)' -ErrorAction SilentlyContinue)
+    $attacks = 0; $hits = 0
+    if ($attackRows.Count -gt 0) {
+        $last = $attackRows[$attackRows.Count - 1].Matches[0].Groups
+        $attacks = [int]$last[1].Value; $hits = [int]$last[2].Value
+    }
+    $rate = if ($attacks -gt 0) { [math]::Round(($hits / [double]$attacks), 4) } else { 0.0 }
+    $m = @{ pairedSamples=$paired.Count; maxCountDiff=$maxCountDiff; badCountSamples=$badDiff;
+            worstMissingHand=$worstHand; worstMissingMs=$worstMs; attacks=$attacks; hits=$hits; hitRate=$rate }
+    $bad = @()
+    if ($paired.Count -lt 10) { $bad += "only $($paired.Count) paired post-warmup samples" }
+    if ($badDiff -gt 0) { $bad += "$badDiff samples differed by more than one NPC" }
+    if ($worstMs -gt 3000) { $bad += "hand $worstHand missing for ${worstMs}ms (>3000ms)" }
+    if ($attacks -lt 10) { $bad += "only $attacks successful join attack orders (need >=10)" }
+    elseif ($rate -lt 0.2) { $bad += ("join captured-hit rate {0:P1} below 20%" -f $rate) }
+    if ($bad.Count -gt 0) {
+        return (Add-GateResult -Name 'shared_fight_parity' -Status FAIL -Metrics $m -Detail ($bad -join '; '))
+    }
+    return (Add-GateResult -Name 'shared_fight_parity' -Status PASS -Metrics $m)
+}

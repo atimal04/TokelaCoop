@@ -204,6 +204,7 @@ function Invoke-OneOracle {
         "npc_aggro"     { return (Test-NpcAggro       -HostFile $HostLog -JoinFile $JoinLog) }
         "proxy_drift"   { return (Test-ProxyDrift     -JoinFile $JoinLog) }
         "pc_assault"    { return (Test-PcAssault       -HostFile $HostLog -JoinFile $JoinLog) }
+        "shared_fight_parity" { return (Test-SharedFightParity -HostFile $HostLog -JoinFile $JoinLog) }
         "player_ko"     { return (Test-PlayerKo        -HostFile $HostLog -JoinFile $JoinLog) }
         "medic_order"   { return (Test-MedicOrder      -HostFile $HostLog -JoinFile $JoinLog) }
         "limb_loss"     { return (Test-LimbLoss        -HostFile $HostLog -JoinFile $JoinLog) }
@@ -507,7 +508,7 @@ Export-ModuleMember -Function @(
     "Get-EscapeSeries", "Get-EscapeFreedMs", "Get-EscapeMoveAfter",
     "Get-EscapeHeldAt", "Get-EscapeHeldEdges", "Test-LockpickEscape",
     "Test-PcDuplicates",
-    "Test-CombatCrowd",
+    "Test-CombatCrowd", "Test-SharedFightParity",
     "Test-SplitInterest",
     "Test-InventorySync", "Test-InventoryBidir", "Test-InventoryEquip",
     "Test-InventoryOverflow", "Test-InventoryDropFull",
