@@ -13,6 +13,7 @@
 
 #include "ReplicatorUtil.h"
 #include "../core/XferPair.h"
+#include <math.h>   // sqrt (severed-limb announce diagnostic)
 
 namespace coop {
 
