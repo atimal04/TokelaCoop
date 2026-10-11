@@ -376,6 +376,18 @@ public:
 
     virtual void onStart(const ScenarioContext& ctx) {
         have_ = engine::pickInventoryContainer(ctx.gw, hand_);
+        // The JOIN must drop from a body it OWNS. playerCharacters[0] is the
+        // host's tab under the squad-owner model (host rank 0, join rank 1), and
+        // a drop authored on a peer-owned copy is the peer's to stream, so the
+        // drop hook skipped it and the scan baselined the item as save-native
+        // (never streamed). In real play the own-guard keeps a join off the
+        // host's bodies, so this only ever bit the test.
+        if (joinAuthor_ && !ctx.isHost) {
+            EntityState sq[32];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, 32);
+            int li = tabLeaderIdx(sq, n, 1u);
+            if (li >= 0) { handFromEntity(sq[li], hand_); have_ = true; }
+        }
         char b[160];
         _snprintf(b, sizeof(b) - 1,
             "SCENARIO WI anchor host=%d have=%d hand=%u,%u,%u,%u,%u",
