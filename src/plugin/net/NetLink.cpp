@@ -364,6 +364,7 @@ void NetLink::queueBuildDoor(const BuildDoorPacket& pkt) { pushLocked(outCs_, ou
 void NetLink::queueBuildRemove(const BuildRemovePacket& pkt) { pushLocked(outCs_, outBuildRemove_, pkt); }
 
 void NetLink::queueBuildIntent(const BuildIntentPacket& pkt) { pushLocked(outCs_, outBuildIntent_, pkt); }
+void NetLink::queueStoreAdd(const StoreAddPacket& pkt) { pushLocked(outCs_, outStoreAdd_, pkt); }
 
 void NetLink::queueStealth(const StealthPacket& pkt) { pushLocked(outCs_, outStealth_, pkt); }
 
@@ -1032,6 +1033,14 @@ void NetLink::threadLoop() {
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &pi)
                             && inbound_) {
                             inbound_->pushProdIntent(pi.ownerId, pi);
+                        }
+                    } else if (type == PKT_STORE_ADD) {
+                        StoreAddPacket sa;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &sa)
+                            && inbound_) {
+                            u32 senderId = isHost_
+                                ? (u32)(size_t)ev.peer->data : (u32)0;
+                            inbound_->pushStoreAdd(senderId, sa);
                         }
                     } else if (type == PKT_RESEARCH) {
                         // Reliable host-authoritative known-research row
@@ -2107,6 +2116,18 @@ void NetLink::threadLoop() {
             } else {
                 enet_packet_destroy(out);
             }
+        }
+        std::vector<StoreAddPacket> storeAddPkts;
+        EnterCriticalSection(&outCs_);
+        storeAddPkts.swap(outStoreAdd_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < storeAddPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&storeAddPkts[i], sizeof(StoreAddPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (!isHost_ && serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED)
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            else
+                enet_packet_destroy(out);
         }
         for (size_t i = 0; i < buildRemovePkts.size(); ++i) {
             ENetPacket* out = enet_packet_create(&buildRemovePkts[i], sizeof(BuildRemovePacket),

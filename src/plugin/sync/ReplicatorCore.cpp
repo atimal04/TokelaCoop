@@ -44,7 +44,7 @@ Replicator::Replicator()
       probeRecruit_(false), probedCount_(0),
       aiSuspend_(false), aiLogTick_(0), nextEventId_(1),
       nextWorldNetId_(1), worldSeeded_(false), nextNativeTakeId_(0),
-      nextDropId_(1), nextPickupId_(1), nextXferId_(1),
+      nextDropId_(1), nextPickupId_(1), nextXferId_(1), nextStoreAddId_(1),
       xferScanMs_(0), nextTreatId_(1),
       quietRelapse_(0), crawlPhysRestore_(0),
       sitOrders_(0), detachUses_(0), noDetach_(false),
@@ -262,6 +262,7 @@ void Replicator::resetSession() {
     facRows_.clear();
     invPub_.clear();
     invRecv_.clear();
+    peerStoreContainers_.clear();
     invSaveFencePending_ = 0;
     ownedContainers_.clear();
     censusContainers_.clear(); // protocol 34: re-censused in the new world
@@ -290,6 +291,8 @@ void Replicator::resetSession() {
     xferHoldSince_.clear();
     xferOut_.clear();
     appliedXfers_.clear();
+    appliedStoreAdds_.clear();
+    nextStoreAddId_ = 1;
     wdSuppress_.clear();
     xferScanMs_ = 0;
     medPub_.clear();
@@ -503,6 +506,9 @@ void Replicator::ingestInv(Inbound& in) {
         r.items     = it->items; // latest snapshot supersedes
         r.dirty     = true;
         r.truncated = (it->flags & INV_FLAG_TRUNCATED) != 0;
+        r.store = (it->flags & INV_FLAG_STORE) != 0;
+        if (r.store) peerStoreContainers_.insert(k);
+        else peerStoreContainers_.erase(k);
     }
 }
 
