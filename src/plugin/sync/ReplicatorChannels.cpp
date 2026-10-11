@@ -242,6 +242,7 @@ void Replicator::applyMedical(GameWorld* gw, Inbound& in, NetLink& net, u32 owne
         if (ownHands_.find(k) != ownHands_.end()) continue; // never write our own truth
         Character* c = resolvePeerChar(k);
         if (!c) continue;
+        MedRecv& r = medRecv_[k];
         engine::MedicalRead w;
         memset(&w, 0, sizeof(w));
         w.valid = true;
@@ -269,6 +270,23 @@ void Replicator::applyMedical(GameWorld* gw, Inbound& in, NetLink& net, u32 owne
             pr.bandaging = e.bandaging;
             pr.juryRig   = e.juryRig;
             pr.maxHealth = -1.0f;
+        }
+        // Keep this healer's optimistic bandage on the driven copy until the
+        // owner echoes it or the short pending window expires. Flesh remains
+        // entirely owner-authored.
+        const char* medOverlay = getenv("TOKELACOOP_MED_OVERLAY");
+        bool overlayOn = !(medOverlay && medOverlay[0] == '0');
+        unsigned long overlayNow = nowMs();
+        if (overlayOn) {
+            for (unsigned int i = 0; i < n; ++i) {
+                if (r.pendingBand[i] < 0.0f) continue;
+                if (overlayNow - r.pendingMs[i] >= 3000) {
+                    r.pendingBand[i] = -1.0f; continue;
+                }
+                if (w.parts[i].used && w.parts[i].bandaging >= 0.0f &&
+                    w.parts[i].bandaging < r.pendingBand[i])
+                    w.parts[i].bandaging = r.pendingBand[i];
+            }
         }
         w.unconscious = (p.flags & MED_UNCONSCIOUS) != 0;
         w.dead        = (p.flags & MED_DEAD) != 0;
@@ -299,7 +317,6 @@ void Replicator::applyMedical(GameWorld* gw, Inbound& in, NetLink& net, u32 owne
                 (unsigned)p.limbState[2], (unsigned)p.limbState[3]);
             lb[sizeof(lb) - 1] = '\0'; coop::logLine(lb);
         }
-        MedRecv& r = medRecv_[k];
         for (unsigned int i = 0; i < 12; ++i) {
             float band = (i < n && p.parts[i].used) ? p.parts[i].bandaging : -1.0f;
             r.recvBand[i] = band;
@@ -307,6 +324,10 @@ void Replicator::applyMedical(GameWorld* gw, Inbound& in, NetLink& net, u32 owne
             // forwarded; re-arm the detector against the new baseline.
             if (r.sentBand[i] >= 0.0f && band >= r.sentBand[i] - 0.25f)
                 r.sentBand[i] = -1.0f;
+            if (r.pendingBand[i] >= 0.0f &&
+                ((overlayOn && band >= r.pendingBand[i] - 0.25f) ||
+                 overlayNow - r.pendingMs[i] >= 3000))
+                r.pendingBand[i] = -1.0f;
         }
         r.have = true;
     }
@@ -341,6 +362,10 @@ void Replicator::applyMedical(GameWorld* gw, Inbound& in, NetLink& net, u32 owne
                 (r.sentBand[i] < 0.0f || local > r.sentBand[i] + RISE_EPS)) {
                 tp.partBand[i] = local;
                 r.sentBand[i]  = local;
+                const char* medOverlay = getenv("TOKELACOOP_MED_OVERLAY");
+                if (!(medOverlay && medOverlay[0] == '0')) {
+                    r.pendingBand[i] = local; r.pendingMs[i] = now;
+                }
                 rise = true; ++nRise;
                 if (local > hiBand) hiBand = local;
             }
@@ -378,6 +403,12 @@ void Replicator::applyTreatments(GameWorld* gw, Inbound& in) {
         Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
         if (!c) continue;
         int n = engine::applyBandageParts(c, p.partBand);
+        if (n > 0) {
+            // Force the next authoritative medical publish to bypass its normal
+            // min-send interval and carry the treatment echo promptly.
+            MedPub& mp = medPub_[k];
+            mp.hash = 0; mp.lastSendMs = 0;
+        }
         char b[160]; _snprintf(b, sizeof(b) - 1,
             "[med] TREAT RECV id=%u hand=%u,%u applied=%d",
             p.treatId, k.i, k.s, n);

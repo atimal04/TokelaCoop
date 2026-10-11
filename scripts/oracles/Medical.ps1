@@ -27,12 +27,14 @@ function Get-VitalsSeries {
         $t = Convert-StampToMs -Groups $g -OffsetMs $off
         # PSCustomObject, NOT a hashtable: Measure-Object -Property only sees real
         # properties (a hashtable 'blood' KEY measures as null -> silent nonsense).
-        $e = [pscustomobject]@{ t = $t; blood = [double]$g[5].Value; fleshMin = $null; bandSum = $null; unc = 0; dead = 0; pfl = $null; pst = $null; ls = $null }
+        $e = [pscustomobject]@{ t = $t; blood = [double]$g[5].Value; fleshMin = $null; bandSum = $null; fl = @(); bd = @(); unc = 0; dead = 0; pfl = $null; pst = $null; ls = $null }
         if ($g[6].Success) {
-            $fl = @(); for ($i = 7; $i -le 10; $i++) { $v = [double]$g[$i].Value; if ($v -ge 0) { $fl += $v } }
+            $fl = @(); for ($i = 7; $i -le 10; $i++) { $v = [double]$g[$i].Value; $fl += $v }
             $bd = 0.0;  for ($i = 11; $i -le 14; $i++) { $v = [double]$g[$i].Value; if ($v -ge 0) { $bd += $v } }
             if ($fl.Count -gt 0) { $e.fleshMin = ($fl | Measure-Object -Minimum).Minimum }
             $e.bandSum = $bd
+            $e.fl = @([double]$g[7].Value,[double]$g[8].Value,[double]$g[9].Value,[double]$g[10].Value)
+            $e.bd = @([double]$g[11].Value,[double]$g[12].Value,[double]$g[13].Value,[double]$g[14].Value)
             $e.unc  = [int]$g[15].Value
             $e.dead = [int]$g[16].Value
         }
@@ -558,6 +560,40 @@ function Test-MedicOrder {
                         [double]($preBand  | Measure-Object -Property bandSum -Maximum).Maximum
         }
         $treated = ($null -ne $bandRise -and $bandRise -ge $MinBandRise)
+        # Identify the treated limb from the healer's own post-marker bandage rise.
+        # Once it rises, neither that bandage nor its flesh may fall back materially.
+        $limb = -1; $peakBand = -1.0; $startFlesh = [double]::NaN
+        if ($H.Count -gt 0) {
+            for ($li = 0; $li -lt 4; $li++) {
+                $samples = @($H | Where-Object { $_.t -ge $Th -and $_.bd.Count -eq 4 -and $_.bd[$li] -ge 0 })
+                if ($samples.Count -gt 0) {
+                    $mx = [double](($samples | ForEach-Object { $_.bd[$li] } | Measure-Object -Maximum).Maximum)
+                    if ($mx -gt $peakBand) { $peakBand = $mx; $limb = $li }
+                }
+            }
+        }
+        $noRevert = $false; $settled = $false
+        if ($limb -ge 0) {
+            $tail = @($H | Where-Object { $_.t -ge $Th -and $_.fl.Count -eq 4 -and $_.fl[$limb] -ne -1.0 })
+            if ($tail.Count -gt 0) {
+                $startFlesh = [double]$tail[0].fl[$limb]
+                $lowBand = @($tail | Where-Object { $_.bd[$limb] -lt ($peakBand - 2.0) }).Count -eq 0
+                $stableFlesh = @($tail | Where-Object { $_.fl[$limb] -lt ($startFlesh - 8.0) }).Count -eq 0
+                $noRevert = $lowBand -and $stableFlesh
+                $hLast = $tail | Select-Object -Last 1
+                $oTail = @($O | Where-Object { $_.t -ge $Th -and $_.fl.Count -eq 4 -and $_.fl[$limb] -ne -1.0 })
+                if ($oTail.Count -gt 0) {
+                    $oLast = $oTail | Select-Object -Last 1
+                    $settled = ([Math]::Abs([double]$hLast.fl[$limb] - [double]$oLast.fl[$limb]) -le 10.0 -and
+                                [Math]::Abs([double]$hLast.bd[$limb] - [double]$oLast.bd[$limb]) -le 5.0)
+                }
+            }
+        }
+        $m["${t}TreatedLimb"] = $limb; $m["${t}HealerBandPeak"] = [Math]::Round($peakBand,1)
+        $m["${t}HealerFleshStart"] = if ([double]::IsNaN($startFlesh)) { -1 } else { [Math]::Round($startFlesh,1) }
+        $m["${t}NoRevert"] = $noRevert; $m["${t}Settled"] = $settled
+        if (-not $noRevert) { $bad += "${t}: treated limb bandage/health reverted or no treated-limb samples" }
+        if (-not $settled) { $bad += "${t}: owner/healer treated-limb end gap exceeds flesh 10 or bandage 5" }
         $m["${t}WoundCrossed"] = $crossWound; $m["${t}HealN"] = $healN
         $m["${t}BandRise"] = if ($null -ne $bandRise) { [Math]::Round($bandRise,1) } else { -1 }
         if (-not $crossWound) { $bad += "${t}: wound never reached the healer's copy (vitals don't cross)" }

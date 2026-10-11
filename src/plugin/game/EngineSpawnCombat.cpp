@@ -1933,8 +1933,23 @@ bool writeMedical(Character* c, const MedicalRead& in) {
                 if (!p) continue;
                 if ((unsigned char)p->whatAmI != pr.partType ||
                     (unsigned char)p->side    != pr.side) continue;
-                // -1 = the OWNER's field is unreadable; never write that.
-                if (pr.flesh     >= 0.0f) p->flesh       = pr.flesh;
+                // A used anatomy slot has a readable flesh value; negative flesh is
+                // valid overkill damage in Kenshi. Clamp to this part's engine range.
+                // TOKELACOOP_MED_NEG=0 restores the legacy nonnegative-only write.
+                const char* medNeg = getenv("TOKELACOOP_MED_NEG");
+                if (medNeg && medNeg[0] == '0') {
+                    if (pr.flesh >= 0.0f) p->flesh = pr.flesh;
+                } else {
+                    float maxHp = p->_maxHealth;
+                    if (maxHp > 0.0f) {
+                        float flesh = pr.flesh;
+                        if (flesh > maxHp) flesh = maxHp;
+                        if (flesh < -maxHp) flesh = -maxHp;
+                        p->flesh = flesh;
+                    } else if (pr.flesh >= 0.0f) {
+                        p->flesh = pr.flesh;
+                    }
+                }
                 if (pr.fleshStun >= 0.0f) p->fleshStun   = pr.fleshStun;
                 if (pr.bandaging >= 0.0f) p->bandaging   = pr.bandaging;
                 if (pr.juryRig   >= 0.0f) p->juryRigging = pr.juryRig;
@@ -1946,7 +1961,17 @@ bool writeMedical(Character* c, const MedicalRead& in) {
             };
             for (int i = 0; i < 4; ++i) {
                 if (!parts[i]) continue;
-                if (in.limbFlesh[i] >= 0.0f) parts[i]->flesh     = in.limbFlesh[i];
+                const char* medNeg = getenv("TOKELACOOP_MED_NEG");
+                if (medNeg && medNeg[0] == '0') {
+                    if (in.limbFlesh[i] >= 0.0f) parts[i]->flesh = in.limbFlesh[i];
+                } else if (parts[i]->_maxHealth > 0.0f) {
+                    float flesh = in.limbFlesh[i];
+                    if (flesh > parts[i]->_maxHealth) flesh = parts[i]->_maxHealth;
+                    if (flesh < -parts[i]->_maxHealth) flesh = -parts[i]->_maxHealth;
+                    parts[i]->flesh = flesh;
+                } else if (in.limbFlesh[i] >= 0.0f) {
+                    parts[i]->flesh = in.limbFlesh[i];
+                }
                 if (in.limbBand[i]  >= 0.0f) parts[i]->bandaging = in.limbBand[i];
             }
         }

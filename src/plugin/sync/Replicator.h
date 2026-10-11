@@ -2132,9 +2132,14 @@ private:
     // Protocol 16: bandage levels are tracked per ANATOMY PART (12 slots), not
     // per limb - first aid on a head wound forwards too.
     struct MedRecv {
-        float recvBand[12]; float sentBand[12]; unsigned long lastFwdMs; bool have;
+        float recvBand[12]; float sentBand[12];
+        float pendingBand[12]; unsigned long pendingMs[12];
+        unsigned long lastFwdMs; bool have;
         MedRecv() : lastFwdMs(0), have(false) {
-            for (int i = 0; i < 12; ++i) { recvBand[i] = -1.0f; sentBand[i] = -1.0f; }
+            for (int i = 0; i < 12; ++i) {
+                recvBand[i] = -1.0f; sentBand[i] = -1.0f;
+                pendingBand[i] = -1.0f; pendingMs[i] = 0;
+            }
         }
     };
     std::map<Key, MedPub>  medPub_;
