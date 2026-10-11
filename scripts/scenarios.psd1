@@ -1442,7 +1442,7 @@
             PrimaryGate = 'save_sync'
             Gating   = @('save_sync', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth', 'march')
-            Tier = 'full'; WanVariant = $false
+            Tier = 'full'; WanVariant = $true
         }
 
         # save_stage1: resume_test.ps1 stage 1 (not a tier member - the
