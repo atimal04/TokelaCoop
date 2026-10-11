@@ -539,7 +539,7 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
             k.i = de[i].itemHand[3]; k.s = de[i].itemHand[4];
             if (worldTrack_.find(k) != worldTrack_.end()) continue; // already tracked
             WorldTrack t; memset(&t, 0, sizeof(t));
-            t.netId = nextWorldNetId_++; t.hash = 0; t.lastSendMs = 0;
+            t.netId = nextWorldNetId_++; t.hash = 0; t.lastSendMs = 0; t.bornMs = now;
             t.x = de[i].x; t.y = de[i].y; t.z = de[i].z; t.seen = true;
             strncpy(t.stringID, de[i].stringID, sizeof(t.stringID) - 1);
             t.stringID[sizeof(t.stringID) - 1] = '\0';
@@ -608,7 +608,7 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
             std::map<Key, WorldTrack>::iterator tit = worldTrack_.find(k);
             if (tit == worldTrack_.end()) {
                 WorldTrack t; memset(&t, 0, sizeof(t));
-                t.netId = nextWorldNetId_++; t.hash = 0; t.lastSendMs = 0;
+                t.netId = nextWorldNetId_++; t.hash = 0; t.lastSendMs = 0; t.bornMs = now;
                 t.x = raw[i].x; t.y = raw[i].y; t.z = raw[i].z; t.seen = true;
                 strncpy(t.stringID, raw[i].stringID, sizeof(t.stringID) - 1);
                 t.stringID[sizeof(t.stringID) - 1] = '\0';
@@ -622,6 +622,9 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
                     const float lim  = wild ? SEVER_DROP_DIST : PENDING_DROP_DIST;
                     if ((wild || strcmp(pd.stringID, raw[i].stringID) == 0) &&
                         dx*dx + dy*dy + dz*dz <= lim * lim) {
+                        if (wild) { char sb[160]; _snprintf(sb, sizeof(sb) - 1,
+                            "[wi] SEVER-MATCH sid='%s' pos=%.2f,%.2f,%.2f", raw[i].stringID,
+                            raw[i].x, raw[i].y, raw[i].z); sb[sizeof(sb) - 1] = 0; coop::logLine(sb); }
                         pendingDrops_.erase(pendingDrops_.begin() + p);
                         isDrop = true; break;
                     }
@@ -2310,6 +2313,21 @@ void Replicator::announceSeveredDrop(const unsigned int hand[5]) {
     if (!c || !engine::readPos(c, &x, &y, &z)) return;
     PendingDrop pd; memset(&pd, 0, sizeof(pd));   // stringID "" = any template
     pd.x = x; pd.y = y; pd.z = z; pd.ms = nowMs();
+    // The engine drops the limb DURING the hit, but we only learn of the
+    // amputation on the next medical sample - a scan in between already
+    // baselined it as a save-native. Promote such a young baseline near the body.
+    const unsigned long now = nowMs();
+    for (std::map<Key, WorldTrack>::iterator it = worldTrack_.begin(); it != worldTrack_.end(); ++it) {
+        WorldTrack& t = it->second;
+        if (!t.baseline || now - t.bornMs > 3000) continue;
+        float dx = t.x - x, dy = t.y - y, dz = t.z - z;
+        if (dx*dx + dy*dy + dz*dz > 36.0f) continue;     // 6 m
+        t.baseline = false;
+        char pb[160]; _snprintf(pb, sizeof(pb) - 1,
+            "[wi] SEVER-PROMOTE netId=%u sid='%s' age=%lums", t.netId, t.stringID, now - t.bornMs);
+        pb[sizeof(pb) - 1] = 0; coop::logLine(pb);
+        return;   // the limb is already tracked: no pending drop needed
+    }
     pendingDrops_.push_back(pd);
     char b[160]; _snprintf(b, sizeof(b) - 1,
         "[wi] SEVER-ANNOUNCE hand=%u,%u pos=%.2f,%.2f,%.2f", k.i, k.s, x, y, z);

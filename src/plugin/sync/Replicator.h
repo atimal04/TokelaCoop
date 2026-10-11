@@ -1606,6 +1606,7 @@ private:
     struct WorldTrack {
         u32 netId; u32 hash; unsigned long lastSendMs; float x, y, z; bool seen;
         char stringID[48]; u32 itemType; u16 quantity; u16 quality; bool baseline;
+        unsigned long bornMs; // first scan sighting (announceSeveredDrop promotes young baselines)
     };
     // `hand` is the proxy's engine identity, captured (and round-trip verified) at
     // mint. The engine owns the object's lifetime: when the block it stands in
