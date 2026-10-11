@@ -1968,7 +1968,7 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
                 for (std::map<Key, std::map<XKey, XferPend> >::iterator li = xferPend_.begin();
                      li != xferPend_.end(); ++li) {
                     std::map<XKey, XferPend>::iterator lp = li->second.find(*ky);
-                    if (li->first != k && lp != li->second.end() && lp->second.delta < 0) {
+                    if ((li->first < k || k < li->first) && lp != li->second.end() && lp->second.delta < 0) {
                         pairedLoss = true; break;
                     }
                 }
