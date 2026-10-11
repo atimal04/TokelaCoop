@@ -138,6 +138,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(LoadNackPacket)",          sizeof(LoadNackPacket),          61);
     CHECK_EQ("sizeof(ProdPacket)",              sizeof(ProdPacket),              121);
     CHECK_EQ("sizeof(ProdIntentPacket)",        sizeof(ProdIntentPacket),         82);
+    CHECK_EQ("sizeof(StoreAddPacket)",          sizeof(StoreAddPacket),          231);
     CHECK_EQ("sizeof(NpcCensusHeader)",         sizeof(NpcCensusHeader),         7); // v35: census
     CHECK_EQ("sizeof(ResearchPacket)",          sizeof(ResearchPacket),          57); // v37: research
     CHECK_EQ("sizeof(DeedPacket)",              sizeof(DeedPacket),              78); // v54: deeds
@@ -337,12 +338,24 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v65: TokelaCoop v0.54 (57) + KenshiDuo (64) merge)",
-             (int)PROTOCOL_VERSION, 65);
+    CHECK_EQ("PROTOCOL_VERSION (v66: store add intent)",
+             (int)PROTOCOL_VERSION, 66);
     CHECK_EQ("PKT_MODLIST id (TokelaCoop 49, retagged to 56 in the merge)", (int)PKT_MODLIST, 56);
     CHECK("PKT_MODLIST distinct from the KenshiDuo series",
           PKT_MODLIST != PKT_NATIVE_TAKEN && PKT_MODLIST != PKT_BOUNTY &&
           PKT_MODLIST != PKT_INV_SAVE_FENCE);
+    CHECK("PKT_STORE_ADD is next free tag and distinct", (int)PKT_STORE_ADD == 57 &&
+          PKT_STORE_ADD != PKT_MODLIST && PKT_STORE_ADD != PKT_BUILD_INTENT &&
+          PKT_STORE_ADD != PKT_PROD_INTENT && PKT_STORE_ADD != PKT_INV_XFER);
+    CHECK("PKT_STORE_ADD distinct from every existing tag value",
+          PKT_STORE_ADD > PKT_MODLIST && PKT_STORE_ADD > PKT_INV_SAVE_FENCE &&
+          PKT_STORE_ADD > PKT_BOUNTY && PKT_STORE_ADD > PKT_NATIVE_TAKEN);
+    // Existing PacketType values occupy 1..56; assert against the complete range.
+    {
+        int tag;
+        for (tag = 1; tag < (int)PKT_STORE_ADD; ++tag)
+            CHECK("PKT_STORE_ADD differs from prior packet tag", (int)PKT_STORE_ADD != tag);
+    }
 
     // Protocol 56: save-native pickup notice. The ownership filter (protocol 55)
     // keeps owned town/shop items out of the stream, so their pickup needs its own
@@ -587,6 +600,7 @@ static void testRoundTrips() {
     roundTrip<DeedPacket>("DeedPacket", (u8)PKT_DEED);
     roundTrip<FixturePacket>("FixturePacket", (u8)PKT_FIXTURE);
     roundTrip<ModListPacket>("ModListPacket", (u8)PKT_MODLIST);
+    roundTrip<StoreAddPacket>("StoreAddPacket", (u8)PKT_STORE_ADD);
     roundTrip<FurniturePacket>("FurniturePacket", (u8)PKT_FURNITURE);
     roundTrip<InvSaveFencePacket>("InvSaveFencePacket", (u8)PKT_INV_SAVE_FENCE);
     roundTrip<CellClaimPacket>("CellClaimPacket", (u8)PKT_CELL_CLAIM);

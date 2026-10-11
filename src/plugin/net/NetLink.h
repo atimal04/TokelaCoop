@@ -186,6 +186,7 @@ public:
     void queueBuildRemove(const BuildRemovePacket& pkt);
     // MAIN thread: reliable idempotent placement/removal request (Join -> Host).
     void queueBuildIntent(const BuildIntentPacket& pkt);
+    void queueStoreAdd(const StoreAddPacket& pkt);
 
     // MAIN thread: queue an UNRELIABLE stealth detection-map snapshot (protocol
     // 20, host -> the sneaker's owner). Latest wins; change-gated + throttled by
@@ -393,6 +394,7 @@ private:
     std::vector<BuildDoorPacket>  outBuildDoor_;
     std::vector<BuildRemovePacket> outBuildRemove_;
     std::vector<BuildIntentPacket> outBuildIntent_;
+    std::vector<StoreAddPacket> outStoreAdd_;
     // Unreliable stealth detection-map snapshots (protocol 20). Guarded by outCs_.
     std::vector<StealthPacket>   outStealth_;
     // Unreliable camera hints (protocol 43, ~1 Hz latest-wins). Guarded by outCs_.
