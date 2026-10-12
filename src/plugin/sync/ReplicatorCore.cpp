@@ -94,7 +94,7 @@ Replicator::Replicator()
       deedSeqOut_(1), deedSampleMs_(0), deedAuditMs_(0), deedSync_(true),
       fixtureSeqOut_(1), fixtureSampleMs_(0), fixtureSync_(true),
       bountySeqOut_(1), bountySampleMs_(0), bountySync_(true), bountyBaseline_(false),
-      invSaveFencePending_(0), storeSync_(false), contCensusMs_(0),
+      invSaveFencePending_(0), storeSync_(false), merchantSync_(false), contCensusMs_(0),
       timeSync_(true), timeBrake_(true),
       timeSlew_(1.0f), timeSeqOut_(1), timeSeqSeen_(0),
       timeLastSendMs_(0), timeLastLogMs_(0), timeSlewApplied_(-1.0f),
@@ -193,6 +193,7 @@ void Replicator::resetSession() {
     rekeyLogged_.clear();      // and the change-detector for its [rekey] line
     jailObs_.clear();          // jail-observe spike per-captive last sample
     proxyByKey_.clear();
+    merchantInfo_.clear();
     peerSquadKeys_.clear();
     suppressed_.clear();
     midBand_.clear();          // host mid-band round-robin (rebuilt by next census)

@@ -18,6 +18,48 @@
 namespace coop {
 namespace engine {
 
+namespace {
+typedef bool (__fastcall* MerchantCheckFn)(const Character*);
+typedef void (__fastcall* MerchantHomeFn)(Ownerships*, const hand&, SquadType);
+static bool sameMerchantHome(const hand& h, const unsigned int home[5]) {
+    return (unsigned int)h.type==home[0] && h.container==home[1] &&
+        h.containerSerial==home[2] && h.index==home[3] && h.serial==home[4];
+}
+}
+
+bool readMerchantHome(Character* c, unsigned int outHome[5], char* outSquadSid, unsigned int maxSid) {
+    if (!c || !outHome || !outSquadSid || !maxSid) return false;
+    memset(outHome,0,5*sizeof(unsigned int)); outSquadSid[0]=0;
+    static MerchantCheckFn check=(MerchantCheckFn)KenshiLib::GetRealAddress(&Character::isATrader);
+    __try {
+        if (!check || !check(c) || !g_getPlatoonFn) return false;
+        ActivePlatoon* ap=g_getPlatoonFn(c); if (!ap || !ap->me) return false;
+        const hand& h=ap->me->ownerships._homeBuilding;
+        GameData* squad=ap->me->squadTemplate;
+        if (h.type!=BUILDING || !h.index || !squad || squad->stringID.empty() || squad->stringID.size()>=maxSid) return false;
+        memcpy(outSquadSid,squad->stringID.c_str(),squad->stringID.size()+1);
+        outHome[0]=h.type; outHome[1]=h.container; outHome[2]=h.containerSerial; outHome[3]=h.index; outHome[4]=h.serial;
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool bindMerchantHome(GameWorld* gw, Character* c, const unsigned int home[5], const char* squadSid) {
+    if (!gw || !c || !home || !squadSid || !squadSid[0] || home[0]!=BUILDING || !home[3] || !g_getPlatoonFn) return false;
+    GameData* squad=findItemTemplateImpl(gw,squadSid,(unsigned int)SQUAD_TEMPLATE);
+    if (!squad) squad=findItemTemplateImpl(gw,squadSid,(unsigned int)UNIQUE_SQUAD_TEMPLATE);
+    static MerchantHomeFn setHome=(MerchantHomeFn)KenshiLib::GetRealAddress(&Ownerships::setHomeBuilding);
+    static MerchantCheckFn check=(MerchantCheckFn)KenshiLib::GetRealAddress(&Character::isATrader);
+    __try {
+        RootObject* building=resolveObjectByHand(home);
+        ActivePlatoon* ap=g_getPlatoonFn(c);
+        if (!building || !ap || !ap->me || !squad || !setHome || !check) return false;
+        ap->me->squadTemplate=squad;
+        Ownerships& own=ap->me->ownerships;
+        if (!sameMerchantHome(own._homeBuilding,home)) setHome(&own,building->getHandle(),ap->me->squadType);
+        return sameMerchantHome(own._homeBuilding,home) && check(c);
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 // ---- Protocol 21: runtime-spawn proxy replication ---------------------------
 
 // SEH shims: the public entry points below hold std::string locals (destructors

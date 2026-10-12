@@ -393,6 +393,18 @@ public:
             doBuy(ctx);
         }
         if (ctx.elapsedMs >= DURATION_MS) {
+            engine::VendorRead finalV[MAX_VENDORS];
+            unsigned int nv=engine::listVendorsNear(ctx.gw,finalV,MAX_VENDORS,VENDOR_RADIUS);
+            for (unsigned int vi=0; vi<nv; ++vi) {
+                if (!finalV[vi].traderHand[3]) continue;
+                char vm[192];
+                _snprintf(vm,sizeof(vm)-1,
+                    "SCENARIO MERCHANT_FINAL who=%s thand=%u,%u,%u,%u,%u money=%d stock=%d t=%lu",
+                    ctx.isHost?"host":"join",finalV[vi].traderHand[0],finalV[vi].traderHand[1],
+                    finalV[vi].traderHand[2],finalV[vi].traderHand[3],finalV[vi].traderHand[4],
+                    finalV[vi].money,finalV[vi].stock,ctx.elapsedMs);
+                vm[sizeof(vm)-1]='\0'; coop::logLine(vm);
+            }
             // Script-ran gate only: wallets were readable and both scripted
             // actions were logged (any result - the RESULTS are findings).
             passed_ = (walletReads_ > 0) && actDone_;
@@ -699,9 +711,8 @@ private:
 // item landing in the buyer's personal inventory, same tick - and gates that
 // BOTH effects converge on the peer through the two channels (the protocol-52
 // pool + the bidirectional inventory snapshots). The VENDOR-side mutation (stock
-// shrink, register cash) intentionally stays local for now: the engine
-// regenerates vendor stock per client anyway, and the [shop] BUY-LOCAL detour is
-// gathering the field evidence for that mirror.
+// shrink and register cash are sampled on both clients after the join-side
+// purchase; the scenario's final merchant row is gated for parity/nonempty stock.
 //
 // Script: two purchases, one per side, out of ONE purse.
 //   * both sides, 1 Hz: the POOL series + a TINV line (count + content hash)

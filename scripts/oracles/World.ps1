@@ -10,7 +10,8 @@
 # shop_probe (protocol 22 phase 0): vendor-trading EVIDENCE gate. The per-tab
 # wallet series it samples is a DIAGNOSTIC, not the player's purse - protocol 52
 # established that the cats live on the player faction, and these tabs read 0.
-# Gates only that the probe produced its evidence:
+# Gates that the probe produced its evidence and that post-purchase merchant
+# money and stock agree across clients while stock remains nonempty:
 #   1. the host enumerated at least one vendor (SCENARIO VENDOR),
 #   2. both sides logged a readable per-tab WALLET series (money >= 0),
 #   3. both sides logged their scripted SHOPBUY attempt (any res - the result
@@ -62,6 +63,33 @@ function Test-ShopProbe {
     $joinBuyRes = if ($joinBuy) { [int]$joinBuy.Matches[0].Groups[1].Value } else { -9 }
     if ($null -eq $hostBuy) { $why += "host never logged its SHOPBUY attempt" }
     if ($null -eq $joinBuy) { $why += "join never logged its SHOPBUY attempt" }
+
+    # Merchant conservation after the staggered host + join purchases. These
+    # final rows use the trader character hand (stable across clients), not the
+    # ShopTrader wrapper hand (runtime-local).
+    $merchantRx = 'SCENARIO MERCHANT_FINAL who=(host|join) thand=([\d,]+) money=(-?\d+) stock=(-?\d+)'
+    $hMerchant = @{}
+    $jMerchant = @{}
+    foreach ($m in @(Select-String -Path $HostFile -Pattern $merchantRx -ErrorAction SilentlyContinue)) {
+        $hMerchant[$m.Matches[0].Groups[2].Value] = $m
+    }
+    foreach ($m in @(Select-String -Path $JoinFile -Pattern $merchantRx -ErrorAction SilentlyContinue)) {
+        $jMerchant[$m.Matches[0].Groups[2].Value] = $m
+    }
+    $commonMerchant = @($hMerchant.Keys | Where-Object { $jMerchant.ContainsKey($_) })
+    if ($hMerchant.Count -eq 0) { $why += "host missing final merchant money/stock" }
+    if ($jMerchant.Count -eq 0) { $why += "join missing final merchant money/stock" }
+    if ($commonMerchant.Count -eq 0) { $why += "no matching trader hand in final host/join merchant rows" }
+    $merchantMatch = $false
+    if ($commonMerchant.Count -gt 0) {
+        $hm=$hMerchant[$commonMerchant[0]]; $jm=$jMerchant[$commonMerchant[0]]
+        $hg=$hm.Matches[0].Groups; $jg=$jm.Matches[0].Groups
+        if ($hg[3].Value -ne $jg[3].Value -or $hg[4].Value -ne $jg[4].Value) {
+            $why += "final vendor money/stock diverged host($($hg[3].Value),$($hg[4].Value)) join($($jg[3].Value),$($jg[4].Value))"
+        } else { $merchantMatch = $true }
+        if ([int]$hg[3].Value -lt 0 -or [int]$jg[3].Value -lt 0) { $why += "vendor money unreadable on a client" }
+        if ([int]$hg[4].Value -le 0 -or [int]$jg[4].Value -le 0) { $why += "vendor stock reached zero on a client" }
+    }
 
     # 4. Both scripted wallet writes logged (the 1b apply-primitive check + the
     #    decisive crossing lever: side-distinct sentinels, host 5000 / join 7000).
@@ -141,6 +169,7 @@ function Test-ShopProbe {
     return (Add-GateResult -Name "shop_probe" -Status $v `
                 -Metrics @{ hostVendors = $hostVendorLines.Count; joinVendors = $joinVendorLines.Count
                             hostBuyRes = $hostBuyRes; joinBuyRes = $joinBuyRes
+                            merchantMatch = $merchantMatch
                             hostSetOk = $hostSetOk; joinSetOk = $joinSetOk
                             crossToJoin = $crossToJoin; crossToHost = $crossToHost
                             vendorShared = $vendorShared; vendorDiverged = $vendorDiverged

@@ -58,6 +58,9 @@ inline unsigned int invEntryHash(const InvItemEntry& e) {
     // is invisible, no snapshot is published, and the peer's bag stays empty. XOR keeps the
     // canonical hash of a top-level entry (parentIdx = 0) exactly as it was.
     h ^= (unsigned int)e.parentIdx * 2129725511u;
+    h ^= (unsigned int)e.gridSection * 3266489917u;
+    h ^= (unsigned int)e.gridX * 668265263u;
+    h ^= (unsigned int)e.gridY * 374761393u;
     // The craft GRADE is content (protocol 51): a Masterwork and a Shoddy copy of the same
     // template are the same in every other field on this wire, so without the level in the
     // fingerprint a re-graded item publishes no snapshot and the peer never re-learns it.

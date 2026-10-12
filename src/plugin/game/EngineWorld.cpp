@@ -1657,7 +1657,7 @@ int probePlaceMachine(GameWorld* gw, float fwd, float side, int kind,
 // classes - a machine's crafted whole ITEMS land in the same Building
 // inventory the chest uses, so both ride the container channel.
 static bool isContainerClassType(int t) {
-    return t == (int)BCTYPE_STORAGE || isMachineClassType(t);
+    return t == (int)BCTYPE_STORAGE || t == (int)BCTYPE_USABLE || isMachineClassType(t);
 }
 
 // Fill a ContRead from a live container-bearing Building. Callers hold the
@@ -1700,7 +1700,7 @@ static void fillContRead(Building* b, ContRead* r) {
 }
 
 unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
-                                unsigned int maxOut) {
+                                unsigned int maxOut, bool includeUsable) {
     if (!gw || !out || maxOut == 0 || !g_getObjsFn) return 0;
     unsigned int n = 0;
     __try {
@@ -1716,6 +1716,7 @@ unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
                 if (!o) continue;
                 Building* b = static_cast<Building*>(o);
                 if (!isContainerClassType((int)b->classType)) continue;
+                if (b->classType == BCTYPE_USABLE && (!includeUsable || !invOf(o))) continue;
                 // Incomplete sites ride protocol 27 until finished.
                 if (!b->_buildState.isComplete) continue;
                 unsigned int h[5];
@@ -1727,6 +1728,61 @@ unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
                 if (dup) continue;
                 fillContRead(b, &out[n]);
                 ++n;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return n; }
+    return n;
+}
+
+// Host census of nearby lootable bodies and traders. A trader refresh is only
+// run while its native refresh timestamp is unset; an empty initialized shop
+// remains exhausted stock. The caller controls host-only invocation.
+unsigned int enumLootInventoriesNear(GameWorld* gw, float radius,
+                                     ContRead* out, unsigned int maxOut,
+                                     bool initializeStock) {
+    if (!gw || !out || !maxOut || !g_getCharsFn) return 0;
+    typedef bool (__fastcall* IsTraderFn)(const Character*);
+    typedef bool (__fastcall* IsUnsetFn)(const TimeOfDay*);
+    static IsTraderFn isTrader = (IsTraderFn)KenshiLib::GetRealAddress(&Character::isATrader);
+    static IsUnsetFn isUnset = (IsUnsetFn)KenshiLib::GetRealAddress(&TimeOfDay::isUnset);
+    unsigned int n = 0;
+    __try {
+        Ogre::Vector3 centers[4];
+        unsigned int nc = interestCenters(gw, centers);
+        for (unsigned int ci = 0; ci < nc; ++ci) {
+            g_npcQuery.clear();
+            g_getCharsFn(gw, &g_npcQuery, &centers[ci], radius, radius, radius, 512, 512, 0);
+            unsigned int total = g_npcQuery.size();
+            for (unsigned int i = 0; i < total && n < maxOut; ++i) {
+                RootObject* ro = g_npcQuery[i];
+                if (!ro || isPlayerSquad(gw, ro)) continue;
+                Character* ch = static_cast<Character*>(ro);
+                bool trader = isTrader && isTrader(ch);
+                if (initializeStock && !trader) continue;
+                if (!trader && !bodyIsDown(readBodyState(ch))) continue;
+                if (trader && initializeStock && isUnset && g_getPlatoonFn && g_platoonRefreshInvFn) {
+                    ActivePlatoon* ap = g_getPlatoonFn(ch);
+                    if (ap && ap->me && isUnset(&ap->me->traderInventoryRefreshTime)) {
+                        g_platoonRefreshInvFn(ap, true);
+                        coop::logLine("[merchant] lazy-init native trader stock");
+                    }
+                }
+                Inventory* inv = invOf(ro);
+                if (!inv) continue;
+                ContRead row; memset(&row, 0, sizeof(row));
+                if (!readObjectHand(ro, row.hand)) continue;
+                bool dup = false;
+                for (unsigned int j = 0; j < n; ++j)
+                    if (out[j].hand[1] == row.hand[1] && out[j].hand[3] == row.hand[3] && out[j].hand[4] == row.hand[4]) { dup = true; break; }
+                if (dup) continue;
+                Ogre::Vector3 p = ch->getPosition(); row.x=p.x; row.y=p.y; row.z=p.z;
+                row.classType=-1; row.complete=1; row.hasInv=1; row.isTrader=trader?1:0;
+                InvItemEntry entries[64];
+                unsigned int ne = readInvItems(inv, entries, 0, 64);
+                row.nEntries=(int)ne;
+                for (unsigned int j=0;j<ne;++j) { row.hash += invEntryHash(entries[j]); row.qtyTotal += entries[j].quantity; }
+                if (ne) { strncpy(row.firstSid,entries[0].stringID,sizeof(row.firstSid)-1); row.firstQty=entries[0].quantity; }
+                out[n++] = row;
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { return n; }
