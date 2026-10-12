@@ -23,6 +23,7 @@ Replicator::Replicator()
       combatConvergeMs_(COMBAT_CONVERGE_MS),
       sendStamp_(true),
       starveHoldMs_(10000), starveHeldNow_(0),
+      staleFreeze_(true),
       leaderOnly_(true), streamNpcs_(false),
       activeFrames_(0), zeroWhileActive_(0), maxStep_(0.0f), slewSkipFrames_(0),
       zpDown_(0), zpCarried_(0), zpFurn_(0), zpChain_(0), zpCrawl_(0),
@@ -196,6 +197,7 @@ void Replicator::resetSession() {
     merchantInfo_.clear();
     peerSquadKeys_.clear();
     suppressed_.clear();
+    staleFrozen_.clear();
     midBand_.clear();          // host mid-band round-robin (rebuilt by next census)
     midCursor_ = 0; midSliceMs_ = 0;
     life_.clear();             // Phase 3 lifecycle: the OLD world's journeys

@@ -327,6 +327,8 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
     float attnAnch[12];
     unsigned int nAttnAnch = attentionAnchors(gw, rawAnch, nRawAnch, attnAnch);
     unsigned int authSkip = 0;   // bodies left alone because we author them
+    unsigned int staleFreezeNow = 0;
+    unsigned int staleThawNow = 0;
 
     // Prune counters for hands the enumeration no longer sees (left interest),
     // preserving suppressed entries (a hidden body may drop out of the query but
@@ -334,6 +336,10 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
     std::set<Key> seen;
     for (unsigned int i = 0; i < n; ++i) seen.insert(keyOf(states[i]));
     for (unsigned int i = 0; i < wn; ++i) seen.insert(keyOf(wStates[i]));
+    for (std::set<Key>::iterator it = staleFrozen_.begin(); it != staleFrozen_.end(); ) {
+        if (seen.find(*it) == seen.end()) staleFrozen_.erase(it++);
+        else ++it;
+    }
     for (std::map<Key, AuthCount>::iterator it = authCount_.begin(); it != authCount_.end(); ) {
         if (seen.find(it->first) == seen.end() &&
             suppressed_.find(it->first) == suppressed_.end()) authCount_.erase(it++);
@@ -363,6 +369,23 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
         // suppress an actively-driven combatant (crowd copies froze mid-brawl).
         bool streamed = (keep.find(k) != keep.end()) ||
                         (drivenChars_.find(chars[i]) != drivenChars_.end());
+        // Silence from both the entity stream and area census is not proof of
+        // absence. Keep this local body visible and inert until fresh evidence
+        // arrives; the healthy-census absence path below still culls normally.
+        if (staleFreeze_ && censusRadius_ > 0.0f && !streamed && !censusFresh) {
+            std::map<Key, Character*>::iterator staleSupp = suppressed_.find(k);
+            if (staleSupp != suppressed_.end()) {
+                engine::restoreNpc(gw, chars[i]);
+                suppressed_.erase(staleSupp);
+                lifeSet(k, LIFE_RESOLVED, "stale-thaw");
+            }
+            staleFrozen_.insert(k);
+            engine::addAiSuspend(chars[i]);
+            engine::haltMovement(chars[i]);
+            ++staleFreezeNow;
+            continue;
+        }
+        if (staleFrozen_.erase(k) != 0) ++staleThawNow;
         // Pop-out fix (2026-07-11 field report): existence authority is the
         // CENSUS, drive authority is the STREAM. An NPC at the ~200 u stream-
         // bubble boundary flickers in/out of the host's fresh set (the two
@@ -460,6 +483,25 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
                         states[i].hIndex, states[i].hSerial);
                     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
                 }
+            }
+        }
+    }
+
+    // Aggregate transition diagnostics at a one-second cadence.
+    {
+        static unsigned long logMs = 0;
+        unsigned long t = nowMs();
+        if ((staleFreezeNow || staleThawNow) && (t - logMs) >= 1000) {
+            logMs = t;
+            unsigned long staleMs = censusRecvMs_ ? (t - censusRecvMs_) : 0ul;
+            if (staleFreezeNow) {
+                char b[112]; _snprintf(b, sizeof(b) - 1,
+                    "[authority] stale-freeze n=%u staleMs=%lu", staleFreezeNow, staleMs);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            } else {
+                char b[80]; _snprintf(b, sizeof(b) - 1,
+                    "[authority] stale-thaw n=%u", staleThawNow);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
         }
     }

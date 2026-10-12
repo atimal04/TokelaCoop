@@ -76,6 +76,7 @@ public:
     // authority transfer (architecture review 2026-07-10); 0 restores the
     // legacy release-on-stale behavior.
     void setStarveHold(unsigned long ms) { starveHoldMs_ = ms; }
+    void setStaleFreeze(bool v) { staleFreeze_ = v; }
 
     // Bidirectional presence: the SQUAD-TAB ranks (distinct hand-containers, sorted)
     // this client OWNS (controls locally + streams). The peer owns the other tabs and
@@ -1158,6 +1159,8 @@ private:
     // streaming them. Keyed by hand so we restore the exact body when it re-enters
     // the host's streamed set.
     std::map<Key, Character*> suppressed_;
+    bool staleFreeze_; // join: hold uncorroborated nearby NPCs during census outage
+    std::set<Key> staleFrozen_;
     // Phase 2 (runtime-spawn sync): last time the suppressed set was re-hidden.
     // The engine can undo a one-shot hide on its own (ambush dialog/combat
     // re-tasks the body, zone streaming re-adds it to the update list), so the
