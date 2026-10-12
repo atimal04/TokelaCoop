@@ -63,7 +63,7 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
                 }
                 static unsigned long merchantLogMs = 0;
                 unsigned int shelfCount=0;
-                for (unsigned int si=0;si<n;++si) if (rows[si].classType==(int)BCTYPE_USABLE) ++shelfCount;
+                for (unsigned int si=0;si<n;++si) if (engine::isShelfClassType(rows[si].classType)) ++shelfCount;
                 if ((merchantCount || shelfCount) && (merchantLogMs == 0 || (cnow - merchantLogMs) >= 5000)) {
                     merchantLogMs = cnow;
                     char mb[128]; _snprintf(mb, sizeof(mb)-1, "[merchant] census traders=%u shelves=%u", merchantCount, shelfCount);
