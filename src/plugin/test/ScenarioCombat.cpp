@@ -1773,41 +1773,54 @@ private:
         if (!engine::readPos(own, &lx, &ly, &lz)) return;
         EntityState npcs[128];
         unsigned int n = engine::captureNpcs(ctx.gw, npcs, 128);
-        unsigned int keys[128][2];
+        // Inner ring (<=150 u) is the sample; the outer ring (150-200 u) is the
+        // hysteresis band the oracle uses so a body on the edge, a few units
+        // apart on the two screens (WAN lag), is not counted as missing.
+        unsigned int keys[128][3];
         unsigned int used = 0;
         for (unsigned int i = 0; i < n; ++i) {
             float dx = npcs[i].x - lx, dy = npcs[i].y - ly, dz = npcs[i].z - lz;
-            if (dx * dx + dy * dy + dz * dz > 22500.0f) continue;
+            float d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 > 40000.0f) continue;
             unsigned int local[5], canon[5];
             handFromEntity(npcs[i], local);
             for (int k = 0; k < 5; ++k) canon[k] = local[k];
             // Translate exact local proxy/re-key identities to census wire hands.
             if (ctx.canonicalNpcHand) ctx.canonicalNpcHand(local, canon);
             // Identity = (index, serial); type/container are shared by many NPCs.
+            const unsigned int inner = (d2 <= 22500.0f) ? 1u : 0u;
             bool duplicate = false;
             for (unsigned int j = 0; j < used; ++j)
-                if (keys[j][0] == canon[3] && keys[j][1] == canon[4]) duplicate = true;
-            if (!duplicate && used < 128) { keys[used][0] = canon[3]; keys[used][1] = canon[4]; ++used; }
+                if (keys[j][0] == canon[3] && keys[j][1] == canon[4]) {
+                    duplicate = true; if (inner) keys[j][2] = 1u;
+                }
+            if (!duplicate && used < 128) {
+                keys[used][0] = canon[3]; keys[used][1] = canon[4]; keys[used][2] = inner; ++used;
+            }
         }
         for (unsigned int i = 0; i < used; ++i)
             for (unsigned int j = i + 1; j < used; ++j)
                 if (keys[j][0] < keys[i][0] || (keys[j][0] == keys[i][0] && keys[j][1] < keys[i][1])) {
-                    unsigned int a = keys[i][0], b = keys[i][1];
-                    keys[i][0] = keys[j][0]; keys[i][1] = keys[j][1];
-                    keys[j][0] = a; keys[j][1] = b;
+                    for (int k = 0; k < 3; ++k) {
+                        unsigned int a = keys[i][k]; keys[i][k] = keys[j][k]; keys[j][k] = a;
+                    }
                 }
-        char hands[3200]; unsigned int at = 0;
-        hands[0] = '\0';
+        char hands[3200], outer[1600]; unsigned int at = 0, ot = 0, nInner = 0;
+        hands[0] = '\0'; outer[0] = '\0';
         for (unsigned int i = 0; i < used; ++i) {
-            int wrote = _snprintf(hands + at, sizeof(hands) - at,
-                "%s%u,%u", i ? ";" : "", keys[i][0], keys[i][1]);
-            if (wrote < 0 || (unsigned int)wrote >= sizeof(hands) - at) break;
-            at += (unsigned int)wrote;
+            char* buf = keys[i][2] ? hands : outer;
+            unsigned int& pos = keys[i][2] ? at : ot;
+            const unsigned int cap = keys[i][2] ? (unsigned int)sizeof(hands) : (unsigned int)sizeof(outer);
+            int wrote = _snprintf(buf + pos, cap - pos,
+                "%s%u,%u", pos ? ";" : "", keys[i][0], keys[i][1]);
+            if (wrote < 0 || (unsigned int)wrote >= cap - pos) continue;
+            pos += (unsigned int)wrote;
+            if (keys[i][2]) ++nInner;
         }
-        char line[3400];
+        char line[5000];
         _snprintf(line, sizeof(line) - 1,
-            "SCENARIO PARITY %s t=%lu npcs=%u hands=%s",
-            ctx.isHost ? "HOST" : "JOIN", ctx.elapsedMs, used, hands);
+            "SCENARIO PARITY %s t=%lu npcs=%u hands=%s outer=%s",
+            ctx.isHost ? "HOST" : "JOIN", ctx.elapsedMs, nInner, hands, outer);
         line[sizeof(line) - 1] = '\0'; coop::logLine(line);
     }
     bool haveOwn_;

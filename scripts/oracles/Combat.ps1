@@ -1579,7 +1579,7 @@ function Test-PcAssault {
 # host clock frame before pairing; each missing canonical hand gets a 3 s lease.
 function Test-SharedFightParity {
     param([string]$HostFile, [string]$JoinFile)
-    $samplePat = 'SCENARIO PARITY (HOST|JOIN) t=(\d+) npcs=(\d+) hands=([^\]]*)'
+    $samplePat = 'SCENARIO PARITY (HOST|JOIN) t=(\d+) npcs=(\d+) hands=(\S*)(?: outer=(\S*))?'
     $samples = @{ HOST = (New-Object System.Collections.ArrayList); JOIN = (New-Object System.Collections.ArrayList) }
     foreach ($side in @(@{ name='HOST'; file=$HostFile }, @{ name='JOIN'; file=$JoinFile })) {
         $offset = Get-LogClockOffsetMs -File $side.file
@@ -1593,7 +1593,9 @@ function Test-SharedFightParity {
             $stamp = Convert-StampToMs -Groups $ts.Groups -OffsetMs $offset
             $hands = @()
             if ($g[4].Value -ne '') { $hands = @($g[4].Value.Split(';') | Where-Object { $_ -ne '' }) }
-            [void]$samples[$side.name].Add(@{ t=$stamp; elapsed=[int]$g[2].Value; count=[int]$g[3].Value; hands=$hands })
+            $outer = @()
+            if ($g[5].Success -and $g[5].Value -ne '') { $outer = @($g[5].Value.Split(';') | Where-Object { $_ -ne '' }) }
+            [void]$samples[$side.name].Add(@{ t=$stamp; elapsed=[int]$g[2].Value; count=[int]$g[3].Value; hands=$hands; outer=$outer })
         }
     }
     $paired = New-Object System.Collections.ArrayList
@@ -1612,24 +1614,28 @@ function Test-SharedFightParity {
     }
     $badDiff = 0; $maxCountDiff = 0; $missingSince = @{}; $worstMs = 0; $worstHand = ''
     foreach ($p in $paired) {
+        # Inner ring (<=150 u) per side, plus the outer 150-200 u hysteresis
+        # band: a body is MISSING only when it is inside one side's inner ring
+        # and nowhere within 200 u on the other. Edge bodies a few units apart
+        # under WAN lag are agreement, not a desync.
         $hs = @{}; foreach ($x in $p.h.hands) { $hs[$x] = $true }
         $js = @{}; foreach ($x in $p.j.hands) { $js[$x] = $true }
+        $hAll = @{}; foreach ($x in $p.h.hands + $p.h.outer) { $hAll[$x] = $true }
+        $jAll = @{}; foreach ($x in $p.j.hands + $p.j.outer) { $jAll[$x] = $true }
         $countDiff = [math]::Abs($p.h.count - $p.j.count)
         if ($countDiff -gt $maxCountDiff) { $maxCountDiff = $countDiff }
-        if ($countDiff -gt 1) { $badDiff++ }
-        $all = @($hs.Keys) + @($js.Keys) | Sort-Object -Unique
-        foreach ($hand in $all) {
-            $absent = (-not $hs.ContainsKey($hand)) -or (-not $js.ContainsKey($hand))
-            if ($absent) {
-                if (-not $missingSince.ContainsKey($hand)) { $missingSince[$hand] = $p.t }
-                $gap = $p.t - $missingSince[$hand]
-                if ($gap -gt $worstMs) { $worstMs = $gap; $worstHand = $hand }
-            } elseif ($missingSince.ContainsKey($hand)) { [void]$missingSince.Remove($hand) }
+        $hard = @{}
+        foreach ($x in $hs.Keys) { if (-not $jAll.ContainsKey($x)) { $hard[$x] = $true } }
+        foreach ($x in $js.Keys) { if (-not $hAll.ContainsKey($x)) { $hard[$x] = $true } }
+        if ($hard.Count -gt 1) { $badDiff++ }
+        foreach ($hand in @($hard.Keys)) {
+            if (-not $missingSince.ContainsKey($hand)) { $missingSince[$hand] = $p.t }
+            $gap = $p.t - $missingSince[$hand]
+            if ($gap -gt $worstMs) { $worstMs = $gap; $worstHand = $hand }
         }
-        # Absent on BOTH sides (left the sampling radius on both screens) is
-        # agreement, not a one-sided miss: stop its clock.
+        # Anything not hard-missing in this pair is agreement: stop its clock.
         foreach ($hand in @($missingSince.Keys)) {
-            if (-not $hs.ContainsKey($hand) -and -not $js.ContainsKey($hand)) { [void]$missingSince.Remove($hand) }
+            if (-not $hard.ContainsKey($hand)) { [void]$missingSince.Remove($hand) }
         }
     }
     foreach ($hand in @($missingSince.Keys)) {
