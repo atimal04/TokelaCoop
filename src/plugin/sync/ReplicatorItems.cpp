@@ -44,9 +44,32 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
         unsigned long cnow = nowMs();
         if (contCensusMs_ == 0 || (cnow - contCensusMs_) >= 1000) {
             contCensusMs_ = cnow;
-            const unsigned int MAX_CONT = 48;
+            const unsigned int MAX_CONT = 128;
+            const unsigned int MAX_BUILDINGS = 96;
+            const unsigned int MAX_TRADERS = 32;
             static engine::ContRead rows[MAX_CONT]; // main-thread only
-            unsigned int n = engine::enumContainersNear(gw, 100.0f, rows, MAX_CONT);
+            unsigned int n = engine::enumContainersNear(gw, 100.0f, rows, MAX_BUILDINGS, merchantSync_);
+            if (merchantSync_) {
+                static engine::ContRead traders[MAX_TRADERS];
+                unsigned int nt = engine::enumLootInventoriesNear(gw, 100.0f, traders, MAX_TRADERS, true);
+                unsigned int merchantCount=0;
+                for (unsigned int ti = 0; ti < nt; ++ti) {
+                    if (!traders[ti].hasInv || !traders[ti].isTrader) continue;
+                    ++merchantCount;
+                    bool dup = false;
+                    for (unsigned int ri = 0; ri < n; ++ri)
+                        if (rows[ri].hand[1] == traders[ti].hand[1] && rows[ri].hand[3] == traders[ti].hand[3] && rows[ri].hand[4] == traders[ti].hand[4]) { dup = true; break; }
+                    if (!dup && n < MAX_CONT) rows[n++] = traders[ti];
+                }
+                static unsigned long merchantLogMs = 0;
+                unsigned int shelfCount=0;
+                for (unsigned int si=0;si<n;++si) if (rows[si].classType==(int)BCTYPE_USABLE) ++shelfCount;
+                if ((merchantCount || shelfCount) && (merchantLogMs == 0 || (cnow - merchantLogMs) >= 5000)) {
+                    merchantLogMs = cnow;
+                    char mb[128]; _snprintf(mb, sizeof(mb)-1, "[merchant] census traders=%u shelves=%u", merchantCount, shelfCount);
+                    mb[sizeof(mb)-1]='\0'; coop::logLine(mb);
+                }
+            }
             censusContainers_.clear();
             for (unsigned int i = 0; i < n; ++i) {
                 if (!rows[i].hasInv) continue; // no Inventory = nothing to author

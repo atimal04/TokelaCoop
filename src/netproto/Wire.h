@@ -29,7 +29,8 @@ typedef double         f64;
 // 65 = merge of TokelaCoop v0.54 (57) and KenshiDuo (64): both older lines are
 // refused at handshake instead of playing with different packet tags.
 // Protocol 67 adds compressed save-file transfer; both peers must match.
-const u16 PROTOCOL_VERSION = 67;
+// Protocol 68 carries exact merchant stock layout and proxy home linkage.
+const u16 PROTOCOL_VERSION = 68;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -571,6 +572,9 @@ struct InvItemEntry {
     // the content hash so a different manufacturer/material registers as a content change.
     char manufacturer[48];
     char material[48];
+    u16 gridSection;
+    u16 gridX;
+    u16 gridY;
 };
 
 // An inventory snapshot is: [InvSnapshotHeader][InvItemEntry * count]. The container
@@ -1559,6 +1563,8 @@ struct SpawnInfoPacket {
     // value or every proxy creature spawns full-grown ("giant goats", manual
     // session 2026-07-12). <= 0 = unreadable -> join uses its adult default.
     f32 age;
+    u32 shopHome[5];
+    char shopSquadSid[48];
 };
 
 // ---- Protocol 31: coordinated save + session resume --------------------------

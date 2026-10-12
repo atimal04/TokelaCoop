@@ -251,6 +251,7 @@ void loadConfig(Config& c) {
     if (envOr("TOKELACOOP_BOUNTY_PROBE", "0") == "1") c.bountySync = false;
 
     c.storeSync   = envOr("TOKELACOOP_STORE_SYNC", "1") != "0";
+    c.merchantSync = envOr("TOKELACOOP_MERCHANT_SYNC", "1") != "0";
     c.squadSync   = envOr("TOKELACOOP_SQUAD_SYNC", "1") != "0";
     c.latejoinSync = envOr("TOKELACOOP_LATEJOIN_SYNC", "1") != "0";
     // NOTE: every channel above DEFAULTS ON for real sessions; the diagnostic
@@ -475,7 +476,7 @@ std::string describeConfig(const Config& c) {
         { "save",    c.saveSync },     { "load",    c.loadSync },
         { "prod",    c.prodSync },     { "research",c.researchSync },
         { "deed",    c.deedSync },    { "fixture", c.fixtureSync },
-        { "store",   c.storeSync },    { "squad",   c.squadSync },
+        { "store",   c.storeSync },    { "merchant", c.merchantSync }, { "squad",   c.squadSync },
         { "latejoin",c.latejoinSync }, { "aiSuspend", c.aiSuspend },
         { "gateAuth",c.gateAuthority },{ "camInterest", c.camInterest },
         { "censusFreezeAi", c.censusFreezeAi }, { "ownGuard", c.ownGuard }, { "tabLedger", c.tabLedger },

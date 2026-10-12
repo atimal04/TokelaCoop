@@ -45,6 +45,11 @@ void fillItemProvenance(Item* it, InvItemEntry& e) {
         GameData* mat = it->materialData;
         if (man) { const char* s = man->stringID.c_str(); strncpy(e.manufacturer, s ? s : "", sizeof(e.manufacturer) - 1); }
         if (mat) { const char* s = mat->stringID.c_str(); strncpy(e.material,     s ? s : "", sizeof(e.material) - 1); }
+        if (!e.equipped && it->isInInventory && it->inventoryPos.x >= 0 && it->inventoryPos.y >= 0) {
+            e.gridSection = sectionNameHash(it->inventorySection.c_str());
+            e.gridX = (unsigned short)it->inventoryPos.x;
+            e.gridY = (unsigned short)it->inventoryPos.y;
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
@@ -593,6 +598,37 @@ unsigned int captureContainerContents(GameWorld* gw, const unsigned int cHand[5]
 // same logic can be pointed at a nested container's private inventory (a worn backpack's
 // 'backpack_content'), which is the only way a bagged item can be placed back INSIDE the bag
 // rather than merely somewhere on the character. Nothing in here needs the owner's hand.
+static Item* fabricateStockItem(GameWorld* gw, const InvItemEntry& e) {
+    if (!gw || !gw->theFactory || !g_createItemFn || !g_handCtorFn) return 0;
+    __try {
+        GameData* tmpl=findItemTemplateImpl(gw,e.stringID,e.itemType);
+        if (!tmpl) return 0;
+        GameData* man=(e.manufacturer[0]) ? findItemTemplateImpl(gw,e.manufacturer,(unsigned int)WEAPON_MANUFACTURER) : 0;
+        GameData* mat=findMaterialSpec(gw,e.material,e.itemType);
+        if ((e.manufacturer[0] && !man) || (e.material[0] && !mat)) return 0;
+        int grade=(e.level==GRADE_NA) ? -1 : (int)e.level;
+        Item* it=0;
+        if ((itemType)e.itemType==WEAPON) {
+            if (!man) man=fallbackWeaponManufacturer(gw);
+            if (!man) return 0;
+            char buf[sizeof(hand)+16]; memset(buf,0,sizeof(buf));
+            hand* h=reinterpret_cast<hand*>(buf);
+            g_handCtorFn(h,0,0,NULL_ITEM,0,0);
+            it=g_createItemFn(gw->theFactory,man,h,tmpl,mat,(grade>=0)?grade:0,0);
+        } else {
+            char buf[sizeof(hand)+16]; memset(buf,0,sizeof(buf));
+            hand* h=reinterpret_cast<hand*>(buf);
+            g_handCtorFn(h,0,0,(itemType)e.itemType,0,0);
+            it=g_createItemFn(gw->theFactory,tmpl,h,man,mat,grade,0);
+        }
+        if (it) {
+            if (e.quality) it->quality=(float)e.quality/100.0f;
+            it->manufacturerData=man; it->materialData=mat;
+        }
+        return it;
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
 static bool applyToInventory(GameWorld* gw, Inventory* inv,
                              const InvItemEntry* items, unsigned int count,
                              bool truncated) {
@@ -609,6 +645,72 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
     Item* curItems[64];
     bool curTruncated = false;
     unsigned int ncur = readInvItems(inv, cur, curItems, MAXC, &curTruncated);
+    // Complete building/shop snapshots carry native loose-grid coordinates.
+    // Validate every target section, item rectangle, stack and overlap before
+    // removing any current item; only reuse matching native objects here.
+    if (inv->owner && inv->owner->getDataType()==BUILDING && !truncated &&
+        !curTruncated && count<=INV_ITEMS_MAX && g_getSectionsFn && g_destroyObjFn) {
+        Item* wanted[INV_ITEMS_MAX]; InventorySection* target[INV_ITEMS_MAX];
+        int matched[INV_ITEMS_MAX]; bool used[64], fabricated[INV_ITEMS_MAX];
+        memset(wanted,0,sizeof(wanted)); memset(target,0,sizeof(target)); memset(used,0,sizeof(used));
+        memset(fabricated,0,sizeof(fabricated));
+        for (unsigned int i=0;i<INV_ITEMS_MAX;++i) matched[i]=-1;
+        bool valid=true, changed=(count!=ncur);
+        __try {
+            lektor<InventorySection*>* secs=g_getSectionsFn(inv);
+            for (unsigned int i=0;i<count && valid;++i) {
+                const InvItemEntry& e=items[i];
+                if (e.equipped || !e.gridSection || !e.quantity) { valid=false; break; }
+                for (unsigned int s=0;secs && s<secs->size();++s) {
+                    InventorySection* sec=(*secs)[s];
+                    if (sec && !sec->isAnEquippedItemSection && sectionNameHash(sec->name.c_str())==e.gridSection) { target[i]=sec; break; }
+                }
+                if (!target[i]) { valid=false; break; }
+                for (unsigned int j=0;j<ncur;++j) if (!used[j] && !cur[j].equipped &&
+                    cur[j].itemType==e.itemType && cur[j].quality==e.quality && cur[j].level==e.level && cur[j].locked==e.locked &&
+                    strcmp(cur[j].stringID,e.stringID)==0 && strcmp(cur[j].manufacturer,e.manufacturer)==0 &&
+                    strcmp(cur[j].material,e.material)==0) { wanted[i]=curItems[j]; matched[i]=(int)j; used[j]=true; break; }
+                if (!wanted[i]) { wanted[i]=fabricateStockItem(gw,e); fabricated[i]=wanted[i]?true:false; }
+                Item* it=wanted[i];
+                if (!it || it->itemWidth<=0 || it->itemHeight<=0 || e.gridX+it->itemWidth>target[i]->width ||
+                    e.gridY+it->itemHeight>target[i]->height || (e.quantity>1 && e.quantity>it->isStackable(target[i]))) { valid=false; break; }
+                if (matched[i]<0 || e.quantity!=cur[matched[i]].quantity || e.gridSection!=cur[matched[i]].gridSection ||
+                    e.gridX!=cur[matched[i]].gridX || e.gridY!=cur[matched[i]].gridY) changed=true;
+                for (unsigned int j=0;j<i;++j) if (target[j]==target[i] &&
+                    e.gridX<items[j].gridX+wanted[j]->itemWidth && items[j].gridX<e.gridX+it->itemWidth &&
+                    e.gridY<items[j].gridY+wanted[j]->itemHeight && items[j].gridY<e.gridY+it->itemHeight) { valid=false; break; }
+            }
+            if (valid && changed) {
+                for (unsigned int j=0;j<ncur;++j) {
+                    if (used[j]) {
+                        Item* kept=inv->removeItemDontDestroy_returnsItem(curItems[j],cur[j].quantity,false);
+                        if (kept!=curItems[j]) { valid=false; break; }
+                    }
+                    else inv->removeItemAutoDestroy(curItems[j],cur[j].quantity);
+                }
+                for (unsigned int i=0;i<count;++i) {
+                    wanted[i]->quantity=items[i].quantity;
+                    target[i]->_addItem(wanted[i],items[i].gridX,items[i].gridY);
+                    if (!inv->hasItem(wanted[i])) { valid=false; break; }
+                    wanted[i]=0; // section now owns the item
+                }
+                inventoryGuiRefresh(inv);
+            }
+            for (unsigned int i=0;i<count;++i)
+                if (fabricated[i] && wanted[i] && g_destroyObjFn)
+                    g_destroyObjFn(gw,wanted[i],false,"coop-stock-staging");
+        } __except(EXCEPTION_EXECUTE_HANDLER) { valid=false; }
+        if (valid) {
+            static unsigned long lastStockLog=0; unsigned long tick=GetTickCount();
+            if (!lastStockLog || tick-lastStockLog>=5000) { lastStockLog=tick; coop::logLine("[merchant] stock-layout applied"); }
+            return changed;
+        }
+        static unsigned long lastStockRejectLog=0; unsigned long tick=GetTickCount();
+        if (!lastStockRejectLog || tick-lastStockRejectLog>=5000) {
+            lastStockRejectLog=tick; coop::logLine("[merchant] stock-layout rejected before mutation");
+        }
+        return false;
+    }
 
     // Group desired + current by TEMPLATE (stringID,itemType), tracking the EQUIPPED vs
     // LOOSE split separately. A change in the split while the template's TOTAL count is

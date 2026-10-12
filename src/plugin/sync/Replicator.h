@@ -693,6 +693,7 @@ public:
     // the protocol-27 build maps (keyKind=1); the receiver resolves back in
     // ingestInv. Layered on invSync (publishInventories is the carrier).
     void setStoreSync(bool v) { storeSync_ = v; }
+    void setMerchantSync(bool v) { merchantSync_ = v; }
 
     // Connect-edge resync (protocol 30, no wire change): called from the
     // game-thread connect drain (processNetEvents) when a peer appears (host
@@ -1587,6 +1588,7 @@ private:
     // usual. Refreshed wholesale each census (leaving interest just stops
     // the captures; the invPub_ baseline survives for the return).
     bool           storeSync_;
+    bool           merchantSync_;
     unsigned long  contCensusMs_;
     std::set<Key>  censusContainers_;
     std::set<Key>  censusEver_;   // every container a census took in this session
@@ -2950,6 +2952,7 @@ private:
     // by pointer via drivenChars_ (hide on stale stream / restore on return
     // come free from the existing hysteresis).
     std::map<Key, Character*> proxyByKey_;
+    std::map<Key, SpawnInfoPacket> merchantInfo_;
 
     // Bodies THIS client created (successful mints only). Bound proxies come from
     // two places now - minted, or ADOPTED from the population we generated

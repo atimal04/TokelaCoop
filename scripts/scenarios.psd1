@@ -1066,10 +1066,9 @@
         # sides log nearby vendors (money+stock) and every squad tab's
         # per-platoon wallet at 1 Hz; the host then drives one programmatic
         # Inventory::buyItem, and the join tries the same against its driven
-        # vendor copy. Gates only on the EVIDENCE (vendor enumerated, wallet
-        # series readable, both buy attempts logged); wallet/vendor divergence
-        # and the join-buy outcome are recorded as FINDINGs that gate the
-        # vendor-mirror design. Save 'sync': the bar town puts real ShopTraders
+        # vendor copy. Gates on vendor enumeration, wallet evidence, both buy
+        # attempts, and final host/join vendor money+stock parity after the join
+        # purchase. Save 'sync': the bar town puts real ShopTraders
         # in range.
         shop_probe = @{
             DiagEnv = @{ TOKELACOOP_MONEY_SYNC = '0' }
