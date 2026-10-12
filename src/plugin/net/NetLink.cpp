@@ -58,20 +58,36 @@ void netErr(const char* msg) {
 }
 
 // WAN link tuning (#83/#86: LAN connects fine, intercontinental Steam/VPN
-// joins sit in an empty world). ENet caps reliable data in flight at
-// packetThrottle/32 * windowSize (64 KB) per RTT, and its throttle decays on
-// every RTT spike above the variance - jitter and retransmits drive it to a
-// single MTU per RTT, i.e. ~4 KB/s at 300 ms, so a 20 MB save bootstrap takes
-// over an hour. Pin the throttle at its limit (deceleration 0) and stretch the
-// peer timeout so a long transfer is not dropped mid-stream.
+// joins sit in an empty world while the connect-time save streams). ENet caps
+// reliable data in flight at packetThrottle/32 * windowSize per RTT, and
+// windowSize is clamped to 64 KB at connect: measured under netsim 120 ms /
+// 5 % loss, a 3.7 MB save moves at ~200 KB/s (17-19 s) whatever the throttle
+// does, so a real 20-30 MB save takes minutes and a lossier link never
+// finishes. Raise the send window to WAN_WINDOW (re-asserted every service
+// tick, because ENet recomputes it whenever bandwidth limits are exchanged),
+// pin the throttle at its limit (deceleration 0) and stretch the peer timeout
+// so a long transfer is not dropped mid-stream.
 // TOKELACOOP_WAN_TUNE=0 restores ENet defaults.
+static const enet_uint32 WAN_WINDOW = 512 * 1024;
+static bool wanTuneOn() {
+    const char* e = getenv("TOKELACOOP_WAN_TUNE");
+    return !(e && e[0] == '0');
+}
 static void tuneWanPeer(ENetPeer* peer) {
     if (!peer) return;
-    const char* e = getenv("TOKELACOOP_WAN_TUNE");
-    if (e && e[0] == '0') { netLog("wan tune OFF (ENet default throttle/timeout)"); return; }
+    if (!wanTuneOn()) { netLog("wan tune OFF (ENet default window/throttle/timeout)"); return; }
     enet_peer_throttle_configure(peer, ENET_PEER_PACKET_THROTTLE_INTERVAL, 2, 0);
     enet_peer_timeout(peer, 64, 15000, 60000);
-    netLog("wan tune: throttle pinned (decel 0), timeout 15-60 s");
+    peer->windowSize = WAN_WINDOW;
+    netLog("wan tune: window 512 KB, throttle pinned (decel 0), timeout 15-60 s");
+}
+static void reassertWanWindow(ENetHost* host, bool on) {
+    if (!host || !on) return;
+    for (size_t i = 0; i < host->peerCount; ++i) {
+        ENetPeer* p = &host->peers[i];
+        if (p->state == ENET_PEER_STATE_CONNECTED && p->windowSize < WAN_WINDOW)
+            p->windowSize = WAN_WINDOW;
+    }
 }
 
 // Cross-thread UI-error channel backing store (see NetLink.h). The buffer holds
@@ -578,6 +594,7 @@ void NetLink::threadLoop() {
     long          bestOffsetMs  = 0;
     unsigned int  syncSamples   = 0;
     const long    HALF_DAY_MS   = 12l * 3600l * 1000l;
+    const bool    wanTune       = wanTuneOn();
 
     while (!stopFlag_) {
         // Steam heartbeat: spike ping/echo + session-state change logging.
@@ -610,6 +627,7 @@ void NetLink::threadLoop() {
             }
         }
 
+        reassertWanWindow(enetHost_, wanTune);
         ENetEvent ev;
         while (enet_host_service(enetHost_, &ev, TICK_MS) > 0) {
             switch (ev.type) {
