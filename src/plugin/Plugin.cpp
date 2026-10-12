@@ -554,8 +554,15 @@ void tickJoinTabWait() {
     if (waited < 6000) return;
     if (!seen && waited < 10000) return;
     g_joinTabWait = false;
-    // Seed again now that the tab exists, so the host decides it from the
-    // ledger (the join's) exactly as the join will after loading the bake.
+    // During the dwell the host's live ownership fell back to the author (the
+    // host) and ledger recording wrote that back over our JOIN row (run 214753:
+    // tab 22 own=1 via=ledger on the host). Re-assert the join's row, then seed
+    // again so the host decides it from the ledger exactly as the join will.
+    {
+        coop::TabLedger fixed = g_repl.tabLedger();
+        fixed[std::make_pair(g_joinTabC, g_joinTabS)] = coop::TAB_ROLE_JOIN;
+        g_repl.setTabLedger(fixed);
+    }
     g_repl.reseedTabsForPeer();
     char b[128];
     _snprintf(b, sizeof(b) - 1, "[squads] AUTO-JOIN-SQUAD tab %s after %lums - baking",
