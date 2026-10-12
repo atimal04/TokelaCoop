@@ -226,6 +226,15 @@ if ($Wan -ne "") {
     if (-not (Test-Path $netsimExe)) {
         throw "dist\netsim.exe not found - build it first: cmd /c scripts\build_netsim.cmd"
     }
+    # Run it under a name of our own: another project's bench on the same PC
+    # also runs a "netsim.exe" and cleans up with taskkill /IM netsim.exe /F,
+    # which killed our relay mid-run (exit code 1, 12/10).
+    $netsimRun = Join-Path $repoRoot "dist\tokelacoop_netsim.exe"
+    if (-not (Test-Path $netsimRun) -or
+        (Get-Item $netsimRun).LastWriteTime -lt (Get-Item $netsimExe).LastWriteTime) {
+        Copy-Item $netsimExe $netsimRun -Force
+    }
+    $netsimExe = $netsimRun
     $proxyPort = $Port + 1
     Write-Host "Starting WAN relay proxy '$Wan' (delay $($wp.DelayMs)ms +/-$($wp.JitterMs)ms, loss $($wp.LossPct)%) on port $proxyPort -> ${Ip}:$Port"
     $wanLog = Join-Path $OutDir "netsim.log"
