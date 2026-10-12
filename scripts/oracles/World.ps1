@@ -914,6 +914,43 @@ function Test-SquadPersist {
                 -Detail ($why -join '; '))
 }
 
+function Test-JoinSquadLoaded {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $created = @(Select-String -Path $HostFile -Pattern '\[squads\] AUTO-JOIN-SQUAD created hand=' -ErrorAction SilentlyContinue).Count
+    if ($created -eq 0) { $why += 'host did not create the loaded-save join character' }
+    $sideHands = @{}
+    foreach ($side in @(@('host', $HostFile), @('join', $JoinFile))) {
+        $name = $side[0]; $file = $side[1]
+        $wantOwn = if ($name -eq 'join') { 1 } else { 0 }
+        $tab = @(Select-String -Path $file -Pattern "\[squad\] TABOWN cont=(\d+),(\d+) rank=1 own=$wantOwn via=ledger" -ErrorAction SilentlyContinue)
+        if ($tab.Count -eq 0) { $why += "$name did not record the expected ledger ownership for rank 1" }
+        $rows = @(Select-String -Path $file -Pattern 'SCENARIO JOIN_SQUAD side=' -ErrorAction SilentlyContinue)
+        $hasMember = @(Select-String -Path $file -Pattern 'SCENARIO JOIN_SQUAD tab=\d+,\d+ rank=1 count=([1-9]\d*)' -ErrorAction SilentlyContinue).Count
+        if ($hasMember -eq 0) { $why += "$name did not prove a character in the join tab" }
+        if ($rows.Count -lt 2) { $why += "$name logged fewer than two samples of the join character"; continue }
+        $samples = @()
+        foreach ($row in $rows) {
+            if ($row.Line -match 'hand=(\d+),(\d+),(\d+),(\d+),(\d+) pos=(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)') {
+                $samples += [pscustomobject]@{ hand="$($Matches[1]),$($Matches[2]),$($Matches[3]),$($Matches[4]),$($Matches[5])"; x=[double]$Matches[6]; z=[double]$Matches[8] }
+            }
+        }
+        if ($samples.Count -lt 2) { $why += "$name has no parseable character movement samples"; continue }
+        $hand = $samples[0].hand
+        $sideHands[$name] = $hand
+        $same = @($samples | Where-Object { $_.hand -eq $hand })
+        $travel = [math]::Sqrt([math]::Pow(($same[-1].x - $same[0].x), 2) + [math]::Pow(($same[-1].z - $same[0].z), 2))
+        if ($travel -lt 2.0) { $why += "$name's join character moved only $([math]::Round($travel,1)) units" }
+        Write-Host "    FINDING: $name join-hand=$hand samples=$($same.Count) travel=$([math]::Round($travel,1)) tabown=$($tab.Count)"
+    }
+    if ($sideHands.ContainsKey('host') -and $sideHands.ContainsKey('join') -and
+        $sideHands.host -ne $sideHands.join) { $why += 'host and join sampled different character hands' }
+    $v = if ($why.Count -eq 0) { 'PASS' } else { 'FAIL' }
+    $detail = $why -join '; '
+    Write-Host "  JOIN-SQUAD-LOADED $v - $detail"
+    return (Add-GateResult -Name 'join_squad_loaded' -Status $v -Metrics @{ created = $created } -Detail $detail)
+}
+
 function Test-SquadSync {
     param([string]$HostFile, [string]$JoinFile)
     $why = @()

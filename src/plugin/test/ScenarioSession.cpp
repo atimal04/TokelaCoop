@@ -21,6 +21,48 @@
 namespace coop {
 namespace {
 
+class JoinSquadLoadedScenario : public TimedScenario {
+public:
+    JoinSquadLoadedScenario() : TimedScenario("join_squad_loaded", 1000), moved_(false),
+                                have_(false), x_(0), y_(0), z_(0) {}
+    virtual void onStart(const ScenarioContext&) { coop::logLine("SCENARIO JOIN_SQUAD start"); }
+    virtual bool onTick(const ScenarioContext& ctx) {
+        EntityState sq[64];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, 64);
+        int found = -1;
+        unsigned int tabChars = 0;
+        unsigned int container = 0, serial = 0;
+        for (unsigned int i = 0; i < n; ++i) {
+            // The join's new tab is the second seeded tab in this single-tab fixture.
+            int rank = tabRankOf(sq, n, i);
+            if (rank == 1) { if (found < 0) found = (int)i; ++tabChars; }
+        }
+        if (found >= 0 && evidenceDue(ctx.elapsedMs)) {
+            EntityState& e = sq[found];
+            container = e.hContainer; serial = e.hContainerSerial;
+            if (!have_) { x_ = e.x; y_ = e.y; z_ = e.z; have_ = true; }
+            if (!ctx.isHost && !moved_) {
+                moved_ = engine::orderMoveTo(engine::resolve(e), x_ + 24.0f, y_, z_);
+            }
+            char b[224];
+            _snprintf(b, sizeof(b) - 1,
+                "SCENARIO JOIN_SQUAD side=%s hand=%u,%u,%u,%u,%u pos=%.1f,%.1f,%.1f destx=%.1f t=%lu",
+                ctx.isHost ? "host" : "join", e.hIndex, e.hSerial, e.hType,
+                e.hContainer, e.hContainerSerial, e.x, e.y, e.z, x_ + 24.0f, ctx.elapsedMs);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            char own[128];
+            _snprintf(own, sizeof(own) - 1, "SCENARIO JOIN_SQUAD tab=%u,%u rank=1 count=%u",
+                      container, serial, tabChars);
+            own[sizeof(own) - 1] = '\0'; coop::logLine(own);
+        }
+        if (ctx.elapsedMs >= 30000) { setPassed(have_ && (ctx.isHost || moved_)); return true; }
+        return false;
+    }
+private:
+    bool moved_, have_;
+    float x_, y_, z_;
+};
+
 
 // latejoin_probe (protocol 30 phase 0, probe tier; latejoinSync forced OFF) /
 // latejoin_sync (probe=false, full tier; ON). A client that connects late
@@ -1801,6 +1843,7 @@ const char* const SaveSquadMetaScenario::FAC_NAME     = "MP-Join-Faction";
 } // namespace
 
 Scenario* makeSessionScenario(const std::string& name) {
+    if (name == "join_squad_loaded") return new JoinSquadLoadedScenario();
     if (name == "latejoin_probe") return new LatejoinProbeScenario(true);
     if (name == "latejoin_sync")  return new LatejoinProbeScenario(false);
     if (name == "save_probe")     return new SaveProbeScenario();

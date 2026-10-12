@@ -24,6 +24,7 @@
 
 #include <windows.h>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <deque>
 
@@ -450,7 +451,68 @@ void sessionResetForWorldReload() {
 // the host is already in-game (processNetEvents), or the host's gameplay
 // starting with a peer already connected (mainLoop_hook gameplay-start edge).
 // Host + saveSync + in-game are the caller's responsibility.
+void prepareJoinPlayerTab() {
+    const char* off = std::getenv("TOKELACOOP_AUTO_JOIN_SQUAD");
+    if (off && strcmp(off, "0") == 0) {
+        coopLog("[squads] AUTO-JOIN-SQUAD skip reason=disabled");
+        return;
+    }
+    if (!g_cfg.isHost || !g_peerPresent || !g_lastGw) {
+        coopLog("[squads] AUTO-JOIN-SQUAD skip reason=not-host-connect");
+        return;
+    }
+
+    coop::EntityState sq[64];
+    unsigned int n = coop::engine::captureSquad(g_lastGw, false, sq, 64);
+    std::pair<unsigned int, unsigned int> tabs[64];
+    unsigned int tabCount = 0;
+    bool ledgerJoin = false;
+    const coop::TabLedger& ledger = g_repl.tabLedger();
+    for (unsigned int i = 0; i < n; ++i) {
+        std::pair<unsigned int, unsigned int> key(sq[i].hContainer, sq[i].hContainerSerial);
+        bool seen = false;
+        for (unsigned int j = 0; j < tabCount; ++j)
+            if (tabs[j] == key) { seen = true; break; }
+        if (!seen && tabCount < 64) tabs[tabCount++] = key;
+    }
+    for (unsigned int i = 0; i < tabCount; ++i) {
+        coop::TabLedger::const_iterator it = ledger.find(tabs[i]);
+        if (it != ledger.end() && it->second == coop::TAB_ROLE_JOIN) ledgerJoin = true;
+    }
+    if (ledgerJoin) {
+        coopLog("[squads] AUTO-JOIN-SQUAD skip reason=join-tab-already-ledgered");
+        return;
+    }
+    if (tabCount > 1) {
+        coopLog("[squads] AUTO-JOIN-SQUAD skip reason=rank-1-tab-exists");
+        return;
+    }
+    if (tabCount == 0) {
+        coopLog("[squads] AUTO-JOIN-SQUAD skip reason=no-player-tab");
+        return;
+    }
+
+    unsigned int hand[5];
+    if (!coop::engine::spawnJoinPlayerTab(g_lastGw, hand)) {
+        coopLog("[squads] AUTO-JOIN-SQUAD skip reason=create-failed");
+        return;
+    }
+    coop::TabLedger updated = ledger;
+    updated[std::make_pair(hand[1], hand[2])] = coop::TAB_ROLE_JOIN;
+    g_repl.setTabLedger(updated);
+    g_toastText = "Join squad ready";
+    g_toastState = 2;
+    g_toastArmMs = GetTickCount();
+    g_toastArmed = true;
+    char b[192];
+    _snprintf(b, sizeof(b) - 1,
+              "[squads] AUTO-JOIN-SQUAD created hand=%u,%u,%u,%u,%u tab=%u,%u near leader",
+              hand[3], hand[4], hand[0], hand[1], hand[2], hand[1], hand[2]);
+    b[sizeof(b) - 1] = '\0'; coopLog(b);
+}
+
 void armConnectPush() {
+    prepareJoinPlayerTab();
     char cur[64];
     cur[0] = '\0';
     coop::engine::saveInfo(cur, sizeof(cur), 0, 0);

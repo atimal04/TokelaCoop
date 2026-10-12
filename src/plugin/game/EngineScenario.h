@@ -96,6 +96,11 @@ int  rearmDownScene(GameWorld* gw);
 // to split (host owns tab 0, join owns tab 1). Host-only; user SAVEs the result.
 bool setupSquadScene(GameWorld* gw);
 
+// Host connect-push repair: create one player-faction character from the
+// loaded leader's template, recruit it, then separate it into its own tab.
+// Returns the new save-stable hand (readObjectHand layout).
+bool spawnJoinPlayerTab(GameWorld* gw, unsigned int outHand[5]);
+
 // split_far fixture bake: relocate every player-squad member that is NOT in the
 // LEADER's squad tab to (x,y,z) and halt it there, so the baked save opens with
 // the two tabs in two different regions. Host-only, single client - doing this

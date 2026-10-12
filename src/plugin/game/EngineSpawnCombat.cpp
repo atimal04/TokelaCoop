@@ -1327,6 +1327,34 @@ bool setupSquadScene(GameWorld* gw) {
     return ra || rb;
 }
 
+bool spawnJoinPlayerTab(GameWorld* gw, unsigned int outHand[5]) {
+    if (!gw || !gw->player || !gw->theFactory || !outHand || !g_createCharFn ||
+        !g_playerFactionFn || !g_separateSquadFn || !g_recruitFn) return false;
+    memset(outHand, 0, sizeof(unsigned int) * 5);
+    Character* ld = leader(gw);
+    if (!ld) return false;
+    Character* c = 0;
+    __try {
+        GameData* tmpl = ld->getGameData();
+        if (!tmpl) return false;
+        Ogre::Vector3 p = ld->getPosition();
+        Faction* fac = g_playerFactionFn(gw->player);
+        if (!fac) return false;
+        Ogre::Vector3 at(p.x + 3.0f, p.y, p.z + 2.0f);
+        RootObject* made = g_createCharFn(gw->theFactory, fac, at, 0, tmpl, 0, 1.0f);
+        if (!made) return false;
+        c = static_cast<Character*>(made);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    if (!recruitNpc(gw, c)) return false;
+    if (!detachFromTownAI(c)) return false;
+    if (!readObjectHand(static_cast<RootObject*>(c), outHand)) return false;
+    unsigned int leaderHand[5];
+    if (!readObjectHand(static_cast<RootObject*>(ld), leaderHand)) return false;
+    return outHand[1] != leaderHand[1] || outHand[2] != leaderHand[2];
+}
+
 // 'splitfar' setup scene (far-apart desync fixture bake): move every player-squad
 // member that is NOT in the leader's tab to a fixed remote point and halt it
 // there, so the baked save OPENS with the two tabs in two different regions.
