@@ -946,16 +946,20 @@ function Test-SquadPersist {
 function Test-JoinSquadLoaded {
     param([string]$HostFile, [string]$JoinFile)
     $why = @()
-    $created = @(Select-String -Path $HostFile -Pattern '\[squads\] AUTO-JOIN-SQUAD created hand=' -ErrorAction SilentlyContinue).Count
+    $createdRows = @(Select-String -Path $HostFile -Pattern '\[squads\] AUTO-JOIN-SQUAD created hand=\S+ tab=(\d+),(\d+)' -ErrorAction SilentlyContinue)
+    $created = $createdRows.Count
     if ($created -eq 0) { $why += 'host did not create the loaded-save join character' }
+    # The created tab, by identity (its rank is 1 on a real single-squad save,
+    # 2 under the harness FORCE mode on a fixture that already has a join tab).
+    $tabKey = if ($created -gt 0) { "$($createdRows[0].Matches[0].Groups[1].Value),$($createdRows[0].Matches[0].Groups[2].Value)" } else { '' }
     $sideHands = @{}
     foreach ($side in @(@('host', $HostFile), @('join', $JoinFile))) {
         $name = $side[0]; $file = $side[1]
         $wantOwn = if ($name -eq 'join') { 1 } else { 0 }
-        $tab = @(Select-String -Path $file -Pattern "\[squad\] TABOWN cont=(\d+),(\d+) rank=1 own=$wantOwn via=ledger" -ErrorAction SilentlyContinue)
-        if ($tab.Count -eq 0) { $why += "$name did not record the expected ledger ownership for rank 1" }
+        $tab = @(Select-String -Path $file -Pattern "\[squad\] TABOWN cont=$([regex]::Escape($tabKey)) rank=\d+ own=$wantOwn via=ledger" -ErrorAction SilentlyContinue)
+        if ($tabKey -eq '' -or $tab.Count -eq 0) { $why += "$name did not record the ledger ownership of the created tab $tabKey (own=$wantOwn)" }
         $rows = @(Select-String -Path $file -Pattern 'SCENARIO JOIN_SQUAD side=' -ErrorAction SilentlyContinue)
-        $hasMember = @(Select-String -Path $file -Pattern 'SCENARIO JOIN_SQUAD tab=\d+,\d+ rank=1 count=([1-9]\d*)' -ErrorAction SilentlyContinue).Count
+        $hasMember = @(Select-String -Path $file -Pattern "SCENARIO JOIN_SQUAD tab=$([regex]::Escape($tabKey)) rank=\d+ count=([1-9]\d*)" -ErrorAction SilentlyContinue).Count
         if ($hasMember -eq 0) { $why += "$name did not prove a character in the join tab" }
         if ($rows.Count -lt 2) { $why += "$name logged fewer than two samples of the join character"; continue }
         $samples = @()
