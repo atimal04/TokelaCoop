@@ -1395,10 +1395,14 @@ bool spawnJoinPlayerTab(GameWorld* gw, unsigned int outHand[5]) {
         GameData* tmpl = ld->getGameData();
         if (!tmpl) return false;
         Ogre::Vector3 p = ld->getPosition();
-        Faction* fac = g_playerFactionFn(gw->player);
+        // Same arguments as the proven spawnNpcInFront path (EngineInventory.cpp):
+        // the leader's own faction and an adult age. The first version (player
+        // faction via PlayerInterface, age 1.0) wrote a platoon file that did
+        // not come back as a player squad tab on the join's load (12/10 runs).
+        Faction* fac = ld->getFaction();
         if (!fac) return false;
         Ogre::Vector3 at(p.x + 3.0f, p.y, p.z + 2.0f);
-        RootObject* made = g_createCharFn(gw->theFactory, fac, at, 0, tmpl, 0, 1.0f);
+        RootObject* made = g_createCharFn(gw->theFactory, fac, at, 0, tmpl, 0, 25.0f);
         if (!made) return false;
         c = static_cast<Character*>(made);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
