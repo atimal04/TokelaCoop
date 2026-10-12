@@ -1665,9 +1665,10 @@ public:
     SharedFightParityScenario()
         : TimedScenario("shared_fight_parity", 0), haveOwn_(false),
           lastSampleMs_(0), lastOrderMs_(0), attacks_(0), hitBase_(0),
-          haveVictim_(false), ownBase_(0), npcBase_(0), vetoBase_(0), lastLandedLogMs_(0) {
+          haveVictim_(false), haveCenter_(false), statsBoosted_(false), ownBase_(0), npcBase_(0), vetoBase_(0), lastLandedLogMs_(0) {
         ownHand_[0] = ownHand_[1] = ownHand_[2] = ownHand_[3] = ownHand_[4] = 0;
         victim_[0] = victim_[1] = victim_[2] = victim_[3] = victim_[4] = 0;
+        centerHand_[0] = centerHand_[1] = centerHand_[2] = centerHand_[3] = centerHand_[4] = 0;
     }
     virtual void onStart(const ScenarioContext& ctx) {
         hitBase_ = (!ctx.isHost && ctx.combatHitCaptureCount)
@@ -1685,6 +1686,32 @@ public:
             handFromEntity(squad[leader], ownHand_);
             haveOwn_ = true;
         }
+        // The fixture squad has every stat at 1: almost every swing is blocked on
+        // both screens, so the landed census has nothing to compare. Raise the
+        // squad's stats to a mid-game 40 once (each side writes the bodies it
+        // sees; the owner's stats stream then settles the copies).
+        if (!statsBoosted_ && nSquad > 0) {
+            statsBoosted_ = true;
+            unsigned int boosted = 0;
+            for (unsigned int i = 0; i < nSquad; ++i) {
+                unsigned int h[5];
+                handFromEntity(squad[i], h);
+                Character* sc = engine::resolveCharByHand(h[3], h[4], h[0], h[1], h[2]);
+                engine::StatsRead st;
+                if (!sc || !engine::readStats(sc, &st) || !st.valid) continue;
+                for (unsigned int k = 1; k < st.nStats && k < 40; ++k)
+                    if (st.stats[k] >= 0.0f && st.stats[k] < 40.0f) st.stats[k] = 40.0f;
+                st.xp = -1.0f; st.freeAttribPts = -1.0f;
+                if (engine::writeStats(sc, st)) ++boosted;
+            }
+            char b[96];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO PARITY BOOST stats=40 bodies=%u", boosted);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        // Both sides sample around the SAME body - the host's tab leader (the
+        // join has it as a driven copy) - so the two NPC sets are comparable.
+        int hostLeader = tabLeaderIdx(squad, nSquad, 0u);
+        if (hostLeader >= 0) { handFromEntity(squad[hostLeader], centerHand_); haveCenter_ = true; }
         // Stick to one victim and re-issue sparsely: every re-order restarts the
         // attackers' approach, which would depress BOTH sides' landed counts.
         if (haveOwn_ && ctx.elapsedMs >= 5000 &&
@@ -1739,8 +1766,8 @@ private:
     void logParitySample(const ScenarioContext& ctx) {
         // handFromEntity order is {type, container, cs, index, serial};
         // resolveCharByHand takes (index, serial, type, container, cs).
-        Character* own = engine::resolveCharByHand(ownHand_[3], ownHand_[4],
-            ownHand_[0], ownHand_[1], ownHand_[2]);
+        const unsigned int* ch = haveCenter_ ? centerHand_ : ownHand_;
+        Character* own = engine::resolveCharByHand(ch[3], ch[4], ch[0], ch[1], ch[2]);
         if (!own) return;
         float lx, ly, lz;
         if (!engine::readPos(own, &lx, &ly, &lz)) return;
@@ -1787,8 +1814,8 @@ private:
     unsigned long lastSampleMs_, lastOrderMs_;
     unsigned long attacks_;
     unsigned int hitBase_, ownHand_[5];
-    bool haveVictim_;
-    unsigned int victim_[5];
+    bool haveVictim_, haveCenter_, statsBoosted_;
+    unsigned int victim_[5], centerHand_[5];
     unsigned long ownBase_, npcBase_, vetoBase_, lastLandedLogMs_;
 };
 
