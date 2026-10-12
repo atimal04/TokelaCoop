@@ -2236,6 +2236,7 @@ struct ContRead {
     unsigned int hand[5]; // local hand [type, container, containerSerial, index, serial]
     float x, y, z;        // world position (census diagnostics)
     int   classType;      // BuildingClassType (BCTYPE_STORAGE or a machine class)
+    int   isTrader;       // native Character::isATrader for character census rows
     int   complete;       // ConstructionState::isComplete (incomplete rides protocol 27)
     int   hasInv;         // getInventory() != null (lazy-inventory evidence)
     int   nEntries;       // distinct (sid,type,equipped) entries captured
@@ -2252,7 +2253,10 @@ struct ContRead {
 // count/qty/hash summary - the capacity question's measuring stick. Returns
 // the count written.
 unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
-                                unsigned int maxOut);
+                                unsigned int maxOut, bool includeUsable = false);
+unsigned int enumLootInventoriesNear(GameWorld* gw, float radius,
+                                     ContRead* out, unsigned int maxOut,
+                                     bool initializeStock);
 // SEH-guarded single-container read by local hand. Returns false when the hand
 // does not resolve locally or is not a container-bearing building class.
 bool readContainerByHand(const unsigned int cHand[5], ContRead* out);
@@ -2346,6 +2350,8 @@ int ensureVendorStock(GameWorld* gw, const unsigned int vHand[5]);
 int probeVendorBuy(GameWorld* gw, const unsigned int vHand[5],
                    const unsigned int buyerHand[5],
                    char* outSid, unsigned int sidLen);
+bool readMerchantHome(Character* c, unsigned int outHome[5], char* outSquadSid, unsigned int maxSid);
+bool bindMerchantHome(GameWorld* gw, Character* c, const unsigned int home[5], const char* squadSid);
 
 // ---- Consensus game-speed sync ----------------------------------------------
 

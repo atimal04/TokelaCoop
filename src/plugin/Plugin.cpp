@@ -3201,6 +3201,7 @@ void installEngineDetours() {
     // performs the census and authors these snapshots; the join uses their store
     // marker to detect add intents. Layered on invSync below.
     g_repl.setStoreSync(g_cfg.storeSync);
+    g_repl.setMerchantSync(g_cfg.merchantSync);
     if (g_cfg.recruitSync) {
         if (coop::engine::installRecruitHook())
             coopLog("[recruit] recruit detour installed; recruitment sync ON");
