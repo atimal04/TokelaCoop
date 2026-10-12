@@ -1659,6 +1659,8 @@ int probePlaceMachine(GameWorld* gw, float fwd, float side, int kind,
 static bool isContainerClassType(int t) {
     return t == (int)BCTYPE_STORAGE || t == (int)BCTYPE_USABLE || isMachineClassType(t);
 }
+// Shop shelf (usable furniture) - for the sync layer, which has no engine enums.
+bool isShelfClassType(int t) { return t == (int)BCTYPE_USABLE; }
 
 // Fill a ContRead from a live container-bearing Building. Callers hold the
 // SEH frame and have already verified isContainerClassType(b->classType).
@@ -1737,14 +1739,24 @@ unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
 // Host census of nearby lootable bodies and traders. A trader refresh is only
 // run while its native refresh timestamp is unset; an empty initialized shop
 // remains exhausted stock. The caller controls host-only invocation.
+typedef bool (__fastcall* LootIsTraderFn)(const Character*);
+typedef bool (__fastcall* LootIsUnsetFn)(const TimeOfDay*);
+// Resolved outside the __try frame below: a dynamically-initialised local
+// static needs EH unwinding, which VS2010 forbids next to __try (C2712).
+static LootIsTraderFn lootIsTraderFn() {
+    static LootIsTraderFn f = (LootIsTraderFn)KenshiLib::GetRealAddress(&Character::isATrader);
+    return f;
+}
+static LootIsUnsetFn lootIsUnsetFn() {
+    static LootIsUnsetFn f = (LootIsUnsetFn)KenshiLib::GetRealAddress(&TimeOfDay::isUnset);
+    return f;
+}
 unsigned int enumLootInventoriesNear(GameWorld* gw, float radius,
                                      ContRead* out, unsigned int maxOut,
                                      bool initializeStock) {
     if (!gw || !out || !maxOut || !g_getCharsFn) return 0;
-    typedef bool (__fastcall* IsTraderFn)(const Character*);
-    typedef bool (__fastcall* IsUnsetFn)(const TimeOfDay*);
-    static IsTraderFn isTrader = (IsTraderFn)KenshiLib::GetRealAddress(&Character::isATrader);
-    static IsUnsetFn isUnset = (IsUnsetFn)KenshiLib::GetRealAddress(&TimeOfDay::isUnset);
+    LootIsTraderFn isTrader = lootIsTraderFn();
+    LootIsUnsetFn isUnset = lootIsUnsetFn();
     unsigned int n = 0;
     __try {
         Ogre::Vector3 centers[4];

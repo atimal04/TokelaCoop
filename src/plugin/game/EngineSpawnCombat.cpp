@@ -25,12 +25,27 @@ static bool sameMerchantHome(const hand& h, const unsigned int home[5]) {
     return (unsigned int)h.type==home[0] && h.container==home[1] &&
         h.containerSerial==home[2] && h.index==home[3] && h.serial==home[4];
 }
+// Lever resolution lives OUTSIDE the __try frames: a dynamically-initialised
+// function-local static needs EH unwinding, which VS2010 forbids next to __try
+// (C2712).
+static MerchantCheckFn merchantCheckFn() {
+    static MerchantCheckFn f = (MerchantCheckFn)KenshiLib::GetRealAddress(&Character::isATrader);
+    return f;
+}
+static MerchantHomeFn merchantHomeFn() {
+    static MerchantHomeFn f = (MerchantHomeFn)KenshiLib::GetRealAddress(&Ownerships::setHomeBuilding);
+    return f;
+}
+// getHandle() returns a hand by value; keep that temporary out of the __try frame.
+static void callSetHome(MerchantHomeFn setHome, Ownerships* own, RootObject* building, SquadType t) {
+    setHome(own, building->getHandle(), t);
+}
 }
 
 bool readMerchantHome(Character* c, unsigned int outHome[5], char* outSquadSid, unsigned int maxSid) {
     if (!c || !outHome || !outSquadSid || !maxSid) return false;
     memset(outHome,0,5*sizeof(unsigned int)); outSquadSid[0]=0;
-    static MerchantCheckFn check=(MerchantCheckFn)KenshiLib::GetRealAddress(&Character::isATrader);
+    MerchantCheckFn check=merchantCheckFn();
     __try {
         if (!check || !check(c) || !g_getPlatoonFn) return false;
         ActivePlatoon* ap=g_getPlatoonFn(c); if (!ap || !ap->me) return false;
@@ -47,15 +62,15 @@ bool bindMerchantHome(GameWorld* gw, Character* c, const unsigned int home[5], c
     if (!gw || !c || !home || !squadSid || !squadSid[0] || home[0]!=BUILDING || !home[3] || !g_getPlatoonFn) return false;
     GameData* squad=findItemTemplateImpl(gw,squadSid,(unsigned int)SQUAD_TEMPLATE);
     if (!squad) squad=findItemTemplateImpl(gw,squadSid,(unsigned int)UNIQUE_SQUAD_TEMPLATE);
-    static MerchantHomeFn setHome=(MerchantHomeFn)KenshiLib::GetRealAddress(&Ownerships::setHomeBuilding);
-    static MerchantCheckFn check=(MerchantCheckFn)KenshiLib::GetRealAddress(&Character::isATrader);
+    MerchantHomeFn setHome=merchantHomeFn();
+    MerchantCheckFn check=merchantCheckFn();
     __try {
         RootObject* building=resolveObjectByHand(home);
         ActivePlatoon* ap=g_getPlatoonFn(c);
         if (!building || !ap || !ap->me || !squad || !setHome || !check) return false;
         ap->me->squadTemplate=squad;
         Ownerships& own=ap->me->ownerships;
-        if (!sameMerchantHome(own._homeBuilding,home)) setHome(&own,building->getHandle(),ap->me->squadType);
+        if (!sameMerchantHome(own._homeBuilding,home)) callSetHome(setHome,&own,building,ap->me->squadType);
         return sameMerchantHome(own._homeBuilding,home) && check(c);
     } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
 }

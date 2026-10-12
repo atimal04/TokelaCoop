@@ -694,7 +694,9 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
                     if (!inv->hasItem(wanted[i])) { valid=false; break; }
                     wanted[i]=0; // section now owns the item
                 }
-                inventoryGuiRefresh(inv);
+                // up4 refreshes an open InventoryGUI here; this branch has no
+                // GUI lever, and the snapshot path already mutates inventories
+                // without one (the #47 UI defer keeps item applies off open UIs).
             }
             for (unsigned int i=0;i<count;++i)
                 if (fabricated[i] && wanted[i] && g_destroyObjFn)

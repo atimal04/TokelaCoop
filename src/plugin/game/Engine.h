@@ -2257,6 +2257,8 @@ unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
 unsigned int enumLootInventoriesNear(GameWorld* gw, float radius,
                                      ContRead* out, unsigned int maxOut,
                                      bool initializeStock);
+// True for a shop shelf's building class (usable furniture), by ContRead.classType.
+bool isShelfClassType(int classType);
 // SEH-guarded single-container read by local hand. Returns false when the hand
 // does not resolve locally or is not a container-bearing building class.
 bool readContainerByHand(const unsigned int cHand[5], ContRead* out);
