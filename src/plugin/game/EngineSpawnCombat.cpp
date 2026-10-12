@@ -1408,8 +1408,24 @@ bool spawnJoinPlayerTab(GameWorld* gw, unsigned int outHand[5]) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
-    if (!recruitNpc(gw, c)) return false;
-    if (!detachFromTownAI(c)) return false;
+    // Put it in a NEW PLAYER squad the way the player's own "new squad" does:
+    // PlayerInterface::createSquad + Character::setFaction(faction, platoon).
+    // recruit + separateIntoMyOwnSquad on a createRandomCharacter body (owner=0,
+    // its own non-player container) looked right live but loaded back as an
+    // NPC on the join (12/10 runs: same hand, no player tab).
+    bool placed = false;
+    __try {
+        Faction* fac = ld->getFaction();
+        ActivePlatoon* sq = gw->player->createSquad();
+        if (fac && sq) { c->setFaction(fac, sq); placed = true; }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        placed = false;
+    }
+    if (!placed) {
+        // Fallback: the earlier recruit + split path.
+        if (!recruitNpc(gw, c)) return false;
+        if (!detachFromTownAI(c)) return false;
+    }
     if (!readObjectHand(static_cast<RootObject*>(c), outHand)) return false;
     unsigned int leaderHand[5];
     if (!readObjectHand(static_cast<RootObject*>(ld), leaderHand)) return false;
