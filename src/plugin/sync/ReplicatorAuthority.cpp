@@ -372,7 +372,12 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
         // Silence from both the entity stream and area census is not proof of
         // absence. Keep this local body visible and inert until fresh evidence
         // arrives; the healthy-census absence path below still culls normally.
-        if (staleFreeze_ && censusRadius_ > 0.0f && !streamed && !censusFresh) {
+        // The census rides a reliable ~1 Hz channel, so 2.5 s without one is
+        // already a link problem even though censusFresh (5 s, the culling
+        // window) still holds - the first seconds of an outage hid four real,
+        // re-keyed combatants in run 224911. Freeze on the shorter window.
+        const bool censusQuiet = censusRecvMs_ != 0 && (nowMs() - censusRecvMs_) > 2500;
+        if (staleFreeze_ && censusRadius_ > 0.0f && !streamed && (!censusFresh || censusQuiet)) {
             std::map<Key, Character*>::iterator staleSupp = suppressed_.find(k);
             if (staleSupp != suppressed_.end()) {
                 engine::restoreNpc(gw, chars[i]);
@@ -396,8 +401,15 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
         // may drift, but it EXISTS; only census-absent ghosts get hidden. With
         // no fresh census (hatch off / host lagging) the legacy streamed-only
         // behavior stands.
+        // censusHands_ holds WIRE keys; a combat-detached copy lives under a
+        // re-keyed LOCAL key, so look it up by its canonical (wire) identity.
+        Key censusKey = k;
+        {
+            std::map<Character*, Key>::const_iterator ci = canonicalOf_.find(chars[i]);
+            if (ci != canonicalOf_.end()) censusKey = ci->second;
+        }
         bool exists = streamed ||
-                      (censusFresh && censusHands_.find(k) != censusHands_.end());
+                      (censusFresh && censusHands_.find(censusKey) != censusHands_.end());
         std::map<Key, Character*>::iterator s = suppressed_.find(k);
         AuthCount& ac = authCount_[k];
         // Dormant and census-absent: neither client is speaking for this
