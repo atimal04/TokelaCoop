@@ -242,6 +242,14 @@ if ($Wan -ne "") {
         -ArgumentList $wanArgs
     Start-Sleep -Milliseconds 500
     if ($wanProc.HasExited) { throw "netsim.exe exited immediately (see $wanLog)" }
+    # Who holds the relay port (a second owner swallowed the join's datagrams
+    # in some 12/10 runs while netsim counted zero traffic).
+    try {
+        $owners = @(Get-NetUDPEndpoint -LocalPort $proxyPort -ErrorAction Stop | ForEach-Object {
+            "{0}:{1} pid={2} {3}" -f $_.LocalAddress, $_.LocalPort, $_.OwningProcess,
+                (Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).Name })
+        Set-Content (Join-Path $OutDir "netsim_ports.txt") ("udp owners of {0}: {1}" -f $proxyPort, ($owners -join " | "))
+    } catch { }
     $joinIp   = "127.0.0.1"
     $joinPort = $proxyPort
 }

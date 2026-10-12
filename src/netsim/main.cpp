@@ -96,6 +96,11 @@ int main(int argc, char** argv) {
     bindAddr.sin_family = AF_INET;
     bindAddr.sin_addr.s_addr = htonl(INADDR_ANY);
     bindAddr.sin_port = htons((unsigned short)listenPort);
+    // Exclusive: a second socket on this port (a stale relay, anything bound to
+    // 127.0.0.1 specifically) would otherwise silently take the join's datagrams
+    // while this relay counts zero traffic (12/10 runs 084313, 093432).
+    BOOL excl = TRUE;
+    setsockopt(clientSock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&excl, sizeof(excl));
     if (bind(clientSock, (sockaddr*)&bindAddr, sizeof(bindAddr)) != 0) {
         std::fprintf(stderr, "netsim: bind(%d) failed (%d)\n", listenPort, WSAGetLastError());
         return 1;
