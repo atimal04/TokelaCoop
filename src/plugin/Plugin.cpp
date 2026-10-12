@@ -505,6 +505,11 @@ void prepareJoinPlayerTab() {
     coop::TabLedger updated = ledger;
     updated[std::make_pair(hand[1], hand[2])] = coop::TAB_ROLE_JOIN;
     g_repl.setTabLedger(updated);
+    // The tabs were already seeded at gameplay start, so a tab born now would
+    // fall to its author (host-fallback) here while the join, loading the baked
+    // save with this ledger, seeds it as its own - both sides owning it (run
+    // 073754). Re-seed so the host decides from the ledger like the join will.
+    g_repl.reseedTabsForPeer();
     g_toastText = "Join squad ready";
     g_toastState = 2;
     g_toastArmMs = GetTickCount();
