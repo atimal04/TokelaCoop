@@ -135,6 +135,7 @@ function Invoke-OneOracle {
         "chain_put"     { return (Test-FurnPut         -HostFile $HostLog -JoinFile $JoinLog -Kind 3) }
         "pole_put"      { return (Test-FurnPut         -HostFile $HostLog -JoinFile $JoinLog -Kind 4 -InKind 2) }
         "cage_peer"     { return (Test-CagePeer        -HostFile $HostLog -JoinFile $JoinLog) }
+        "kidnap_sync"   { return (Test-KidnapSync      -HostFile $HostLog -JoinFile $JoinLog) }
         "sneak_probe"   { return (Test-SneakProbe      -HostFile $HostLog) }
         "spawn_probe"   { return (Test-SpawnProbe      -HostFile $HostLog -JoinFile $JoinLog) }
         "shop_probe"    { return (Test-ShopProbe       -HostFile $HostLog -JoinFile $JoinLog) }
@@ -490,7 +491,7 @@ Export-ModuleMember -Function @(
     "Test-MedicPose", "Test-LimbLoss", "Test-NpcVitals",
     "Get-CrawlSeries", "Get-CrawlProbeSeries", "Test-CrawlMove",
     "Get-StatsSeries", "Test-StatsSync",
-    "Get-CarrySeries", "Test-CarryOrder", "Test-NpcCarry",
+    "Get-CarrySeries", "Test-CarryOrder", "Test-NpcCarry", "Test-KidnapSync",
     "Get-FurnSeries", "Test-FurnPut", "Test-ChainPut", "Test-PolePut", "Test-CagePeer",
     "Test-SneakProbe",
     "Get-SpawnHands", "Test-SpawnProbe", "Test-SpawnSync", "Test-SpawnFarBind",

@@ -1009,6 +1009,20 @@
             Tier = 'full'; WanVariant = $true
         }
 
+        # bug #65: a host-owned world NPC knocks out, carries, then cages the
+        # JOIN's own squad leader. Both clients publish the five-field prisoner,
+        # carrier and furniture hands plus imprisoned state every 500 ms.
+        # Gate requires the join to converge to the exact host cage within 4.5 s,
+        # permits at most 1.5 s of continuous free-state mismatch, and rejects
+        # every wrong-cage sample. Fixture: bedcage1.
+        kidnap_sync = @{
+            Save = 'bedcage1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'kidnap_sync'
+            Gating   = @('kidnap_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $true
+        }
+
         # sneak_probe: protocol-20 phase-0 spike (host-side, log-only). The host
         # forces stealthMode on its DRIVEN copy of the join's leader near the bar
         # NPCs and logs the copy's whoSeesMeSneaking series - proves the engine's

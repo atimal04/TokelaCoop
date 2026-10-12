@@ -1175,6 +1175,62 @@ function Test-CagePeer {
                             enterLatMs = $m.EnterLatMs; hostZeroDwell = $m.HostZeroDwell } -Detail $detail)
 }
 
+# bug #65: host NPC kidnaps the join-owned PC into the host's cage. Compare
+# save-stable five-field hands and clock-corrected periodic state on both sides.
+function Test-KidnapSync {
+    param([string]$HostFile, [string]$JoinFile, [int]$MaxMatchMs = 4500,
+          [int]$MismatchToleranceMs = 1500)
+    $rx = 'SCENARIO KIDNAP side=\w+ hand=(\d+,\d+,\d+,\d+,\d+) carriedBy=(\d+,\d+,\d+,\d+,\d+) furniture=(\d+,\d+,\d+,\d+,\d+) imprisoned=(\d) carried=(\d) t=(\d+)'
+    function Read-KidnapRows([string]$File) {
+        $rows = New-Object System.Collections.ArrayList
+        if (-not (Test-Path $File)) { return ,$rows }
+        $off = Get-LogClockOffsetMs -File $File
+        foreach ($line in (Select-String -Path $File -Pattern $rx -ErrorAction SilentlyContinue)) {
+            $g=$line.Matches[0].Groups
+            $stamp=[regex]::Match($line.Line,'\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\]')
+            if (-not $stamp.Success) { continue }
+            $sg=$stamp.Groups
+            $when=Convert-StampToMs -Groups $sg -OffsetMs $off
+            [void]$rows.Add([pscustomobject]@{ at=[long]$when; hand=$g[1].Value; carrier=$g[2].Value;
+                furn=$g[3].Value; imprisoned=([int]$g[4].Value -eq 1); carried=([int]$g[5].Value -eq 1); t=[long]$g[6].Value })
+        }
+        return ,$rows
+    }
+    $h=Read-KidnapRows $HostFile; $j=Read-KidnapRows $JoinFile
+    $put=Select-String -Path $HostFile -Pattern 'SCENARIO KIDNAPACT cage prisoner=[\d,]+ ok=1' -ErrorAction SilentlyContinue | Select-Object -First 1
+    foreach ($action in @('down','pickup','drop')) {
+        if ($null -eq (Select-String -Path $HostFile -Pattern ("SCENARIO KIDNAPACT $action prisoner=[\d,]+ ok=1") -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+            return (Add-GateResult -Name 'kidnap_sync' -Status FAIL -Detail "host NPC kidnapping stage '$action' did not succeed")
+        }
+    }
+    if ($null -eq $put -or $h.Count -lt 4 -or $j.Count -lt 4) {
+        return (Add-GateResult -Name 'kidnap_sync' -Status FAIL -Metrics @{} -Detail 'missing successful host cage action or periodic samples')
+    }
+    $tPut=Get-MarkerTimeMs -File $HostFile -Pattern 'SCENARIO KIDNAPACT cage '
+    $target=($h | Where-Object { $_.at -ge $tPut -and $_.imprisoned } | Select-Object -First 1)
+    if ($null -eq $target) { return (Add-GateResult -Name 'kidnap_sync' -Status FAIL -Detail 'host never reports prisoner imprisoned') }
+    $h= @($h | Where-Object { $_.hand -eq $target.hand })
+    $j= @($j | Where-Object { $_.hand -eq $target.hand })
+    $firstMatch=$null; $wrong=0; $mismatch=0; $freeRun=0; $maxFreeRun=0
+    foreach ($hs in @($h | Where-Object { $_.at -ge $target.at -and $_.imprisoned })) {
+        $js=$j | Sort-Object @{Expression={ [Math]::Abs($_.at-$hs.at) }} | Select-Object -First 1
+        if ($null -eq $js -or [Math]::Abs($js.at-$hs.at) -gt 900) { continue }
+        if ($js.imprisoned -and $js.furn -eq $hs.furn) { if ($null -eq $firstMatch) { $firstMatch=$hs.at } ; $freeRun=0 }
+        else {
+            $mismatch += 500
+            if ($js.imprisoned -and $js.furn -ne $hs.furn) { $wrong++ }
+            if (-not $js.imprisoned) { $freeRun += 500; if ($freeRun -gt $maxFreeRun) { $maxFreeRun=$freeRun } }
+        }
+    }
+    $matchMs=if ($null -eq $firstMatch) { -1 } else { [int]($firstMatch-$target.at) }
+    $bad=@()
+    if ($matchMs -lt 0 -or $matchMs -gt $MaxMatchMs) { $bad += "join did not match the host cage within ${MaxMatchMs}ms" }
+    if ($wrong -gt 0) { $bad += "join reported a different furniture hand ($wrong samples)" }
+    if ($maxFreeRun -gt $MismatchToleranceMs) { $bad += "join stayed free for ${maxFreeRun}ms while host was caged" }
+    $status=if ($bad.Count) {'FAIL'} else {'PASS'}
+    return (Add-GateResult -Name 'kidnap_sync' -Status $status -Metrics @{ timeToMatchMs=$matchMs; mismatchMs=$mismatch; wrongCageSamples=$wrong } -Detail ($bad -join '; '))
+}
+
 # sneak_probe (protocol 20 phase 0, host-side spike): the host forced
 # stealthMode on a DRIVEN copy near NPCs. Gates: the engine call landed
 # (SNEAKACT on ok=1), the mode read back 1 on the copy, and the copy's
