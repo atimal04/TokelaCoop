@@ -99,6 +99,10 @@ $script:CoopDiagEnvKeys = @(
     # a block. The real window is one frame wide (the publish sweep clears dead proxies
     # every tick), so it cannot be reached by scheduling a scenario into it.
     'TOKELACOOP_WI_TEST_STALE'
+    # --- auto join squad (#59, Plugin.cpp prepareJoinPlayerTab) ---------------
+    # Every fixture save already carries a join tab, so join_squad_loaded sets
+    # this to 1 to create the joiner's squad anyway (a single-squad save's path).
+    'TOKELACOOP_AUTO_JOIN_SQUAD_FORCE'
     # --- presence authority (Config.cpp) ----------------------------------------
     # Off everywhere except split_far2 and run_apart, which is what makes the tier
     # a fail-open proof rather than a co-test. Note this one is not merely cleared
