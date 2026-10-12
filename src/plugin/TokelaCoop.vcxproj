@@ -203,6 +203,11 @@
       <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
     </ClCompile>
     <!-- ENet (Windows source set). unix.c is intentionally excluded. -->
+    <ClCompile Include="..\..\third_party\miniz\miniz.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <PreprocessorDefinitions>MINIZ_NO_ARCHIVE_APIS;MINIZ_NO_STDIO;MINIZ_NO_TIME;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
     <ClCompile Include="..\..\third_party\enet\enet\callbacks.c" />
     <ClCompile Include="..\..\third_party\enet\enet\compress.c" />
     <ClCompile Include="..\..\third_party\enet\enet\host.c" />
@@ -226,6 +231,7 @@
     <ClInclude Include="test\Scenario.h" />
     <ClInclude Include="test\ScenarioTimed.h" />
     <ClInclude Include="test\ScenarioSupport.h" />
+    <ClInclude Include="..\netproto\SaveCompress.h" />
     <ClInclude Include="..\netproto\Wire.h" />
     <ClInclude Include="..\netproto\Version.h" />
     <ClInclude Include="..\netproto\HostIntent.h" />

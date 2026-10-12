@@ -9,6 +9,7 @@
 #include "../net/NetLink.h"
 #endif
 #include "../../netproto/ContentHash.h" // fnv1aInit/Update (per-file CRC)
+#include "../../netproto/SaveCompress.h"
 
 #include <windows.h>
 #include <cstdio>
@@ -82,7 +83,7 @@ void walkFolder(const std::string& folder, int depth, unsigned int* files,
 
 // Recursive walk collecting RELATIVE file paths + sizes (the transfer's file
 // list). 'prefix' is the accumulated relative path ("" at the root).
-struct XferFile { std::string rel; unsigned __int64 size; };
+struct XferFile { std::string rel; unsigned __int64 size; std::vector<u8> wire; bool compressed; };
 void collectFiles(const std::string& folder, const std::string& prefix, int depth,
                   std::vector<XferFile>* out) {
     if (depth > 4) return;
@@ -102,6 +103,7 @@ void collectFiles(const std::string& folder, const std::string& prefix, int dept
             XferFile xf;
             xf.rel  = rel;
             xf.size = ((unsigned __int64)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            xf.compressed = false;
             out->push_back(xf);
         }
     } while (FindNextFileA(h, &fd));
@@ -169,7 +171,12 @@ unsigned __int64      g_sendOffset  = 0;     // within the current file
 HANDLE                g_sendHandle  = INVALID_HANDLE_VALUE;
 u32                   g_sendCurCrc  = 0;
 unsigned __int64      g_sendTotalBytes = 0;
-unsigned __int64      g_sendSentBytes  = 0;
+unsigned __int64      g_sendSentBytes  = 0; // raw bytes for legacy progress/oracle accounting
+unsigned __int64      g_sendWireBytes  = 0;
+unsigned __int64      g_sendWireTotal  = 0;
+std::vector<u8>       g_sendContent;
+std::vector<u8>       g_sendWire;
+bool                  g_sendCompressed = false;
 unsigned long         g_sendStartTick  = 0;
 unsigned long         g_sendLastBurst  = 0;
 
@@ -205,6 +212,10 @@ int              g_recvOpenIdx = -1;   // fileIdx of the open handle
 HANDLE           g_recvHandle = INVALID_HANDLE_VALUE;
 std::vector<u32> g_recvCrcs;           // incremental FNV per fileIdx
 std::vector<u8>  g_recvSeen;           // fileIdx touched at least once
+std::vector< std::vector<u8> > g_recvWire;
+std::vector<u32> g_recvRawSizes, g_recvWireSizes;
+std::vector<u8> g_recvCompressed, g_recvStarted;
+unsigned __int64 g_recvWireBytes = 0;
 unsigned long    g_recvStartTick = 0;
 
 // Scenario gate accessors' backing state.
@@ -491,8 +502,31 @@ bool beginSend(NetLink& net, u32 localId, const std::string& name) {
         return false;
     }
     g_sendTotalBytes = 0;
-    for (size_t i = 0; i < g_sendFiles.size(); ++i)
-        g_sendTotalBytes += g_sendFiles[i].size;
+    g_sendWireTotal = 0;
+    g_sendCrcs.assign(g_sendFiles.size(), 0);
+    const char* kill = getenv("TOKELACOOP_SAVE_COMPRESS");
+    for (size_t i = 0; i < g_sendFiles.size(); ++i) {
+        XferFile& xf = g_sendFiles[i];
+        if (xf.size > 512ULL * 1024ULL * 1024ULL) { g_sendFiles.clear(); return false; }
+        std::vector<u8> raw((size_t)xf.size);
+        if (xf.size) {
+            HANDLE h = CreateFileA(pathJoin(folder, xf.rel).c_str(), GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+            if (h == INVALID_HANDLE_VALUE) { g_sendFiles.clear(); return false; }
+            DWORD got = 0;
+            bool readOk = ReadFile(h, &raw[0], (DWORD)xf.size, &got, 0) && got == (DWORD)xf.size;
+            CloseHandle(h);
+            if (!readOk) { g_sendFiles.clear(); return false; }
+        }
+        g_sendCrcs[i] = fnv1aUpdate(fnv1aInit(), raw.empty() ? 0 : &raw[0], (unsigned int)raw.size());
+        xf.wire = raw;
+        xf.compressed = false;
+        if (!(kill && strcmp(kill, "0") == 0)) {
+            std::vector<u8> packed;
+            if (savecompress::compress(raw.empty() ? 0 : &raw[0], (unsigned long)raw.size(), &packed) && packed.size() < raw.size()) { xf.wire.swap(packed); xf.compressed = true; }
+        }
+        g_sendTotalBytes += xf.size;
+        g_sendWireTotal += xf.wire.size();
+    }
 
     ++g_sendXferId;
     g_sendName      = name;
@@ -501,9 +535,10 @@ bool beginSend(NetLink& net, u32 localId, const std::string& name) {
     g_sendOffset    = 0;
     g_sendCurCrc    = fnv1aInit();
     g_sendSentBytes = 0;
+    g_sendWireBytes = 0;
+    g_sendContent.clear(); g_sendWire.clear();
     g_sendStartTick = GetTickCount();
     g_sendLastBurst = 0;
-    g_sendCrcs.assign(g_sendFiles.size(), 0);
     g_sendActive    = true;
 
     SaveBeginPacket bp;
@@ -518,9 +553,9 @@ bool beginSend(NetLink& net, u32 localId, const std::string& name) {
 
     char b[192];
     _snprintf(b, sizeof(b) - 1,
-              "[save] XFER-BEGIN id=%u name='%s' files=%u bytes=%I64u",
+              "[save] XFER-BEGIN id=%u name='%s' files=%u bytes=%I64u raw=%I64u wire=%I64u",
               g_sendXferId, name.c_str(), (unsigned)g_sendFiles.size(),
-              g_sendTotalBytes);
+              g_sendTotalBytes, g_sendTotalBytes, g_sendWireTotal);
     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     return true;
 }
@@ -541,43 +576,26 @@ bool tickSend(NetLink& net, u32 localId) {
         if (g_sendFileIdx >= g_sendFiles.size()) break;
         const XferFile& xf = g_sendFiles[g_sendFileIdx];
 
-        if (g_sendHandle == INVALID_HANDLE_VALUE) {
-            g_sendHandle = CreateFileA(pathJoin(g_sendFolder, xf.rel).c_str(),
-                                       GENERIC_READ, FILE_SHARE_READ, 0,
-                                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
-            if (g_sendHandle == INVALID_HANDLE_VALUE) {
-                sendAbort("open failed (save changed mid-transfer?)");
-                return false;
-            }
-            g_sendOffset = 0;
-            g_sendCurCrc = fnv1aInit();
+        if (g_sendWire.empty() && !xf.wire.empty()) {
+            g_sendWire = xf.wire;
+            g_sendCompressed = xf.compressed;
         }
-
-        DWORD want = SAVE_CHUNK_MAX;
-        if (xf.size - g_sendOffset < (unsigned __int64)want)
-            want = (DWORD)(xf.size - g_sendOffset);
-        DWORD got = 0;
-        if (want > 0 && (!ReadFile(g_sendHandle, buf, want, &got, 0) || got != want)) {
-            sendAbort("read failed (save changed mid-transfer?)");
-            return false;
-        }
-        g_sendCurCrc = fnv1aUpdate(g_sendCurCrc, buf, (unsigned int)got);
-
+        g_sendCurCrc = g_sendCrcs[g_sendFileIdx];
+        unsigned int remain = (unsigned int)(g_sendWire.size() - (size_t)g_sendOffset);
+        unsigned int got = remain > SAVE_CHUNK_MAX ? SAVE_CHUNK_MAX : remain;
+        if (got) memcpy(buf, &g_sendWire[(size_t)g_sendOffset], got);
         SaveFileHeader fh;
-        fh.type    = (u8)PKT_SAVE_FILE;
-        fh.ownerId = localId;
-        fh.xferId  = g_sendXferId;
-        fh.fileIdx = (u16)g_sendFileIdx;
-        fh.pathLen = (u16)xf.rel.size();
-        fh.offset  = (u32)g_sendOffset;
-        fh.dataLen = (u16)got;
-        net.queueSaveFile(fh, xf.rel.c_str(), buf, (unsigned int)got);
+        memset(&fh, 0, sizeof(fh));
+        fh.type = (u8)PKT_SAVE_FILE; fh.ownerId = localId; fh.xferId = g_sendXferId;
+        fh.fileIdx = (u16)g_sendFileIdx; fh.pathLen = (u16)xf.rel.size();
+        fh.offset = (u32)g_sendOffset; fh.dataLen = (u16)got;
+        fh.rawSize = (u32)xf.size; fh.wireSize = (u32)g_sendWire.size(); fh.compressed = g_sendCompressed ? 1 : 0;
+        net.queueSaveFile(fh, xf.rel.c_str(), buf, got);
+        g_sendOffset += got; g_sendWireBytes += got;
 
-        g_sendOffset    += got;
-        g_sendSentBytes += got;
-        if (g_sendOffset >= xf.size) {
-            g_sendCrcs[g_sendFileIdx] = g_sendCurCrc;
-            sendCloseFile();
+        if (g_sendOffset >= g_sendWire.size()) {
+            g_sendSentBytes += xf.size;
+            g_sendContent.clear(); g_sendWire.clear(); g_sendOffset = 0;
             ++g_sendFileIdx;
         }
     }
@@ -592,9 +610,9 @@ bool tickSend(NetLink& net, u32 localId) {
                           (unsigned int)g_sendCrcs.size());
         char b[176];
         _snprintf(b, sizeof(b) - 1,
-                  "[save] XFER-SENT id=%u files=%u bytes=%I64u ms=%lu",
+                  "[save] XFER-SENT id=%u files=%u bytes=%I64u ms=%lu raw=%I64u wire=%I64u",
                   g_sendXferId, (unsigned)g_sendFiles.size(), g_sendSentBytes,
-                  GetTickCount() - g_sendStartTick);
+                  GetTickCount() - g_sendStartTick, g_sendSentBytes, g_sendWireBytes);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         g_lastSentXferId = g_sendXferId;
         g_sendActive = false;
@@ -649,6 +667,9 @@ void onSaveBegin(const SaveBeginPacket& b) {
     g_recvStartTick  = GetTickCount();
     g_recvCrcs.assign(b.fileCount, fnv1aInit());
     g_recvSeen.assign(b.fileCount, 0);
+    g_recvWire.assign(b.fileCount, std::vector<u8>());
+    g_recvRawSizes.assign(b.fileCount, 0); g_recvWireSizes.assign(b.fileCount, 0);
+    g_recvCompressed.assign(b.fileCount, 0); g_recvStarted.assign(b.fileCount, 0); g_recvWireBytes = 0;
 
     // Refuse an unsafe name BEFORE deriving any on-disk path. saveFolderFor("")
     // (or a name with separators / "..") would resolve staging/commit targets to
@@ -696,35 +717,30 @@ void onSaveFile(const SaveFileHeader& h, const char* path, const unsigned char* 
         return;
     }
 
-    if (g_recvOpenIdx != (int)h.fileIdx) {
-        recvCloseFile();
-        std::string rel(path, path + h.pathLen);
-        std::string full = pathJoin(g_recvStaging, rel);
-        ensureParentDirs(full);
-        // CREATE_ALWAYS on the file's first chunk; OPEN_EXISTING when a later
-        // chunk re-opens it (only happens after an interleave, which the
-        // ordered channel + sequential sender never produce - belt/braces).
-        g_recvHandle = CreateFileA(full.c_str(), GENERIC_WRITE, 0, 0,
-                                   g_recvSeen[h.fileIdx] ? OPEN_EXISTING : CREATE_ALWAYS,
-                                   FILE_ATTRIBUTE_NORMAL, 0);
-        if (g_recvHandle == INVALID_HANDLE_VALUE) {
-            coop::logErrLine("[save] XFER chunk write-open FAILED");
-            return;
-        }
-        g_recvOpenIdx = (int)h.fileIdx;
-        g_recvSeen[h.fileIdx] = 1;
+    if (h.rawSize > 512U * 1024U * 1024U || h.wireSize > 512U * 1024U * 1024U || h.compressed > 1 || h.offset > h.wireSize || h.dataLen > h.wireSize - h.offset) return;
+    if (h.offset == 0) {
+        g_recvWire[h.fileIdx].clear();
+        g_recvRawSizes[h.fileIdx] = h.rawSize; g_recvWireSizes[h.fileIdx] = h.wireSize;
+        g_recvCompressed[h.fileIdx] = h.compressed; g_recvStarted[h.fileIdx] = 1; g_recvSeen[h.fileIdx] = 0;
     }
-
-    LONG hi = 0;
-    SetFilePointer(g_recvHandle, (LONG)h.offset, &hi, FILE_BEGIN);
-    DWORD wrote = 0;
-    if (h.dataLen > 0) {
-        if (!WriteFile(g_recvHandle, data, h.dataLen, &wrote, 0) || wrote != h.dataLen) {
-            coop::logErrLine("[save] XFER chunk write FAILED");
-            return;
-        }
-        g_recvCrcs[h.fileIdx] = fnv1aUpdate(g_recvCrcs[h.fileIdx], data, h.dataLen);
-        g_recvBytes += h.dataLen;
+    if (!g_recvStarted[h.fileIdx] || g_recvRawSizes[h.fileIdx] != h.rawSize || g_recvWireSizes[h.fileIdx] != h.wireSize || g_recvCompressed[h.fileIdx] != h.compressed || h.offset != g_recvWire[h.fileIdx].size()) return;
+    if (h.dataLen) g_recvWire[h.fileIdx].insert(g_recvWire[h.fileIdx].end(), data, data + h.dataLen);
+    g_recvWireBytes += h.dataLen;
+    if (g_recvWire[h.fileIdx].size() == h.wireSize) {
+        std::vector<u8> raw;
+        if (h.compressed) {
+            if (!savecompress::decompress(g_recvWire[h.fileIdx].empty() ? 0 : &g_recvWire[h.fileIdx][0], (unsigned long)g_recvWire[h.fileIdx].size(), h.rawSize, &raw)) { g_recvSeen[h.fileIdx] = 0; return; }
+        } else raw.swap(g_recvWire[h.fileIdx]);
+        std::string rel(path, path + h.pathLen);
+        std::string full = pathJoin(g_recvStaging, rel); ensureParentDirs(full);
+        HANDLE out = CreateFileA(full.c_str(), GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+        if (out == INVALID_HANDLE_VALUE) { g_recvSeen[h.fileIdx] = 0; return; }
+        DWORD wrote = 0; bool good = raw.empty() || (WriteFile(out, &raw[0], (DWORD)raw.size(), &wrote, 0) && wrote == raw.size());
+        CloseHandle(out);
+        if (!good || raw.size() != h.rawSize) { g_recvSeen[h.fileIdx] = 0; return; }
+        g_recvSeen[h.fileIdx] = 1;
+        g_recvCrcs[h.fileIdx] = fnv1aUpdate(fnv1aInit(), raw.empty() ? 0 : &raw[0], (unsigned int)raw.size());
+        g_recvBytes += raw.size();
     }
 }
 
@@ -784,10 +800,10 @@ int onSaveDone(const SaveDoneHeader& d, const u32* crcs,
 
     char b[192];
     _snprintf(b, sizeof(b) - 1,
-              "[save] XFER-%s id=%u name='%s' files=%u bytes=%I64u badCrc=%u ms=%lu",
+              "[save] XFER-%s id=%u name='%s' files=%u bytes=%I64u badCrc=%u ms=%lu raw=%I64u wire=%I64u",
               ok ? "COMMIT" : "FAILED", d.xferId, g_recvName.c_str(),
               (unsigned)g_recvFileCount, g_recvBytes, bad,
-              GetTickCount() - g_recvStartTick);
+              GetTickCount() - g_recvStartTick, g_recvBytes, g_recvWireBytes);
     b[sizeof(b) - 1] = '\0';
     if (ok) coop::logLine(b); else coop::logErrLine(b);
     g_lastCommitResult = ok ? 1 : 0;

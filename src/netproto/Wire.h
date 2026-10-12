@@ -28,7 +28,8 @@ typedef double         f64;
 // 66 = reliable join-to-host storage add intents.
 // 65 = merge of TokelaCoop v0.54 (57) and KenshiDuo (64): both older lines are
 // refused at handshake instead of playing with different packet tags.
-const u16 PROTOCOL_VERSION = 66;
+// Protocol 67 adds compressed save-file transfer; both peers must match.
+const u16 PROTOCOL_VERSION = 67;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -1614,8 +1615,10 @@ struct SaveFileHeader {
     u16 fileIdx;  // 0-based index into the transfer's file list
     u16 pathLen;  // bytes of relative path following this header (1..SAVE_PATH_MAX)
     u32 offset;   // byte offset of this chunk within the file
-    u16 dataLen;  // payload bytes following the path (0..SAVE_CHUNK_MAX;
-                  // 0 is legal for an empty file's single chunk)
+    u16 dataLen;  // payload bytes following the path (0..SAVE_CHUNK_MAX)
+    u32 rawSize;  // full uncompressed file size
+    u32 wireSize; // full transmitted file size
+    u8  compressed; // 1 = zlib stream, 0 = raw bytes
 };
 
 // Host -> join: end of transfer + the per-file CRC table (FNV-1a-32 over
