@@ -35,7 +35,8 @@ cl.exe /nologo /O2 /EHsc /W3 /D TOKELACOOP_PROTOTEST ^
     "%REPO%\src\prototest\main.cpp" ^
     "%REPO%\src\prototest\savexfer_test.cpp" ^
     "%REPO%\src\plugin\sync\Interp.cpp" ^
-    "%REPO%\src\plugin\sync\SaveXfer.cpp"
+    "%REPO%\src\plugin\sync\SaveXfer.cpp" ^
+    "%REPO%\third_party\miniz\miniz.c"
 if errorlevel 1 (
     echo prototest build FAILED
     exit /b 1

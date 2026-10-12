@@ -141,6 +141,7 @@ int deliver(const std::string& name, const std::vector<File>& files,
             h.pathLen = (u16)rel.size();
             h.offset = 0;
             h.dataLen = (u16)dat.size();
+            h.rawSize = (u32)dat.size(); h.wireSize = (u32)dat.size(); h.compressed = 0;
             savexfer::onSaveFile(h, rel.c_str(),
                                  dat.empty() ? 0 : (const unsigned char*)dat.data());
             crcs[i] = fnv1aUpdate(fnv1aInit(),
