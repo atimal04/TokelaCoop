@@ -116,7 +116,7 @@
             # Every fixture save already has a join tab, so force the auto
             # join-squad path (a single-player save's case) for the test.
             Save = 'sync'; Setup = ''; Tolerance = 3.0
-            DiagEnv = @{ TOKELACOOP_AUTO_JOIN_SQUAD = 'force' }
+            DiagEnv = @{ TOKELACOOP_AUTO_JOIN_SQUAD_FORCE = '1' }
             PrimaryGate = 'join_squad_loaded'
             Gating   = @('join_squad_loaded')
             Advisory = @()
