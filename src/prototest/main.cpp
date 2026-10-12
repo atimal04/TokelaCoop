@@ -25,6 +25,7 @@
 
 #include "../netproto/Wire.h"
 #include "../netproto/ContentHash.h"
+#include "../netproto/SaveCompress.h"
 #include "../netproto/HostIntent.h"
 #include "../plugin/sync/Interp.h"
 #include "../plugin/core/OwnRanks.h"
@@ -90,6 +91,22 @@ void testSaveXfer();
 
 // ---- 1. Wire contract: packed sizes ------------------------------------------
 
+static void testSaveCompression() {
+    std::vector<unsigned char> source(1024 * 1024), packed, decoded;
+    unsigned int seed = 0x12345678U;
+    for (size_t i = 0; i < source.size(); ++i) {
+        seed = seed * 1664525U + 1013904223U;
+        source[i] = (i % 3 == 0) ? (unsigned char)(i % 19) : (unsigned char)(seed >> 24);
+    }
+    bool good = savecompress::compress(&source[0], (unsigned long)source.size(), &packed) &&
+                savecompress::decompress(&packed[0], (unsigned long)packed.size(), (unsigned long)source.size(), &decoded) && decoded == source;
+    CHECK("save compression 1 MB round trip", good);
+    packed.clear(); decoded.clear();
+    good = savecompress::compress(0, 0, &packed) &&
+           savecompress::decompress(packed.empty() ? 0 : &packed[0], (unsigned long)packed.size(), 0, &decoded) && decoded.empty();
+    CHECK("save compression empty round trip", good);
+}
+
 static void testSizes() {
     std::printf("== wire struct sizes (the packed contract both clients memcpy) ==\n");
     CHECK_EQ("sizeof(HelloPacket)",             sizeof(HelloPacket),             4);
@@ -130,7 +147,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(BuildIntentPacket)",       sizeof(BuildIntentPacket),       95);
     CHECK_EQ("sizeof(SaveReqPacket)",           sizeof(SaveReqPacket),           57);
     CHECK_EQ("sizeof(SaveBeginPacket)",         sizeof(SaveBeginPacket),         67);
-    CHECK_EQ("sizeof(SaveFileHeader)",          sizeof(SaveFileHeader),          19);
+    CHECK_EQ("sizeof(SaveFileHeader)",          sizeof(SaveFileHeader),          28);
     CHECK_EQ("sizeof(SaveDoneHeader)",          sizeof(SaveDoneHeader),          11);
     CHECK_EQ("sizeof(SaveAckPacket)",           sizeof(SaveAckPacket),           20);
     CHECK_EQ("sizeof(LoadGoPacket)",            sizeof(LoadGoPacket),            61);
@@ -338,8 +355,8 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v66: store add intent)",
-             (int)PROTOCOL_VERSION, 66);
+    CHECK_EQ("PROTOCOL_VERSION (v67: compressed save transfer)",
+             (int)PROTOCOL_VERSION, 67);
     CHECK_EQ("PKT_MODLIST id (TokelaCoop 49, retagged to 56 in the merge)", (int)PKT_MODLIST, 56);
     CHECK("PKT_MODLIST distinct from the KenshiDuo series",
           PKT_MODLIST != PKT_NATIVE_TAKEN && PKT_MODLIST != PKT_BOUNTY &&
@@ -724,6 +741,7 @@ static void testFraming() {
         SaveFileHeader fh;
         fh.type = (u8)PKT_SAVE_FILE; fh.ownerId = 0; fh.xferId = 7;
         fh.fileIdx = 3; fh.pathLen = (u16)pl; fh.offset = 4096; fh.dataLen = (u16)dl;
+        fh.rawSize = 8192; fh.wireSize = 8192; fh.compressed = 0;
         std::memcpy(sbuf, &fh, sizeof(fh));
         std::memcpy(sbuf + sizeof(fh), relPath, pl);
         for (unsigned i = 0; i < dl; ++i) sbuf[sizeof(fh) + pl + i] = (unsigned char)i;
@@ -927,6 +945,7 @@ static int xferRun(const char* name, const XferSrcFile* srcs, unsigned nsrc,
             fh.type = (u8)PKT_SAVE_FILE; fh.ownerId = 1; fh.xferId = xferId;
             fh.fileIdx = (u16)i; fh.pathLen = (u16)std::strlen(f.rel);
             fh.offset = off; fh.dataLen = (u16)n;
+            fh.rawSize = f.len; fh.wireSize = f.len; fh.compressed = 0;
             savexfer::onSaveFile(fh, f.rel,
                                  n ? &chunk[0] : (const unsigned char*)"");
             off += n;
@@ -2932,6 +2951,7 @@ int main() {
     testFraming();
     testSaveCrc();
     testFolderFingerprint();
+    testSaveCompression();
     testSaveXferRoundTrip();
     testContentHash();
     testInterp();
