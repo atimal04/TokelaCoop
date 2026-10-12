@@ -1284,7 +1284,7 @@ public:
     KidnapSyncScenario() : TimedScenario("kidnap_sync", 0), passed_(false), havePrisoner_(false),
         haveNpc_(false), down_(false), picked_(false), dropped_(false),
         put_(false), putOk_(false), downOk_(false), pickupOk_(false), dropOk_(false),
-        lastHoldMs_(0), lastLogMs_(0), lastPutMs_(0) {
+        lastHoldMs_(0), lastLogMs_(0), lastPutMs_(0), downMs_(0), pickMs_(0), lastWhyMs_(0) {
         memset(prisoner_, 0, sizeof(prisoner_)); memset(npc_, 0, sizeof(npc_));
     }
     virtual void onStart(const ScenarioContext&) {}
@@ -1301,13 +1301,18 @@ public:
             detectNpc(ctx);
         if (ctx.isHost && havePrisoner_ && !down_ && ctx.elapsedMs >= 8000) {
             bool ok = engine::orderDownSubject(ctx.gw, prisoner_);
-            downOk_ = ok; logAct("down", ok); down_ = true;
+            downOk_ = ok; logAct("down", ok); down_ = true; downMs_ = ctx.elapsedMs;
         }
-        if (ctx.isHost && haveNpc_ && havePrisoner_ && !picked_ && ctx.elapsedMs >= 13000) {
+        // Stage gates hang off the previous stage, not fixed clocks: under WAN
+        // the latch can land late, and a pickup that never runs is a scenario
+        // failure, not a sync one (s27 WAN run 012704).
+        if (ctx.isHost && haveNpc_ && havePrisoner_ && down_ && !picked_ &&
+            ctx.elapsedMs >= 13000 && ctx.elapsedMs >= downMs_ + 3000) {
             bool ok = engine::carrySubject(ctx.gw, npc_, prisoner_);
-            pickupOk_ = ok; logAct("pickup", ok); picked_ = true;
+            pickupOk_ = ok; logAct("pickup", ok); picked_ = true; pickMs_ = ctx.elapsedMs;
         }
-        if (ctx.isHost && haveNpc_ && !dropped_ && ctx.elapsedMs >= 22000) {
+        if (ctx.isHost && haveNpc_ && picked_ && !dropped_ &&
+            ctx.elapsedMs >= 22000 && ctx.elapsedMs >= pickMs_ + 9000) {
             bool ok = engine::dropSubject(ctx.gw, npc_, true);
             dropOk_ = ok; logAct("drop", ok); dropped_ = true;
         }
@@ -1340,19 +1345,31 @@ public:
 private:
     void latchNpc(const ScenarioContext& ctx) {
         Character* p = engine::resolveCharByHand(prisoner_[3], prisoner_[4], prisoner_[0], prisoner_[1], prisoner_[2]);
-        float px, py, pz; if (!p || !engine::readPos(p, &px, &py, &pz)) return;
+        float px, py, pz;
+        if (!p || !engine::readPos(p, &px, &py, &pz)) { latchWhy(ctx, p ? "prisoner-pos" : "prisoner-unresolved", 0, 0); return; }
         Character* chars[96]; EntityState states[96];
         unsigned int n = engine::listNpcs(ctx.gw, chars, states, 96);
         int best = -1; float bestD = 1.0e18f;
+        unsigned int skippedDown = 0;
         for (unsigned int i = 0; i < n; ++i) {
-            if (coop::bodyIsDown(states[i].bodyState) || (states[i].bodyState & BODY_DEAD)) continue;
+            if (states[i].hIndex == prisoner_[3] && states[i].hSerial == prisoner_[4]) continue;
+            if (coop::bodyIsDown(states[i].bodyState) || (states[i].bodyState & BODY_DEAD)) { ++skippedDown; continue; }
             float x=states[i].x-px, y=states[i].y-py, z=states[i].z-pz, d=x*x+y*y+z*z;
             if (d < bestD) { bestD=d; best=(int)i; }
         }
-        if (best < 0) return;
+        if (best < 0) { latchWhy(ctx, "no-upright-npc", n, skippedDown); return; }
         npc_[0]=states[best].hType; npc_[1]=states[best].hContainer;
         npc_[2]=states[best].hContainerSerial; npc_[3]=states[best].hIndex; npc_[4]=states[best].hSerial;
         haveNpc_=true;
+    }
+    // Why the carrier latch failed, at most once per second.
+    void latchWhy(const ScenarioContext& ctx, const char* why, unsigned int n, unsigned int down) {
+        if (lastWhyMs_ != 0 && ctx.elapsedMs - lastWhyMs_ < 1000) return;
+        lastWhyMs_ = ctx.elapsedMs;
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO KIDNAP latch-fail why=%s npcs=%u down=%u t=%lu",
+                  why, n, down, ctx.elapsedMs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
     void detectNpc(const ScenarioContext& ctx) {
         Character* chars[96]; EntityState states[96];
@@ -1395,7 +1412,7 @@ private:
     }
     bool passed_,havePrisoner_,haveNpc_,down_,picked_,dropped_,put_,putOk_;
     bool downOk_,pickupOk_,dropOk_;
-    unsigned long lastHoldMs_,lastLogMs_,lastPutMs_;
+    unsigned long lastHoldMs_,lastLogMs_,lastPutMs_,downMs_,pickMs_,lastWhyMs_;
     unsigned int prisoner_[5],npc_[5];
 };
 
