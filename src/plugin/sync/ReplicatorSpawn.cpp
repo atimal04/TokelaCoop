@@ -145,6 +145,7 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             pkt.found = found ? 1 : 0;
             pkt.dead  = dead ? 1 : 0;
             pkt.age   = age; // animals scale body size by age (protocol 39)
+            if (found && isHost && merchantSync_) engine::readMerchantHome(c, pkt.shopHome, pkt.shopSquadSid, sizeof(pkt.shopSquadSid));
             if (found) engine::charName(c, pkt.name, sizeof(pkt.name));
             net.queueSpawnInfo(pkt);
             char b[224]; _snprintf(b, sizeof(b) - 1,
@@ -159,6 +160,23 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
     // Land replies first (a proxy bound this tick is driven this same frame).
     std::deque<InboundSpawnInfo> got;
     in.drainSpawnInfos(got);
+    if (!isHost && merchantSync_) {
+        for (std::deque<InboundSpawnInfo>::iterator mi=got.begin(); mi!=got.end(); ++mi) {
+            const SpawnInfoPacket& p=mi->pkt;
+            if (p.ownerId!=0 || !p.found || !p.shopHome[3]) continue;
+            Key k; k.t=p.hType; k.c=p.hContainer; k.cs=p.hContainerSerial; k.i=p.hIndex; k.s=p.hSerial;
+            if (pinOwned_.find(k)!=pinOwned_.end()) continue;
+            merchantInfo_[k]=p;
+        }
+        for (std::map<Key,SpawnInfoPacket>::iterator mi=merchantInfo_.begin(); mi!=merchantInfo_.end();) {
+            std::map<Key,Character*>::iterator px=proxyByKey_.find(mi->first);
+            if (pinOwned_.find(mi->first)!=pinOwned_.end()) { merchantInfo_.erase(mi++); continue; }
+            if (px!=proxyByKey_.end() && engine::bindMerchantHome(gw,px->second,mi->second.shopHome,mi->second.shopSquadSid)) {
+                coop::logLine("[merchant] proxy home bound");
+                merchantInfo_.erase(mi++);
+            } else ++mi;
+        }
+    }
 
     // Census-missing scan (2026-07-11 "NPCs spawn on top of the join player"
     // fix): the census is the join's EXISTENCE authority out to ~2000 u, but
@@ -424,6 +442,11 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                 engine::detachFromTownAI(twin);
                 engine::clearGoals(twin);
                 proxyByKey_[k] = twin;
+                if (!isHost && merchantSync_ && p.ownerId == 0 && p.shopHome[3]) {
+                    if (!engine::bindMerchantHome(gw, twin, p.shopHome, p.shopSquadSid)) {
+                        coop::logLine("[merchant] proxy home bind deferred/unavailable");
+                    } else { merchantInfo_.erase(k); coop::logLine("[merchant] proxy home bound"); }
+                }
                 ++adoptedThisTick;
                 ++censusAdopts_;
                 lifeSet(k, LIFE_RESOLVED, "adopt");
@@ -581,6 +604,11 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
         }
         proxyByKey_[k] = proxy;
         mintedBodies_.insert(proxy);
+        if (!isHost && merchantSync_ && p.ownerId == 0 && p.shopHome[3]) {
+            if (!engine::bindMerchantHome(gw, proxy, p.shopHome, p.shopSquadSid)) {
+                coop::logLine("[merchant] proxy home bind deferred/unavailable");
+            } else { merchantInfo_.erase(k); coop::logLine("[merchant] proxy home bound"); }
+        }
         ++mintedThisTick;
         lifeSet(k, LIFE_RESOLVED, "mint");
         // Dead on arrival: latch the down state now (the same reliable-latch

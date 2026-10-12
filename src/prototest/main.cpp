@@ -114,7 +114,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(EventPacket)",             sizeof(EventPacket),             54);
     CHECK_EQ("sizeof(EntityState)",             sizeof(EntityState),             79);
     CHECK_EQ("sizeof(EntityBatchHeader)",       sizeof(EntityBatchHeader),       14); // v35: +sendMs; v44: +epoch
-    CHECK_EQ("sizeof(InvItemEntry)",            sizeof(InvItemEntry),            159); // v42: +locked, v48: reserved byte became parentIdx (size unchanged), v51: +level (craft grade)
+    CHECK_EQ("sizeof(InvItemEntry)",            sizeof(InvItemEntry),            165); // v68: native merchant grid section + X/Y
     CHECK_EQ("sizeof(InvSnapshotHeader)",       sizeof(InvSnapshotHeader),       28); // v33: +keyKind; v46: +flags
     CHECK_EQ("sizeof(InvSaveFencePacket)",      sizeof(InvSaveFencePacket),      13); // v61: pre-save inventory barrier
     CHECK_EQ("sizeof(WorldItemEntry)",          sizeof(WorldItemEntry),          73);
@@ -133,7 +133,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(StatsPacket)",             sizeof(StatsPacket),             198);
     CHECK_EQ("sizeof(StealthPacket)",           sizeof(StealthPacket),           427);
     CHECK_EQ("sizeof(SpawnReqPacket)",          sizeof(SpawnReqPacket),          25);
-    CHECK_EQ("sizeof(SpawnInfoPacket)",         sizeof(SpawnInfoPacket),         191);
+    CHECK_EQ("sizeof(SpawnInfoPacket)",         sizeof(SpawnInfoPacket),         259); // v68: merchant home + trader squad template
     CHECK_EQ("sizeof(MoneyPacket)",             sizeof(MoneyPacket),             13);
     CHECK_EQ("sizeof(MoneyDeltaPacket)",        sizeof(MoneyDeltaPacket),        13);
     CHECK_EQ("sizeof(FactionPacket)",           sizeof(FactionPacket),           61);
@@ -178,6 +178,8 @@ static void testSizes() {
           ENTITY_BATCH_MAX_STEAM <= ENTITY_BATCH_MAX);
     CHECK("world-item batch fits datagram",
           sizeof(WorldItemSnapshotHeader) + WORLD_ITEMS_MAX * sizeof(WorldItemEntry) <= 1400);
+    CHECK_EQ("maximum inventory snapshot bytes after merchant layout fields",
+             sizeof(InvSnapshotHeader) + INV_ITEMS_MAX * sizeof(InvItemEntry), 10588);
 
     // Carried-body sync (protocol 18): the synthetic carry task must never
     // collide with TASK_NONE, the combat stances, or a real engine task key
@@ -464,6 +466,9 @@ static void testSizes() {
         InvItemEntry a; std::memset(&a, 0, sizeof(a));
         InvItemEntry b = a;
         a.level = 95; b.level = 20;                  // Masterwork vs Shoddy, all else equal
+        a.gridSection=0x1234; a.gridX=7; a.gridY=9;
+        InvItemEntry gridMove=a; ++gridMove.gridX;
+        CHECK("merchant grid position is fingerprinted", invEntryHash(gridMove)!=invEntryHash(a));
         CHECK("a re-graded item is a CONTENT change (fingerprint moves)",
               invEntryHash(a) != invEntryHash(b));
         // Items with no craft level must hash exactly as they did before the field existed,
@@ -479,6 +484,9 @@ static void testSizes() {
         std::memcpy(buf, &rt, sizeof(rt));
         InvItemEntry back; std::memcpy(&back, buf, sizeof(back));
         CHECK_EQ("InvItemEntry::level round-trips", (int)back.level, 95);
+        rt.gridSection=0x1234; rt.gridX=7; rt.gridY=9;
+        std::memcpy(buf, &rt, sizeof(rt)); std::memcpy(&back, buf, sizeof(back));
+        CHECK("InvItemEntry merchant grid round-trips", back.gridSection==0x1234 && back.gridX==7 && back.gridY==9);
         InvXferPacket xp; std::memset(&xp, 0, sizeof(xp));
         xp.level = 80;
         unsigned char xbuf[sizeof(InvXferPacket)];
@@ -632,12 +640,14 @@ static void testRoundTrips() {
         si.type = (u8)PKT_SPAWN_INFO;
         std::strncpy(si.name, "Beep the Brave", sizeof(si.name) - 1);
         si.age = 3.5f;
+        si.shopHome[3]=0x12345678U; std::strncpy(si.shopSquadSid,"TraderSquad",sizeof(si.shopSquadSid)-1);
         unsigned char sbuf[sizeof(SpawnInfoPacket)];
         std::memcpy(sbuf, &si, sizeof(si));
         SpawnInfoPacket so; std::memset(&so, 0, sizeof(so));
-        CHECK("SpawnInfoPacket name+age round-trip",
+        CHECK("SpawnInfoPacket name+age+merchant round-trip",
               readPacket(sbuf, (unsigned)sizeof(sbuf), &so) &&
-              std::strcmp(so.name, "Beep the Brave") == 0 && so.age == 3.5f);
+              std::strcmp(so.name, "Beep the Brave") == 0 && so.age == 3.5f &&
+              so.shopHome[3]==0x12345678U && std::strcmp(so.shopSquadSid,"TraderSquad")==0);
         StatsPacket sa; std::memset(&sa, 0, sizeof(sa));
         sa.type = (u8)PKT_STATS;
         sa.age = 12.25f;

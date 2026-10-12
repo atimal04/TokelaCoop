@@ -575,6 +575,8 @@ struct Config {
     // Forced OFF for store_probe (it measures the unsynced baseline). "0" is
     // the A/B escape hatch.
     bool          storeSync;
+    // TOKELACOOP_MERCHANT_SYNC=0 restores pre-merchant census/proxy behavior.
+    bool          merchantSync;
 
     // TOKELACOOP_SQUAD_SYNC (default ON): squad management sync (protocol 35)
     // - a squad-tab MOVE re-containers the body (its hand changes) exactly
