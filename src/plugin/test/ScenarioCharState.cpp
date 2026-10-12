@@ -1275,6 +1275,130 @@ private:
     unsigned int  l1Hand_[5];
 };
 
+// bug #65: a HOST-owned world NPC kidnaps the JOIN's own squad leader. The
+// host drives the complete sequence (KO, pickup, drop, cage order); both
+// clients report full save-stable wire hands so the oracle can compare the
+// prisoner and fixture identities instead of merely comparing occupancy.
+class KidnapSyncScenario : public TimedScenario {
+public:
+    KidnapSyncScenario() : TimedScenario("kidnap_sync", 0), passed_(false), havePrisoner_(false),
+        haveNpc_(false), down_(false), picked_(false), dropped_(false),
+        put_(false), putOk_(false), downOk_(false), pickupOk_(false), dropOk_(false),
+        lastHoldMs_(0), lastLogMs_(0), lastPutMs_(0) {
+        memset(prisoner_, 0, sizeof(prisoner_)); memset(npc_, 0, sizeof(npc_));
+    }
+    virtual void onStart(const ScenarioContext&) {}
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!havePrisoner_) {
+            EntityState sq[32];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, 32);
+            int i = tabLeaderIdx(sq, n, 1);
+            if (i >= 0) { handFromEntity(sq[i], prisoner_); havePrisoner_ = true; }
+        }
+        if (ctx.isHost && havePrisoner_ && !haveNpc_ && ctx.elapsedMs >= 6000)
+            latchNpc(ctx);
+        if (!ctx.isHost && havePrisoner_ && !haveNpc_ && ctx.elapsedMs >= 6000)
+            detectNpc(ctx);
+        if (ctx.isHost && havePrisoner_ && !down_ && ctx.elapsedMs >= 8000) {
+            bool ok = engine::orderDownSubject(ctx.gw, prisoner_);
+            downOk_ = ok; logAct("down", ok); down_ = true;
+        }
+        if (ctx.isHost && haveNpc_ && havePrisoner_ && !picked_ && ctx.elapsedMs >= 13000) {
+            bool ok = engine::carrySubject(ctx.gw, npc_, prisoner_);
+            pickupOk_ = ok; logAct("pickup", ok); picked_ = true;
+        }
+        if (ctx.isHost && haveNpc_ && !dropped_ && ctx.elapsedMs >= 22000) {
+            bool ok = engine::dropSubject(ctx.gw, npc_, true);
+            dropOk_ = ok; logAct("drop", ok); dropped_ = true;
+        }
+        if (ctx.isHost && havePrisoner_ && dropped_ && ctx.elapsedMs >= 24000 &&
+            ctx.elapsedMs < 43000 && (!put_ || (!putOk_ && ctx.elapsedMs-lastPutMs_ >= 2000))) {
+            lastPutMs_ = ctx.elapsedMs;
+            putOk_ = engine::putSubjectInFurniture(ctx.gw, prisoner_, 2, true);
+            if (putOk_) logAct("cage", true);
+            put_ = true;
+        }
+        if (ctx.isHost && down_ && ctx.elapsedMs < 43000 &&
+            ctx.elapsedMs-lastHoldMs_ >= 2000) {
+            lastHoldMs_ = ctx.elapsedMs;
+            Character* c = engine::resolveCharByHand(prisoner_[3], prisoner_[4],
+                prisoner_[0], prisoner_[1], prisoner_[2]);
+            if (c) engine::holdDown(c);
+        }
+        if (ctx.elapsedMs-lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            if (havePrisoner_) logKidnap(ctx, prisoner_);
+        }
+        if (ctx.elapsedMs >= (ctx.isHost ? 47000UL : 45000UL)) {
+            passed_ = ctx.isHost ? (havePrisoner_ && haveNpc_ && downOk_ && pickupOk_ && dropOk_ && putOk_)
+                                 : havePrisoner_;
+            return true;
+        }
+        return false;
+    }
+    virtual bool passed() const { return passed_; }
+private:
+    void latchNpc(const ScenarioContext& ctx) {
+        Character* p = engine::resolveCharByHand(prisoner_[3], prisoner_[4], prisoner_[0], prisoner_[1], prisoner_[2]);
+        float px, py, pz; if (!p || !engine::readPos(p, &px, &py, &pz)) return;
+        Character* chars[96]; EntityState states[96];
+        unsigned int n = engine::listNpcs(ctx.gw, chars, states, 96);
+        int best = -1; float bestD = 1.0e18f;
+        for (unsigned int i = 0; i < n; ++i) {
+            if (coop::bodyIsDown(states[i].bodyState) || (states[i].bodyState & BODY_DEAD)) continue;
+            float x=states[i].x-px, y=states[i].y-py, z=states[i].z-pz, d=x*x+y*y+z*z;
+            if (d < bestD) { bestD=d; best=(int)i; }
+        }
+        if (best < 0) return;
+        npc_[0]=states[best].hType; npc_[1]=states[best].hContainer;
+        npc_[2]=states[best].hContainerSerial; npc_[3]=states[best].hIndex; npc_[4]=states[best].hSerial;
+        haveNpc_=true;
+    }
+    void detectNpc(const ScenarioContext& ctx) {
+        Character* chars[96]; EntityState states[96];
+        unsigned int n=engine::listNpcs(ctx.gw,chars,states,96);
+        for (unsigned int i=0;i<n;++i) {
+            engine::CarryRead cr;
+            if (!engine::readCarry(chars[i],&cr) || !cr.carrying ||
+                cr.carried[3]!=prisoner_[3] || cr.carried[4]!=prisoner_[4]) continue;
+            npc_[0]=states[i].hType; npc_[1]=states[i].hContainer;
+            npc_[2]=states[i].hContainerSerial; npc_[3]=states[i].hIndex; npc_[4]=states[i].hSerial;
+            haveNpc_=true; return;
+        }
+    }
+    void logAct(const char* action, bool ok) {
+        char b[160]; _snprintf(b,sizeof(b)-1,"SCENARIO KIDNAPACT %s prisoner=%u,%u ok=%d",
+            action,prisoner_[3],prisoner_[4],ok?1:0); b[sizeof(b)-1]='\0'; coop::logLine(b);
+    }
+    void logKidnap(const ScenarioContext& ctx, const unsigned int h[5]) {
+        Character* c=engine::resolveCharByHand(h[3],h[4],h[0],h[1],h[2]); if (!c) return;
+        engine::FurnitureRead fr; engine::CarryRead cr;
+        if (!engine::readFurniture(c,&fr) || !engine::readCarry(c,&cr)) return;
+        const unsigned int zero[5] = {0,0,0,0,0};
+        unsigned int carrierWire[5] = {0,0,0,0,0};
+        if (haveNpc_) {
+            for (int i=0;i<5;++i) carrierWire[i]=npc_[i];
+            if (ctx.canonicalNpcHand) {
+                unsigned int canonical[5];
+                if (ctx.canonicalNpcHand(npc_, canonical))
+                    for (int i=0;i<5;++i) carrierWire[i]=canonical[i];
+            }
+        }
+        const unsigned int* carrier = haveNpc_ ? carrierWire : zero;
+        char b[320]; _snprintf(b,sizeof(b)-1,
+            "SCENARIO KIDNAP side=%s hand=%u,%u,%u,%u,%u carriedBy=%u,%u,%u,%u,%u furniture=%u,%u,%u,%u,%u imprisoned=%d carried=%d t=%lu",
+            ctx.isHost?"host":"join",h[0],h[1],h[2],h[3],h[4],
+            carrier[0],carrier[1],carrier[2],carrier[3],carrier[4],
+            fr.furn[0],fr.furn[1],fr.furn[2],fr.furn[3],fr.furn[4],fr.kind==2?1:0,
+            cr.beingCarried?1:0,ctx.elapsedMs);
+        b[sizeof(b)-1]='\0'; coop::logLine(b);
+    }
+    bool passed_,havePrisoner_,haveNpc_,down_,picked_,dropped_,put_,putOk_;
+    bool downOk_,pickupOk_,dropOk_;
+    unsigned long lastHoldMs_,lastLogMs_,lastPutMs_;
+    unsigned int prisoner_[5],npc_[5];
+};
+
 // sneak_probe (protocol 20 phase 0, host-side spike): does the engine's stealth
 // detection fire against a DRIVEN copy, and is whoSeesMeSneaking safely
 // readable? The HOST directly sets stealthMode on its driven copy of the
@@ -2560,6 +2684,7 @@ Scenario* makeCharStateScenario(const std::string& name) {
     if (name == "chain_put")    return new FurnPutScenario(3);
     if (name == "pole_put")     return new FurnPutScenario(4);
     if (name == "cage_peer_sync") return new CagePeerScenario();
+    if (name == "kidnap_sync") return new KidnapSyncScenario();
     if (name == "sneak_probe")  return new SneakProbeScenario();
     if (name == "sneak_pose")   return new SneakPoseScenario();
     if (name == "sneak_detect") return new SneakDetectScenario();
