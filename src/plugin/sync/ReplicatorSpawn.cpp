@@ -711,23 +711,25 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
 
 bool Replicator::canonicalNpcHand(const unsigned int localHand[5],
                                   unsigned int canonicalHand[5]) const {
+    // Hands are in handFromEntity order {type, container, containerSerial,
+    // index, serial}; resolveCharByHand takes (index, serial, type, ...).
     if (!localHand || !canonicalHand) return false;
-    Character* c = engine::resolveCharByHand(localHand[0], localHand[1],
-        localHand[2], localHand[3], localHand[4]);
+    Character* c = engine::resolveCharByHand(localHand[3], localHand[4],
+        localHand[0], localHand[1], localHand[2]);
     if (!c) return false;
     std::map<Character*, Key>::const_iterator ci = canonicalOf_.find(c);
     if (ci != canonicalOf_.end()) {
-        canonicalHand[0] = ci->second.i; canonicalHand[1] = ci->second.s;
-        canonicalHand[2] = ci->second.t; canonicalHand[3] = ci->second.c;
-        canonicalHand[4] = ci->second.cs;
+        canonicalHand[0] = ci->second.t; canonicalHand[1] = ci->second.c;
+        canonicalHand[2] = ci->second.cs; canonicalHand[3] = ci->second.i;
+        canonicalHand[4] = ci->second.s;
         return true;
     }
     for (std::map<Key, Character*>::const_iterator pi = proxyByKey_.begin();
          pi != proxyByKey_.end(); ++pi) {
         if (pi->second != c) continue;
-        canonicalHand[0] = pi->first.i; canonicalHand[1] = pi->first.s;
-        canonicalHand[2] = pi->first.t; canonicalHand[3] = pi->first.c;
-        canonicalHand[4] = pi->first.cs;
+        canonicalHand[0] = pi->first.t; canonicalHand[1] = pi->first.c;
+        canonicalHand[2] = pi->first.cs; canonicalHand[3] = pi->first.i;
+        canonicalHand[4] = pi->first.s;
         return true;
     }
     return false;
