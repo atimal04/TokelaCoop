@@ -109,6 +109,16 @@
             Advisory = @('smoothness', 'anim_truth', 'march', 'clock_sync')
             Tier = 'none'; WanVariant = $false
         }
+        # Loaded-save regression for bug #59. duel1 is the single-player combat
+        # fixture; its two duel actors were spawned as detached world NPCs, not
+        # player-squad members, so the save keeps its one player tab.
+        join_squad_loaded = @{
+            Save = 'duel1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'join_squad_loaded'
+            Gating   = @('join_squad_loaded')
+            Advisory = @()
+            Tier = 'full'; WanVariant = $false
+        }
         leader_move = @{
             Save = 'sync'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'crosscheck'

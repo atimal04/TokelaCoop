@@ -178,6 +178,7 @@ function Invoke-OneOracle {
         "store_join_add" { return (Test-StoreJoinAdd   -HostFile $HostLog -JoinFile $JoinLog) }
         "squad_probe"    { return (Test-SquadProbe     -HostFile $HostLog -JoinFile $JoinLog) }
         "squad_sync"     { return (Test-SquadSync      -HostFile $HostLog -JoinFile $JoinLog) }
+        "join_squad_loaded" { return (Test-JoinSquadLoaded -HostFile $HostLog -JoinFile $JoinLog) }
         "spawn_sync"    { return (Test-SpawnSync       -HostFile $HostLog -JoinFile $JoinLog -Tol $Tolerance) }
         "spawn_far"     { return (Test-SpawnFarBind    -HostFile $HostLog -JoinFile $JoinLog) }
         "npc_census"    { return (Test-NpcCensus       -HostFile $HostLog -JoinFile $JoinLog) }
@@ -520,7 +521,7 @@ Export-ModuleMember -Function @(
     "Test-SnapRate", "Test-SuppressChurn", "Test-RestFlap",
     "Test-ExistenceParity",
     "Get-WnpcRows", "Get-WorldRows", "Group-WnpcSamples", "Test-FollowTravel", "Test-TravelParity",
-    "Test-SplitFar", "Test-SplitFar2", "Test-DualDrive", "Test-RunApart",
+    "Test-SplitFar", "Test-SplitFar2", "Test-DualDrive", "Test-RunApart", "Test-JoinSquadLoaded",
     "Get-TownArriveData", "Get-TownAuditRows", "Test-TownArrive", "Test-TownPopParity",
     "Test-WorldParity", "Test-CellProbe",
     "Test-CampApproach",
