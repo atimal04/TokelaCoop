@@ -113,7 +113,10 @@
         # fixture; its two duel actors were spawned as detached world NPCs, not
         # player-squad members, so the save keeps its one player tab.
         join_squad_loaded = @{
-            Save = 'duel1'; Setup = ''; Tolerance = 3.0
+            # Every fixture save already has a join tab, so force the auto
+            # join-squad path (a single-player save's case) for the test.
+            Save = 'sync'; Setup = ''; Tolerance = 3.0
+            DiagEnv = @{ TOKELACOOP_AUTO_JOIN_SQUAD = 'force' }
             PrimaryGate = 'join_squad_loaded'
             Gating   = @('join_squad_loaded')
             Advisory = @()

@@ -479,11 +479,15 @@ void prepareJoinPlayerTab() {
         coop::TabLedger::const_iterator it = ledger.find(tabs[i]);
         if (it != ledger.end() && it->second == coop::TAB_ROLE_JOIN) ledgerJoin = true;
     }
-    if (ledgerJoin) {
+    // "force" (harness only): every fixture save already carries a second tab,
+    // so the join_squad_loaded scenario creates one regardless to exercise the
+    // spawn + ledger + join-control path a single-squad save takes.
+    const bool force = off && strcmp(off, "force") == 0;
+    if (ledgerJoin && !force) {
         coopLog("[squads] AUTO-JOIN-SQUAD skip reason=join-tab-already-ledgered");
         return;
     }
-    if (tabCount > 1) {
+    if (tabCount > 1 && !force) {
         coopLog("[squads] AUTO-JOIN-SQUAD skip reason=rank-1-tab-exists");
         return;
     }
