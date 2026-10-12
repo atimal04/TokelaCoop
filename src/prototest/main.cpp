@@ -357,8 +357,8 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v67: compressed save transfer)",
-             (int)PROTOCOL_VERSION, 67);
+    CHECK_EQ("PROTOCOL_VERSION (v68: merchant stock layout + shop linkage)",
+             (int)PROTOCOL_VERSION, 68);
     CHECK_EQ("PKT_MODLIST id (TokelaCoop 49, retagged to 56 in the merge)", (int)PKT_MODLIST, 56);
     CHECK("PKT_MODLIST distinct from the KenshiDuo series",
           PKT_MODLIST != PKT_NATIVE_TAKEN && PKT_MODLIST != PKT_BOUNTY &&
