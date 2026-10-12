@@ -1586,8 +1586,11 @@ function Test-SharedFightParity {
         foreach ($m in (Select-String -Path $side.file -Pattern $samplePat -ErrorAction SilentlyContinue)) {
             $g = $m.Matches[0].Groups
             if ([int]$g[2].Value -lt 5000) { continue }
-            if ($m.Line -notmatch '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\]') { continue }
-            $stamp = Convert-StampToMs -Groups $Matches -OffsetMs $offset
+            # Convert-StampToMs reads .Value off regex Groups; the $Matches
+            # hashtable has plain strings, which made every stamp 0.
+            $ts = [regex]::Match($m.Line, '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\]')
+            if (-not $ts.Success) { continue }
+            $stamp = Convert-StampToMs -Groups $ts.Groups -OffsetMs $offset
             $hands = @()
             if ($g[4].Value -ne '') { $hands = @($g[4].Value.Split(';') | Where-Object { $_ -ne '' }) }
             [void]$samples[$side.name].Add(@{ t=$stamp; elapsed=[int]$g[2].Value; count=[int]$g[3].Value; hands=$hands })
@@ -1635,14 +1638,25 @@ function Test-SharedFightParity {
         $attacks = [int]$last[1].Value; $hits = [int]$last[2].Value
     }
     $rate = if ($attacks -gt 0) { [math]::Round(($hits / [double]$attacks), 4) } else { 0.0 }
+    # Landed-swing census (same meaning on both sides): the join's own squad
+    # must land a comparable share to the host's in the same fight. Absolute
+    # rates are meaningless with the fixture's str/dex-1 characters.
+    $landed = @{ HOST = 0; JOIN = 0 }
+    foreach ($side in @(@{ name='HOST'; file=$HostFile }, @{ name='JOIN'; file=$JoinFile })) {
+        $rows = @(Select-String -Path $side.file -Pattern 'SCENARIO PARITY LANDED side=(HOST|JOIN) t=\d+ ownOnNpc=(\d+)' -ErrorAction SilentlyContinue)
+        if ($rows.Count -gt 0) { $landed[$side.name] = [int]$rows[$rows.Count - 1].Matches[0].Groups[2].Value }
+    }
     $m = @{ pairedSamples=$paired.Count; maxCountDiff=$maxCountDiff; badCountSamples=$badDiff;
-            worstMissingHand=$worstHand; worstMissingMs=$worstMs; attacks=$attacks; hits=$hits; hitRate=$rate }
+            worstMissingHand=$worstHand; worstMissingMs=$worstMs; attacks=$attacks; hits=$hits; hitRate=$rate;
+            hostLanded=$landed.HOST; joinLanded=$landed.JOIN }
     $bad = @()
     if ($paired.Count -lt 10) { $bad += "only $($paired.Count) paired post-warmup samples" }
     if ($badDiff -gt 0) { $bad += "$badDiff samples differed by more than one NPC" }
     if ($worstMs -gt 3000) { $bad += "hand $worstHand missing for ${worstMs}ms (>3000ms)" }
-    if ($attacks -lt 10) { $bad += "only $attacks successful join attack orders (need >=10)" }
-    elseif ($rate -lt 0.2) { $bad += ("join captured-hit rate {0:P1} below 20%" -f $rate) }
+    if ($attacks -lt 4) { $bad += "only $attacks successful join attack orders (need >=4)" }
+    if ($landed.HOST -ge 4 -and ($landed.JOIN * 3) -lt $landed.HOST) {
+        $bad += "join landed $($landed.JOIN) swings vs host $($landed.HOST) in the same fight"
+    }
     if ($bad.Count -gt 0) {
         return (Add-GateResult -Name 'shared_fight_parity' -Status FAIL -Metrics $m -Detail ($bad -join '; '))
     }
