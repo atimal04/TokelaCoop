@@ -789,6 +789,23 @@ void processNetEvents(GameWorld* gw) {
         // Pop the ephemeral "Peer disconnected" toast at the exact leave edge -
         // the momentary notice the persistent banner (now back to "waiting") lacks.
         armPeerToast(false);
+        // #52: a JOIN that keeps playing after the host drops (crash, quit)
+        // runs its world on alone - the clock and every NPC drift, and the
+        // reconnect's save push throws all of it away anyway. Pause until the
+        // host is back; the host's speed stream resumes it after the reload,
+        // and the player can still unpause by hand to play solo.
+        // TOKELACOOP_PAUSE_ON_HOST_LOSS=0 keeps the old run-on behaviour.
+        if (!g_cfg.isHost && liveGw) {
+            const char* pe = getenv("TOKELACOOP_PAUSE_ON_HOST_LOSS");
+            if (!(pe && pe[0] == '0')) {
+                float mult = 1.0f; bool paused = false;
+                coop::engine::readGameSpeed(liveGw, &mult, &paused);
+                // Quiet: no speed intent is raised, so the pause can never be
+                // published to the host when the link comes back.
+                if (!paused && coop::engine::writeGameSpeedQuiet(liveGw, mult, true))
+                    coopLog("[time] host lost - JOIN paused until the host is back");
+            }
+        }
         // Coordinated save: disconnected = solo again; local saves must work.
         if (!g_cfg.isHost && g_cfg.saveSync) {
             coop::engine::setSaveSuppress(false);
