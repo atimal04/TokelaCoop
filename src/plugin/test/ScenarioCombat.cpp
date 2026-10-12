@@ -1664,12 +1664,17 @@ class SharedFightParityScenario : public TimedScenario {
 public:
     SharedFightParityScenario()
         : TimedScenario("shared_fight_parity", 0), haveOwn_(false),
-          lastSampleMs_(0), lastOrderMs_(0), attacks_(0), hitBase_(0) {
+          lastSampleMs_(0), lastOrderMs_(0), attacks_(0), hitBase_(0),
+          haveVictim_(false), ownBase_(0), npcBase_(0), vetoBase_(0), lastLandedLogMs_(0) {
         ownHand_[0] = ownHand_[1] = ownHand_[2] = ownHand_[3] = ownHand_[4] = 0;
+        victim_[0] = victim_[1] = victim_[2] = victim_[3] = victim_[4] = 0;
     }
     virtual void onStart(const ScenarioContext& ctx) {
         hitBase_ = (!ctx.isHost && ctx.combatHitCaptureCount)
             ? ctx.combatHitCaptureCount() : 0;
+        engine::landedSwingStats(&ownBase_, &npcBase_);
+        vetoBase_ = engine::remoteSwingsVetoed();
+        haveVictim_ = false; lastLandedLogMs_ = 0;
     }
     virtual bool onTick(const ScenarioContext& ctx) {
         EntityState squad[32];
@@ -1680,20 +1685,36 @@ public:
             handFromEntity(squad[leader], ownHand_);
             haveOwn_ = true;
         }
+        // Stick to one victim and re-issue sparsely: every re-order restarts the
+        // attackers' approach, which would depress BOTH sides' landed counts.
         if (haveOwn_ && ctx.elapsedMs >= 5000 &&
-            (lastOrderMs_ == 0 || ctx.elapsedMs - lastOrderMs_ >= 2500)) {
-            unsigned int victim[5];
-            if (engine::pickCombatVictim(ctx.gw, ownHand_, 0, victim, 0)) {
+            (lastOrderMs_ == 0 || ctx.elapsedMs - lastOrderMs_ >= 8000)) {
+            if (!haveVictim_)
+                haveVictim_ = engine::pickCombatVictim(ctx.gw, ownHand_, 0, victim_, 0);
+            if (haveVictim_) {
                 lastOrderMs_ = ctx.elapsedMs;
                 // Count successful attack orders issued by this client's own squad.
                 // Kenshi exposes no per-character swing-attempt counter here.
                 for (unsigned int i = 0; i < nSquad; ++i) {
                     unsigned int attacker[5];
                     handFromEntity(squad[i], attacker);
-                    if (engine::orderAttackByHand(ctx.gw, attacker, victim) && !ctx.isHost)
+                    if (engine::orderAttackByHand(ctx.gw, attacker, victim_) && !ctx.isHost)
                         ++attacks_;
                 }
             }
+        }
+        if (lastLandedLogMs_ == 0 || ctx.elapsedMs - lastLandedLogMs_ >= 5000 ||
+            ctx.elapsedMs >= 45000) {
+            lastLandedLogMs_ = ctx.elapsedMs;
+            unsigned long own = 0, npc = 0;
+            engine::landedSwingStats(&own, &npc);
+            char b[176];
+            _snprintf(b, sizeof(b) - 1,
+                "SCENARIO PARITY LANDED side=%s t=%lu ownOnNpc=%lu npcOnOwn=%lu remoteVetoed=%lu victim=%u,%u",
+                ctx.isHost ? "HOST" : "JOIN", ctx.elapsedMs, own - ownBase_, npc - npcBase_,
+                engine::remoteSwingsVetoed() - vetoBase_,
+                haveVictim_ ? victim_[3] : 0u, haveVictim_ ? victim_[4] : 0u);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
         if (lastSampleMs_ == 0 || ctx.elapsedMs - lastSampleMs_ >= 500) {
             lastSampleMs_ = ctx.elapsedMs;
@@ -1766,6 +1787,9 @@ private:
     unsigned long lastSampleMs_, lastOrderMs_;
     unsigned long attacks_;
     unsigned int hitBase_, ownHand_[5];
+    bool haveVictim_;
+    unsigned int victim_[5];
+    unsigned long ownBase_, npcBase_, vetoBase_, lastLandedLogMs_;
 };
 
 // assault_travel (2026-08-05 free-play report: "an enemy was attacking my

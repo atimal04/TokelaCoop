@@ -1286,6 +1286,17 @@ void __fastcall knockout_hook(MedicalSystem* self, float skill) {
 std::set<Character*>              g_remoteSwingers;
 std::set<Character*>              g_squadBodies;
 unsigned long                     g_remoteSwingsVetoed = 0;
+// Landed-swing census for the combat-desync work (#54/#67): swings by THIS
+// client's player squad that land on a non-squad body (guarded copy or native),
+// and swings that land on the squad. Same meaning on host and join, so the two
+// sides' rates in one shared fight are directly comparable.
+unsigned long                     g_landedOwnOnNpc = 0;
+unsigned long                     g_landedNpcOnOwn = 0;
+static bool isOwnSquadBody(Character* c) {
+    return c && (g_reportAttackers.find(c) != g_reportAttackers.end() ||
+                 (g_squadBodies.find(c) != g_squadBodies.end() &&
+                  g_remoteSwingers.find(c) == g_remoteSwingers.end()));
+}
 
 HitMaterialType __fastcall hitByMelee_hook(Character* self, CutDirection dir,
                                            Damages& damage, Character* who,
@@ -1293,6 +1304,7 @@ HitMaterialType __fastcall hitByMelee_hook(Character* self, CutDirection dir,
     if (!g_damageGuarded.empty() &&
         g_damageGuarded.find(self) != g_damageGuarded.end()) {
         ++g_dmgGuardedHits;
+        if (isOwnSquadBody(who)) ++g_landedOwnOnNpc;
         // Report path (join): the local swing never lands here, but if a player-
         // squad attacker dealt it, accumulate so the host wounds the real NPC.
         // flesh ~ solid impact (cut+blunt+pierce+stun); blood ~ bleeding sources
@@ -1312,6 +1324,11 @@ HitMaterialType __fastcall hitByMelee_hook(Character* self, CutDirection dir,
         return HIT_MISSED; // the friend's own report carries this swing's damage
     }
     ++g_dmgPassedHits;
+    {
+        const bool selfOwn = isOwnSquadBody(self), whoOwn = isOwnSquadBody(who);
+        if (whoOwn && !selfOwn) ++g_landedOwnOnNpc;
+        if (selfOwn && who && !whoOwn) ++g_landedNpcOnOwn;
+    }
     return g_hitByMeleeOrig(self, dir, damage, who, attack, comboID);
 }
 
@@ -2502,6 +2519,10 @@ void clearRemoteSwingers()           { g_remoteSwingers.clear(); g_squadBodies.c
 void addRemoteSwinger(Character* c)  { if (c) g_remoteSwingers.insert(c); }
 void addSquadBody(Character* c)      { if (c) g_squadBodies.insert(c); }
 unsigned long remoteSwingsVetoed()   { return g_remoteSwingsVetoed; }
+void landedSwingStats(unsigned long* ownOnNpc, unsigned long* npcOnOwn) {
+    if (ownOnNpc) *ownOnNpc = g_landedOwnOnNpc;
+    if (npcOnOwn) *npcOnOwn = g_landedNpcOnOwn;
+}
 bool takeReportedDamage(Character* c, float* outFlesh, float* outBlood) {
     std::map<Character*, ReportedDmg>::iterator it = g_reportedDmg.find(c);
     if (it == g_reportedDmg.end()) return false;

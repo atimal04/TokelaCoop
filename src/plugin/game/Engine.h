@@ -1396,6 +1396,9 @@ void          clearRemoteSwingers();   // clears the squad bodies too
 void          addRemoteSwinger(Character* c);
 void          addSquadBody(Character* c);
 unsigned long remoteSwingsVetoed();    // cumulative, for logs / oracles
+// Cumulative landed melee swings: this client's player squad on non-squad
+// bodies, and non-squad bodies on the squad (#54/#67 census).
+void          landedSwingStats(unsigned long* ownOnNpc, unsigned long* npcOnOwn);
 // Drain the accumulated join-dealt damage for one victim copy (returns false if
 // nothing pending). flesh/blood are the summed deltas since the last drain.
 bool         takeReportedDamage(Character* c, float* outFlesh, float* outBlood);
