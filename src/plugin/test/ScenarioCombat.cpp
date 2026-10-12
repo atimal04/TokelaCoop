@@ -1716,8 +1716,10 @@ public:
     }
 private:
     void logParitySample(const ScenarioContext& ctx) {
-        Character* own = engine::resolveCharByHand(ownHand_[0], ownHand_[1],
-            ownHand_[2], ownHand_[3], ownHand_[4]);
+        // handFromEntity order is {type, container, cs, index, serial};
+        // resolveCharByHand takes (index, serial, type, container, cs).
+        Character* own = engine::resolveCharByHand(ownHand_[3], ownHand_[4],
+            ownHand_[0], ownHand_[1], ownHand_[2]);
         if (!own) return;
         float lx, ly, lz;
         if (!engine::readPos(own, &lx, &ly, &lz)) return;
@@ -1731,13 +1733,13 @@ private:
             unsigned int local[5], canon[5];
             handFromEntity(npcs[i], local);
             for (int k = 0; k < 5; ++k) canon[k] = local[k];
-            float distance = 0.0f;
             // Translate exact local proxy/re-key identities to census wire hands.
             if (ctx.canonicalNpcHand) ctx.canonicalNpcHand(local, canon);
+            // Identity = (index, serial); type/container are shared by many NPCs.
             bool duplicate = false;
             for (unsigned int j = 0; j < used; ++j)
-                if (keys[j][0] == canon[0] && keys[j][1] == canon[1]) duplicate = true;
-            if (!duplicate && used < 128) { keys[used][0] = canon[0]; keys[used][1] = canon[1]; ++used; }
+                if (keys[j][0] == canon[3] && keys[j][1] == canon[4]) duplicate = true;
+            if (!duplicate && used < 128) { keys[used][0] = canon[3]; keys[used][1] = canon[4]; ++used; }
         }
         for (unsigned int i = 0; i < used; ++i)
             for (unsigned int j = i + 1; j < used; ++j)
