@@ -451,15 +451,15 @@ void sessionResetForWorldReload() {
 // the host is already in-game (processNetEvents), or the host's gameplay
 // starting with a peer already connected (mainLoop_hook gameplay-start edge).
 // Host + saveSync + in-game are the caller's responsibility.
-void prepareJoinPlayerTab() {
+bool prepareJoinPlayerTab(unsigned int outTab[2]) {
     const char* off = std::getenv("TOKELACOOP_AUTO_JOIN_SQUAD");
     if (off && strcmp(off, "0") == 0) {
         coopLog("[squads] AUTO-JOIN-SQUAD skip reason=disabled");
-        return;
+        return false;
     }
     if (!g_cfg.isHost || !g_peerPresent || !g_lastGw) {
         coopLog("[squads] AUTO-JOIN-SQUAD skip reason=not-host-connect");
-        return;
+        return false;
     }
 
     coop::EntityState sq[64];
@@ -486,30 +486,25 @@ void prepareJoinPlayerTab() {
     const bool force = fe && strcmp(fe, "1") == 0;
     if (ledgerJoin && !force) {
         coopLog("[squads] AUTO-JOIN-SQUAD skip reason=join-tab-already-ledgered");
-        return;
+        return false;
     }
     if (tabCount > 1 && !force) {
         coopLog("[squads] AUTO-JOIN-SQUAD skip reason=rank-1-tab-exists");
-        return;
+        return false;
     }
     if (tabCount == 0) {
         coopLog("[squads] AUTO-JOIN-SQUAD skip reason=no-player-tab");
-        return;
+        return false;
     }
 
     unsigned int hand[5];
     if (!coop::engine::spawnJoinPlayerTab(g_lastGw, hand)) {
         coopLog("[squads] AUTO-JOIN-SQUAD skip reason=create-failed");
-        return;
+        return false;
     }
     coop::TabLedger updated = ledger;
     updated[std::make_pair(hand[1], hand[2])] = coop::TAB_ROLE_JOIN;
     g_repl.setTabLedger(updated);
-    // The tabs were already seeded at gameplay start, so a tab born now would
-    // fall to its author (host-fallback) here while the join, loading the baked
-    // save with this ledger, seeds it as its own - both sides owning it (run
-    // 073754). Re-seed so the host decides from the ledger like the join will.
-    g_repl.reseedTabsForPeer();
     g_toastText = "Join squad ready";
     g_toastState = 2;
     g_toastArmMs = GetTickCount();
@@ -519,10 +514,52 @@ void prepareJoinPlayerTab() {
               "[squads] AUTO-JOIN-SQUAD created hand=%u,%u,%u,%u,%u tab=%u,%u near leader",
               hand[3], hand[4], hand[0], hand[1], hand[2], hand[1], hand[2]);
     b[sizeof(b) - 1] = '\0'; coopLog(b);
+    outTab[0] = hand[1]; outTab[1] = hand[2];
+    return true;
 }
 
+// #59: a squad created for the join must be IN the baked save and seeded from
+// the ledger on the host too. The new character only shows in the squad
+// enumeration a few frames after creation (run 094028: baked in the same tick,
+// it was missing from the join's world; the host re-seeded before it appeared
+// and took it via host-fallback). So the bake waits until the tab is visible.
+bool          g_joinTabWait   = false;
+unsigned int  g_joinTabC      = 0, g_joinTabS = 0;
+unsigned long g_joinTabWaitMs = 0;
+void bakeConnectPush();
 void armConnectPush() {
-    prepareJoinPlayerTab();
+    unsigned int tab[2] = { 0, 0 };
+    if (prepareJoinPlayerTab(tab)) {
+        g_joinTabWait = true; g_joinTabC = tab[0]; g_joinTabS = tab[1];
+        g_joinTabWaitMs = GetTickCount();
+        coopLog("[boot] connect-push waits for the join squad to enter the world");
+        return;
+    }
+    bakeConnectPush();
+}
+
+void tickJoinTabWait() {
+    if (!g_joinTabWait) return;
+    if (!g_peerPresent || !g_lastGw) { g_joinTabWait = false; return; }
+    coop::EntityState sq[64];
+    unsigned int n = coop::engine::captureSquad(g_lastGw, false, sq, 64);
+    bool seen = false;
+    for (unsigned int i = 0; i < n; ++i)
+        if (sq[i].hContainer == g_joinTabC && sq[i].hContainerSerial == g_joinTabS) { seen = true; break; }
+    const unsigned long waited = GetTickCount() - g_joinTabWaitMs;
+    if (!seen && waited < 8000) return;
+    g_joinTabWait = false;
+    // Seed again now that the tab exists, so the host decides it from the
+    // ledger (the join's) exactly as the join will after loading the bake.
+    g_repl.reseedTabsForPeer();
+    char b[128];
+    _snprintf(b, sizeof(b) - 1, "[squads] AUTO-JOIN-SQUAD tab %s after %lums - baking",
+              seen ? "visible" : "NOT visible (timeout)", waited);
+    b[sizeof(b) - 1] = '\0'; coopLog(b);
+    bakeConnectPush();
+}
+
+void bakeConnectPush() {
     char cur[64];
     cur[0] = '\0';
     coop::engine::saveInfo(cur, sizeof(cur), 0, 0);
@@ -2054,6 +2091,8 @@ void tickCoordinatedSaveLoad(GameWorld* gw) {
         // Coordinated save + session resume (protocol 31): host-arbitrated
         // save edges, folder-quiescence completion, paced in-band folder
         // transfer, staged+verified commit on the join.
+        // #59: a connect-push held until the join's new squad is in the world.
+        tickJoinTabWait();
         if (g_cfg.saveSync)
             driveSaveSync();
         // Coordinated load (protocol 32): host-arbitrated load edges,
