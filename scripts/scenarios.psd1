@@ -2116,7 +2116,7 @@
             PrimaryGate = 'shared_fight_parity'
             Gating   = @('shared_fight_parity', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth', 'march', 'existence_parity')
-            Tier = 'full'; WanVariant = $false
+            Tier = 'full'; WanVariant = $true
         }
 
         # ---- inventory ---------------------------------------------------------------
