@@ -240,6 +240,7 @@ if ($Wan -ne "") {
     $wanProc = Start-Process -FilePath $netsimExe -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput $wanLog `
         -ArgumentList $wanArgs
+    $null = $wanProc.Handle   # keep the handle so ExitCode is readable after exit
     Start-Sleep -Milliseconds 500
     if ($wanProc.HasExited) { throw "netsim.exe exited immediately (see $wanLog)" }
     # Who holds the relay port (a second owner swallowed the join's datagrams
@@ -466,7 +467,16 @@ if ($null -ne $wanProc) {
     $alive = -not $wanProc.HasExited
     $ec = if ($alive) { '' } else { " exit=$($wanProc.ExitCode)" }
     Add-Content (Join-Path $OutDir "netsim_ports.txt") ("at join launch: netsim alive={0}{1}" -f $alive, $ec)
-    if (-not $alive) { Write-Host "  WARNING: netsim relay died before the join launched$ec" }
+    if (-not $alive) {
+        # The relay died on its own in most 12/10 WAN runs (exit cause still
+        # being traced); restart it so the join has a link at all.
+        Write-Host "  WARNING: netsim relay died before the join launched$ec - restarting it"
+        $wanProc = Start-Process -FilePath $netsimExe -PassThru -WindowStyle Hidden `
+            -RedirectStandardOutput (Join-Path $OutDir "netsim2.log") -ArgumentList $wanArgs
+        $null = $wanProc.Handle
+        Start-Sleep -Milliseconds 500
+        Add-Content (Join-Path $OutDir "netsim_ports.txt") ("restarted: alive={0}" -f (-not $wanProc.HasExited))
+    }
 }
 
 Write-Host "Launching JOIN (and clicking through the launcher) ..."
