@@ -462,6 +462,13 @@ if (Wait-ForLogLine -File $hostLog -Pattern "gameplay started" -TimeoutSec $Star
 }
 Start-Sleep -Seconds $JoinDelaySec
 
+if ($null -ne $wanProc) {
+    $alive = -not $wanProc.HasExited
+    $ec = if ($alive) { '' } else { " exit=$($wanProc.ExitCode)" }
+    Add-Content (Join-Path $OutDir "netsim_ports.txt") ("at join launch: netsim alive={0}{1}" -f $alive, $ec)
+    if (-not $alive) { Write-Host "  WARNING: netsim relay died before the join launched$ec" }
+}
+
 Write-Host "Launching JOIN (and clicking through the launcher) ..."
 Set-CoopEnv -Mode "join" -Log $joinLog
 $joinPid = Start-PastLauncher -Exe $joinExe -WorkDir $JoinDir
@@ -585,6 +592,10 @@ foreach ($p in @($hostPid, $joinPid)) {
 }
 
 # Tear down the WAN proxy.
+if ($null -ne $wanProc) {
+    $ec = if ($wanProc.HasExited) { " exit=$($wanProc.ExitCode)" } else { '' }
+    Add-Content (Join-Path $OutDir "netsim_ports.txt") ("at teardown: netsim alive={0}{1}" -f (-not $wanProc.HasExited), $ec)
+}
 if ($null -ne $wanProc -and -not $wanProc.HasExited) {
     try { Stop-Process -Id $wanProc.Id -Force -ErrorAction SilentlyContinue } catch {}
 }
