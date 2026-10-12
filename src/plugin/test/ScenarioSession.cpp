@@ -32,10 +32,18 @@ public:
         int found = -1;
         unsigned int tabChars = 0;
         unsigned int container = 0, serial = 0;
+        // The created tab is the newest, i.e. highest-ranked: rank 1 on a real
+        // single-squad save, rank 2 under TOKELACOOP_AUTO_JOIN_SQUAD_FORCE on a
+        // fixture that already carries a join tab.
+        int topRank = -1;
         for (unsigned int i = 0; i < n; ++i) {
-            // The join's new tab is the second seeded tab in this single-tab fixture.
             int rank = tabRankOf(sq, n, i);
-            if (rank == 1) { if (found < 0) found = (int)i; ++tabChars; }
+            if (rank > topRank) topRank = rank;
+        }
+        for (unsigned int i = 0; i < n; ++i) {
+            if (topRank < 1 || tabRankOf(sq, n, i) != topRank) continue;
+            if (found < 0) found = (int)i;
+            ++tabChars;
         }
         if (found >= 0 && evidenceDue(ctx.elapsedMs)) {
             EntityState& e = sq[found];
@@ -51,8 +59,8 @@ public:
                 e.hContainer, e.hContainerSerial, e.x, e.y, e.z, x_ + 24.0f, ctx.elapsedMs);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             char own[128];
-            _snprintf(own, sizeof(own) - 1, "SCENARIO JOIN_SQUAD tab=%u,%u rank=1 count=%u",
-                      container, serial, tabChars);
+            _snprintf(own, sizeof(own) - 1, "SCENARIO JOIN_SQUAD tab=%u,%u rank=%d count=%u",
+                      container, serial, topRank, tabChars);
             own[sizeof(own) - 1] = '\0'; coop::logLine(own);
         }
         if (ctx.elapsedMs >= 30000) { setPassed(have_ && (ctx.isHost || moved_)); return true; }
