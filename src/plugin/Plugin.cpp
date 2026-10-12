@@ -3017,6 +3017,7 @@ void configureReplicator() {
         g_repl.setCellCollapse(g_cfg.cellCollapse);
         g_repl.setSpeedCombatCap(g_cfg.speedCombatCap);
         g_repl.setStarveHold(g_cfg.starveHoldMs);
+        g_repl.setStaleFreeze(g_cfg.staleFreeze);
         // Camera-anchored interest (protocol 43): engine-side master enable
         // for the camera anchors in interestCenters.
         coop::engine::setCamInterest(g_cfg.camInterest);

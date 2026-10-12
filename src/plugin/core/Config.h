@@ -183,6 +183,7 @@ struct Config {
     // local simulation - a WAN stall must not become an authority transfer.
     // 0 = legacy release-on-stale.
     unsigned int starveHoldMs;      // TOKELACOOP_STARVE_HOLD_MS       (10000)
+    bool         staleFreeze;       // TOKELACOOP_STALE_FREEZE != "0" (default on)
 
     // Injected fake wall-clock skew (TOKELACOOP_FAKE_CLOCK_SKEW_MS, may be
     // negative; join only in practice). Shifts coop::wallClockMs() - i.e. BOTH

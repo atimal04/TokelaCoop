@@ -419,6 +419,7 @@ void loadConfig(Config& c) {
         std::string sh = envOr("TOKELACOOP_STARVE_HOLD_MS", "");
         int shv = sh.empty() ? 10000 : std::atoi(sh.c_str());
         c.starveHoldMs = (shv > 0) ? (unsigned int)shv : 0u;
+        c.staleFreeze = envOr("TOKELACOOP_STALE_FREEZE", "1") != "0";
     }
 
     int delay  = std::atoi(envOr("TOKELACOOP_NETSIM_DELAY_MS", "0").c_str());
