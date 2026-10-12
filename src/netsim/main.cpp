@@ -76,6 +76,13 @@ int main(int argc, char** argv) {
     const int stallAtS   = (argc >= 10) ? std::atoi(argv[8]) : 0;
     const int stallForS  = (argc >= 10) ? std::atoi(argv[9]) : 0;
 
+    // Detach from the (hidden) console the harness gives us: in half the WAN
+    // runs the relay died 14-49 s in, while the Kenshi launchers were being
+    // clicked through, and a closed console takes its process with it. stdout
+    // is redirected to netsim.log, so nothing is lost; ctrl events are ignored.
+    SetConsoleCtrlHandler(0, TRUE);
+    FreeConsole();
+
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
         std::fprintf(stderr, "netsim: WSAStartup failed\n");
