@@ -547,7 +547,12 @@ void tickJoinTabWait() {
     for (unsigned int i = 0; i < n; ++i)
         if (sq[i].hContainer == g_joinTabC && sq[i].hContainerSerial == g_joinTabS) { seen = true; break; }
     const unsigned long waited = GetTickCount() - g_joinTabWaitMs;
-    if (!seen && waited < 8000) return;
+    // Visible in playerCharacters is not "in the save": recruit lists the body
+    // at once (0-15 ms), and a bake that soon left it out of the join's world
+    // in every run. Dwell like the scene bakes do (tickSetupScene settles 4-20
+    // s before saving): at least 6 s, at most 10 s.
+    if (waited < 6000) return;
+    if (!seen && waited < 10000) return;
     g_joinTabWait = false;
     // Seed again now that the tab exists, so the host decides it from the
     // ledger (the join's) exactly as the join will after loading the bake.
