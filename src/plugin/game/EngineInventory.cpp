@@ -648,7 +648,15 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
     // Complete building/shop snapshots carry native loose-grid coordinates.
     // Validate every target section, item rectangle, stack and overlap before
     // removing any current item; only reuse matching native objects here.
-    if (inv->owner && inv->owner->getDataType()==BUILDING && !truncated &&
+    // Shop SHELVES only (usable furniture), and only with merchant sync on: the
+    // first port ran this for every building, so a plain storage chest took the
+    // layout path and ended up empty on the join (store_sync regression,
+    // a123801 PASS -> 057444e FAIL).
+    const char* msEnv = getenv("TOKELACOOP_MERCHANT_SYNC");
+    const bool layoutPath = !(msEnv && msEnv[0] == '0') &&
+        inv->owner && inv->owner->getDataType()==BUILDING &&
+        static_cast<Building*>(inv->owner)->classType == BCTYPE_USABLE;
+    if (layoutPath && !truncated &&
         !curTruncated && count<=INV_ITEMS_MAX && g_getSectionsFn && g_destroyObjFn) {
         Item* wanted[INV_ITEMS_MAX]; InventorySection* target[INV_ITEMS_MAX];
         int matched[INV_ITEMS_MAX]; bool used[64], fabricated[INV_ITEMS_MAX];
